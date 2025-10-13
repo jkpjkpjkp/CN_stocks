@@ -83,6 +83,7 @@ def train(
             x = x / scaling_factors
 
             y = x[:,-1]
+            print(y)
             x = x[:,:-1]
 
             x = torch.rand_like(x)
@@ -104,10 +105,17 @@ def val(
     with torch.no_grad():
         for x in tqdm(dataloader):
             x = x.to('cuda')
+
+            scaling_factors = x[:, -2].unsqueeze(1)  # Get last position and add dimension for broadcasting
+            x = x / scaling_factors
+
             y = x[:,-1]
             x = x[:,:-1]
             y_hat = model(x)
             loss = f_loss(y_hat, y)
+
+            print(x, y, y_hat)
+            breakpoint()
         print(f"Val loss: {loss.item()}")
 
 # In[48]:
@@ -144,24 +152,26 @@ datasets = []
 for x in df.collect().group_by('order_book_id'):
     datasets.append(rollingWindowDataset(x[1]['close'].to_torch(), window_size))
 
-    if len(datasets) > 10:
+    if len(datasets) > 100:
         break
 data = ConcatDataset(datasets)
-
-# In[50]:
-
-
-model.parameters()
-
-# In[ ]:
 
 
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
+# val(
+#     model=model,
+#     dataloader=DataLoader(data, batch_size=1, shuffle=True),
+#     f_loss=F.huber_loss
+# )
+
+# In[ ]:
+
+
 train(
     model=model,
-    dataloader=DataLoader(data, batch_size=2048, shuffle=True),
+    dataloader=DataLoader(data, batch_size=32768, shuffle=True),
     lr=3e-4,
     n_epochs=100,
     f_loss=F.huber_loss
