@@ -164,5 +164,5 @@ train(
     dataloader=DataLoader(data, batch_size=2048, shuffle=True),
     lr=3e-4,
     n_epochs=100,
-    f_loss=F.mse_loss
+    f_loss=F.huber_loss
 )
