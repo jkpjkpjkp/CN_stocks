@@ -40,8 +40,8 @@ class BatchedDummyModule(nn.Module):
         super().__init__()
         self.window_size = window_size
         val = torch.randn(int(math.log2(window_size)) + 1)
-        # self.weights = nn.Parameter(val / val.sum())
-        self.weights = nn.Parameter(val)
+        self.weights = nn.Parameter(val / val.sum())
+        # self.weights = nn.Parameter(val)
     
     def forward(self, series):
         assert series.shape[1] == self.window_size, f'{series.shape} {self.window_size}'
