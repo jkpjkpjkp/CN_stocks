@@ -4,7 +4,6 @@
 # 2. Set up the end-to-end training/evaluation skeleton + get dumb baselines
 
 # verify loss @ init. Verify that your loss starts at the correct loss value. E.g. if you initialize your final layer correctly you should measure -log(1/n_classes) on a softmax at initialization. The same default values can be derived for L2 regression, Huber losses, etc.
-# init well. Initialize the final layer weights correctly. E.g. if you are regressing some values that have a mean of 50 then initialize the final bias to 50. If you have an imbalanced dataset of a ratio 1:10 of positives:negatives, set the bias on your logits such that your network predicts probability of 0.1 at initialization. Setting these correctly will speed up convergence and eliminate “hockey stick” loss curves where in the first few iteration your network is basically just learning the bias.
 # human baseline. Monitor metrics other than loss that are human interpretable and checkable (e.g. accuracy). Whenever possible evaluate your own (human) accuracy and compare to it. Alternatively, annotate the test data twice and for each example treat one annotation as prediction and the second as ground truth.
 # input-indepent baseline. Train an input-independent baseline, (e.g. easiest is to just set all your inputs to zero). This should perform worse than when you actually plug in your data without zeroing it out. Does it? i.e. does your model learn to extract any information out of the input at all?
 # overfit one batch. Overfit a single batch of only a few examples (e.g. as little as two). To do so we increase the capacity of our model (e.g. add layers or filters) and verify that we can reach the lowest achievable loss (e.g. zero). I also like to visualize in the same plot both the label and the prediction and ensure that they end up aligning perfectly once we reach the minimum loss. If they do not, there is a bug somewhere and we cannot continue to the next stage.
@@ -86,6 +85,8 @@ def train(
             y = x[:,-1]
             x = x[:,:-1]
 
+            x = torch.rand_like(x)
+
             optimizer.zero_grad()
             y_hat = model(x)
             loss = f_loss(y_hat, y)
@@ -135,7 +136,7 @@ class rollingWindowDataset(Dataset):
         self.window_size = window_size
     
     def __len__(self):
-        return self.data.shape[0] - self.window_size + 1
+        return max(0, self.data.shape[0] - self.window_size + 1)
 
     def __getitem__(self, idx):
         return self.data[idx:idx+self.window_size]
@@ -162,6 +163,6 @@ train(
     model=model,
     dataloader=DataLoader(data, batch_size=2048, shuffle=True),
     lr=3e-4,
-    n_epochs=10,
+    n_epochs=100,
     f_loss=F.mse_loss
 )
