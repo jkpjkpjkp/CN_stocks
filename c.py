@@ -5,7 +5,6 @@
 
 # verify loss @ init. Verify that your loss starts at the correct loss value. E.g. if you initialize your final layer correctly you should measure -log(1/n_classes) on a softmax at initialization. The same default values can be derived for L2 regression, Huber losses, etc.
 # human baseline. Monitor metrics other than loss that are human interpretable and checkable (e.g. accuracy). Whenever possible evaluate your own (human) accuracy and compare to it. Alternatively, annotate the test data twice and for each example treat one annotation as prediction and the second as ground truth.
-# overfit one batch. Overfit a single batch of only a few examples (e.g. as little as two). To do so we increase the capacity of our model (e.g. add layers or filters) and verify that we can reach the lowest achievable loss (e.g. zero). I also like to visualize in the same plot both the label and the prediction and ensure that they end up aligning perfectly once we reach the minimum loss. If they do not, there is a bug somewhere and we cannot continue to the next stage.
 # verify decreasing training loss. At this stage you will hopefully be underfitting on your dataset because you’re working with a toy model. Try to increase its capacity just a bit. Did your training loss go down as it should?
 # visualize just before the net. The unambiguously correct place to visualize your data is immediately before your y_hat = model(x) (or sess.run in tf). That is - you want to visualize exactly what goes into your network, decoding that raw tensor of data and labels into visualizations. This is the only “source of truth”. I can’t count the number of times this has saved me and revealed problems in data preprocessing and augmentation.
 # visualize prediction dynamics. I like to visualize model predictions on a fixed test batch during the course of training. The “dynamics” of how these predictions move will give you incredibly good intuition for how the training progresses. Many times it is possible to feel the network “struggle” to fit your data if it wiggles too much in some way, revealing instabilities. Very low or very high learning rates are also easily noticeable in the amount of jitter.
@@ -85,13 +84,14 @@ def train(
             # print(y)
             x = x[:,:-30]
 
-            x = torch.ones_like(x)
+            # x = torch.ones_like(x)
 
             optimizer.zero_grad()
             y_hat = model(x)
             loss = f_loss(y_hat, y)
             loss.backward()
             optimizer.step()
+            break
         print(f"Epoch {epoch} loss: {loss.item()}")
 
 
@@ -170,7 +170,7 @@ import torch.nn.functional as F
 
 train(
     model=model,
-    dataloader=DataLoader(data, batch_size=32768, shuffle=True),
+    dataloader=DataLoader(data, batch_size=100, shuffle=True),
     lr=3e-4,
     n_epochs=100,
     f_loss=F.huber_loss
