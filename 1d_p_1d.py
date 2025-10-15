@@ -22,38 +22,91 @@ daily_prices = (
     .sort(["order_book_id", "date"])
 )
 
+assert daily_prices["prices"].list.len().max() == 8, daily_prices["prices"].list.len().max()
 daily_prices = daily_prices.filter(pl.col("prices").list.len() == 8)
 
-daily_prices = daily_prices.with_columns(
-    pl.col("prices").shift(-1).over("order_book_id").alias("next_day_prices")
-)
 
-daily_prices = daily_prices.drop_nulls("next_day_prices")
+N_DAYS_LOOKBACK = 2
+
+# Create expressions for the past N days of prices.
+# We want the sequence to be chronological [day_T-13, day_T-12, ..., day_T].
+# shift(0) is the current day, shift(13) is 13 days ago.
+price_sequence_expr = [
+    pl.col("prices").shift(i).over("order_book_id")
+    for i in range(N_DAYS_LOOKBACK - 1, -1, -1)
+]
+
+# Combine the expressions to create the final DataFrame
+# 'price_sequence' will be our feature (X): a list of 14 daily price lists
+# 'next_day_prices' will be our target (y): the list of prices for the next day
+sequences_df = daily_prices.with_columns(
+    pl.concat_list(price_sequence_expr).alias("price_sequence"),
+    pl.col("prices").shift(-1).over("order_book_id").alias("next_day_prices"),
+).drop_nulls()
+
+# As a sanity check, ensure all our sequences have the correct length
+sequences_df = sequences_df.filter(pl.col("price_sequence").list.len() == N_DAYS_LOOKBACK * 8)
+
+print(f"Created {len(sequences_df)} samples of {N_DAYS_LOOKBACK}-day sequences.")
+
+# --- MODIFICATION END ---
+
 
 print("--- 3. Custom Dataset and DataLoader ---")
 
-
 class StockDataset(Dataset):
     def __init__(self, df: pl.DataFrame):
-        self.df = df.select(["prices", "next_day_prices"])
+        # Eagerly convert the needed columns to numpy arrays for faster access in __getitem__
+        # Using .to_numpy() on a list column creates an object array of lists
+        self.sequences = df["price_sequence"].to_numpy()
+        self.targets = df["next_day_prices"].to_numpy()
 
     def __len__(self):
-        return len(self.df)
-
-    @classmethod
-    def _normalize(cls, df: pl.DataFrame):
-        val = df["prices"][0][-1]
-        ret = df.select(
-            prices=(pl.col("prices") / val) - 1,
-            next_day_prices=pl.col("next_day_prices") / val - 1,
-        )
-        return torch.tensor(ret["prices"][0][:-1]), torch.tensor(
-            ret["next_day_prices"][0]
-        )
+        return len(self.sequences)
 
     def __getitem__(self, idx):
-        return type(self)._normalize(self.df.slice(idx, 1))
+        # Retrieve the raw sequence and target lists for the given index
+        price_sequence = self.sequences[idx]
+        next_day_prices = self.targets[idx]
 
+        # Convert lists to numpy arrays for numerical operations
+        # The input X will have shape (14, 8)
+        # The target y will have shape (8,)
+        x_np = np.array(price_sequence, dtype=np.float32)
+        y_np = np.array(next_day_prices, dtype=np.float32)
+
+        # Normalize based on the last price of the last day in the input sequence
+        # This helps the model predict relative price changes
+        val = x_np[-1]
+        
+        # Avoid division by zero, though unlikely with price data
+        if val == 0:
+            val = 1 
+
+        x_normalized = (x_np / val) - 1
+        y_normalized = (y_np / val) - 1
+
+        # Convert normalized numpy arrays to PyTorch tensors
+        return torch.from_numpy(x_normalized), torch.from_numpy(y_normalized)
+
+# --- MODIFICATION END ---
+
+# Use a larger batch size for more stable gradients
+batch_size = 32
+dataset = StockDataset(sequences_df)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# --- 4. Example Usage ---
+print("\n--- 4. Checking Dataloader Output ---")
+# Fetch one batch to verify the shapes
+try:
+    x_batch, y_batch = next(iter(dataloader))
+    print(f"Batch X shape: {x_batch.shape}")
+    print(f"Batch y shape: {y_batch.shape}")
+    # Expected output for X: torch.Size([32, 14, 8])
+    # Expected output for y: torch.Size([32, 8])
+except StopIteration:
+    print("Dataset is empty. Check the data processing steps.")
 
 batch_size = 3
 dataset = StockDataset(daily_prices)
