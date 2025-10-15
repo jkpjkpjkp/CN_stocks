@@ -5,7 +5,9 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from tqdm import tqdm
 
-def get_df():
+
+N_DAYS_LOOKBACK = 2
+def get_df(N_DAYS_LOOKBACK):
     print("--- 1. Data Loading ---")
     df = pl.scan_parquet("../data/a_30min.pq")
 
@@ -54,7 +56,6 @@ def get_df():
     daily_prices = daily_prices.filter(pl.col("prices").list.len() == 8)
 
 
-    N_DAYS_LOOKBACK = 2
 
     # Create expressions for the past N days of prices.
     # We want the sequence to be chronological [day_T-13, day_T-12, ..., day_T].
@@ -78,7 +79,7 @@ def get_df():
     print(f"Created {len(sequences_df)} samples of {N_DAYS_LOOKBACK}-day sequences.")
     return sequences_df
 
-df = get_df()
+df = get_df(N_DAYS_LOOKBACK)
 print("--- 3. Custom Dataset and DataLoader ---")
 class StockDataset(Dataset):
     def __init__(self, df: pl.DataFrame):
@@ -121,56 +122,27 @@ batch_size = 4
 dataset = StockDataset(df)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-print(dataset[0])
-breakpoint()
 
-print("--- 4. Model Definition (Simplified Transformer) ---")
-class TransformerModel(nn.Module):
-    def __init__(
-        self,
-        seq_len,
-        pred_len,
-        input_dim=1,
-        d_model=32,
-        nhead=2,
-        num_encoder_layers=1,
-        num_decoder_layers=1,
-        dim_feedforward=128,
-        dropout=0.1,
-    ):
-        super(TransformerModel, self).__init__()
-        self.transformer = nn.Transformer(
-            d_model=d_model,
-            nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.input_proj = nn.Linear(input_dim, d_model)
-        self.output_proj = nn.Linear(d_model, input_dim)
-        self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len - 1, d_model))
-        self.pos_decoder = nn.Parameter(torch.zeros(1, pred_len, d_model))
+print("--- 4. Model ---")
+from model import Transformer, ModelArgs
 
-    def forward(self, src, tgt):
-        b, s = src.shape
-        src = self.input_proj(src.unsqueeze(-1)) + self.pos_encoder
-        assert src.shape[:2] == (b, s)
-        d_model = src.shape[-1]
-        tgt = self.input_proj(tgt.unsqueeze(-1)) + self.pos_decoder
-        output = self.transformer(src, tgt)
-        assert output.shape == (b, s, d_model)
-        return self.output_proj(output).squeeze(-1)
+args = ModelArgs(
+    block_size=N_DAYS_LOOKBACK,
+    patch_size=8,
+    n_head=4,
+    n_layer=2,
+    dim=64,
+    rope_base=1024,
+    max_batch_size=batch_size,
+)
 
 
-# --- 5. Training ---
 print("--- 5. Training ---")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 seq_len = 8
 pred_len = 8
-model = TransformerModel(seq_len, pred_len).to(device)
+model = Transformer(args).to(device)
 criterion = nn.HuberLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
 
@@ -186,7 +158,7 @@ for epoch in range(num_epochs):
 
         tgt_input = torch.zeros_like(batch_y).to(device)
 
-        output = model(batch_X, tgt_input)
+        output = model(batch_X)
         loss = criterion(output, batch_y)
         loss.backward()
         optimizer.step()

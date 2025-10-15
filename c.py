@@ -16,14 +16,6 @@ import math
 
 from model import Transformer, ModelArgs
 
-args = ModelArgs(
-    block_size=256,
-    patch_size=8,
-    n_head=4,
-    n_layer=2,
-    dim=128,
-    rope_base=1024,
-)
 model = Transformer(args).to('cuda')
 
 

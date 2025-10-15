@@ -44,6 +44,7 @@ class ModelArgs:
     rope_base: float = 10000
     norm_eps: float = 1e-5
     rope_scaling: Optional[dict] = None
+    max_batch_size: int = 128
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -123,11 +124,13 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.patch_size, bias=False)
 
-        self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.get_mask_mod = get_mask_mod
+
+        self.setup_caches(config.max_batch_size, config.block_size)
+        self.freqs_cis = self.freqs_cis.to('cuda')
 
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
@@ -142,14 +145,15 @@ class Transformer(nn.Module):
             dtype = self.output.scales.dtype
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
-        for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
+        # for b in self.layers:
+        #     b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
 
-    def forward(self, mask: BlockMask, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, mask: Optional[BlockMask] = None, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
+        if mask is not None:
+            mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
         x = x.unflatten(-1, (-1, self.patch_dim))
         x = self.patch_embeddings(x)
@@ -157,6 +161,7 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
+        x = x[:, -1, :]
         preds = self.output(x)
         return preds
 
@@ -174,6 +179,7 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: BlockMask) -> Tensor:
+        assert x is not None
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
