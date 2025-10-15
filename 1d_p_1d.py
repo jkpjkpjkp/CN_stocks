@@ -7,7 +7,8 @@ from tqdm import tqdm
 
 
 N_DAYS_LOOKBACK = 2
-def get_df(N_DAYS_LOOKBACK):
+batch_size = 256
+def get_df(N_DAYS_LOOKBACK, head=None):
     print("--- 1. Data Loading ---")
     df = pl.scan_parquet("../data/a_30min.pq")
 
@@ -19,7 +20,10 @@ def get_df(N_DAYS_LOOKBACK):
         'volume_post': 'volume',
     })
 
-    df = df.head(100000).collect()
+    if head is not None:
+        df = df.head(head)
+
+    df = df.collect()
 
     print("--- 2. Polars Processing ---")
     df = df.with_columns(
@@ -79,16 +83,15 @@ def get_df(N_DAYS_LOOKBACK):
     print(f"Created {len(sequences_df)} samples of {N_DAYS_LOOKBACK}-day sequences.")
     return sequences_df
 
-df = get_df(N_DAYS_LOOKBACK)
+df = get_df(N_DAYS_LOOKBACK, head=int(1e5))
 print("--- 3. Custom Dataset and DataLoader ---")
 class StockDataset(Dataset):
     def __init__(self, df: pl.DataFrame):
-        # Eagerly convert the needed columns to numpy arrays for faster access in __getitem__
-        # Using .to_numpy() on a list column creates an object array of lists
         self.sequences = df["price_sequence"].to_numpy()
         self.targets = df["next_day_prices"].to_numpy()
 
     def __len__(self):
+        return 1024
         return len(self.sequences)
 
     def __getitem__(self, idx):
@@ -118,9 +121,8 @@ class StockDataset(Dataset):
         # Convert normalized numpy arrays to PyTorch tensors
         return torch.from_numpy(x_normalized * scale_up), torch.from_numpy(y_normalized * scale_up)
 
-batch_size = 4
 dataset = StockDataset(df)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
 
 print("--- 4. Model ---")
@@ -131,10 +133,11 @@ args = ModelArgs(
     patch_size=8,
     n_head=4,
     n_layer=2,
-    dim=64,
+    dim=128,
     rope_base=1024,
     max_batch_size=batch_size,
 )
+
 
 
 print("--- 5. Training ---")
@@ -144,9 +147,10 @@ seq_len = 8
 pred_len = 8
 model = Transformer(args).to(device)
 criterion = nn.HuberLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-num_epochs = 3
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=10)
+num_epochs = 1000
 
 for epoch in range(num_epochs):
     model.train()
@@ -155,17 +159,15 @@ for epoch in range(num_epochs):
         batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
         optimizer.zero_grad()
-
-        tgt_input = torch.zeros_like(batch_y).to(device)
-
         output = model(batch_X)
         loss = criterion(output, batch_y)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+    scheduler.step(total_loss / len(dataloader))
 
     print(
-        f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {total_loss / len(dataloader):.6f}"
+        f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {total_loss / len(dataloader)}"
     )
 
 print("Training finished.")
