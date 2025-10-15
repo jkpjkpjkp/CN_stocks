@@ -12,7 +12,6 @@ class MultiHeadAttention(nn.Module):
         E_total (int): Total embedding dim of combined heads post input projection. Each head
             has dim E_total // nheads
         nheads (int): Number of heads
-        dropout (float, optional): Dropout probability. Default: 0.0
         bias (bool, optional): Whether to add bias to input projection. Default: True
     """
 
@@ -23,24 +22,19 @@ class MultiHeadAttention(nn.Module):
         E_v: int,
         E_total: int,
         nheads: int,
-        dropout: float = 0.0,
         bias=True,
-        device=None,
-        dtype=None,
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.nheads = nheads
-        self.dropout = dropout
         self._qkv_same_embed_dim = E_q == E_k and E_q == E_v
         if self._qkv_same_embed_dim:
-            self.packed_proj = nn.Linear(E_q, E_total * 3, bias=bias, **factory_kwargs)
+            self.packed_proj = nn.Linear(E_q, E_total * 3, bias=bias)
         else:
-            self.q_proj = nn.Linear(E_q, E_total, bias=bias, **factory_kwargs)
-            self.k_proj = nn.Linear(E_k, E_total, bias=bias, **factory_kwargs)
-            self.v_proj = nn.Linear(E_v, E_total, bias=bias, **factory_kwargs)
+            self.q_proj = nn.Linear(E_q, E_total, bias=bias)
+            self.k_proj = nn.Linear(E_k, E_total, bias=bias)
+            self.v_proj = nn.Linear(E_v, E_total, bias=bias)
         E_out = E_q
-        self.out_proj = nn.Linear(E_total, E_out, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(E_total, E_out, bias=bias)
         assert E_total % nheads == 0, "Embedding dim is not divisible by nheads"
         self.E_head = E_total // nheads
         self.bias = bias
@@ -50,7 +44,6 @@ class MultiHeadAttention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask=None,
         is_causal=False,
     ) -> torch.Tensor:
         """
@@ -64,7 +57,6 @@ class MultiHeadAttention(nn.Module):
             query (torch.Tensor): query of shape (``N``, ``L_q``, ``E_qk``)
             key (torch.Tensor): key of shape (``N``, ``L_kv``, ``E_qk``)
             value (torch.Tensor): value of shape (``N``, ``L_kv``, ``E_v``)
-            attn_mask (torch.Tensor, optional): attention mask of shape (``N``, ``L_q``, ``L_kv``) to pass to SDPA. Default: None
             is_causal (bool, optional): Whether to apply causal mask. Default: False
 
         Returns:
@@ -108,7 +100,7 @@ class MultiHeadAttention(nn.Module):
         # Step 3. Run SDPA
         # (N, nheads, L_t, E_head)
         attn_output = F.scaled_dot_product_attention(
-            query, key, value, dropout_p=self.dropout, is_causal=is_causal
+            query, key, value, is_causal=is_causal
         )
         # (N, nheads, L_t, E_head) -> (N, L_t, nheads, E_head) -> (N, L_t, E_total)
         attn_output = attn_output.transpose(1, 2).flatten(-2)
@@ -120,16 +112,26 @@ class MultiHeadAttention(nn.Module):
         return attn_output
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int):
+        self.mean = nn.Parameter(torch.zeros(d_model))
+        self.var = nn.Parameter(torch.ones(d_model))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_detach = x.detach()
+        x = (x - x_detach.mean(dim=-1, keepdim=True)) / torch.sqrt(x_detach.var(dim=-1, keepdim=True))
+        x = x * self.var + self.mean
+        return x
+
+
 class TransformerDecoderLayer(nn.Module):
     """
-    Transformer decoder layer with prenorm architecture, residual connections,
-    and modern best practices (GELU activation, proper dropout placement).
+    Transformer decoder layer
     
     Args:
         d_model (int): Dimension of the input embedding
         nheads (int): Number of attention heads
         dim_feedforward (int, optional): Dimension of the feedforward network. Default: 2048
-        dropout (float, optional): Dropout probability. Default: 0.1
         bias (bool, optional): Whether to use bias in linear layers. Default: True
     """
     def __init__(
@@ -137,10 +139,7 @@ class TransformerDecoderLayer(nn.Module):
         d_model: int,
         nheads: int,
         dim_feedforward: int = 2048,
-        dropout: float = 0.1,
         bias: bool = True,
-        device=None,
-        dtype=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -152,21 +151,18 @@ class TransformerDecoderLayer(nn.Module):
             E_v=d_model,
             E_total=d_model,
             nheads=nheads,
-            dropout=dropout,
-            bias=bias,** factory_kwargs
+            bias=bias,
+            **factory_kwargs
         )
-        self.norm1 = nn.LayerNorm(d_model, **factory_kwargs)  # Prenorm for self-attention
-        self.dropout1 = nn.Dropout(dropout)  # Dropout after attention
+        self.norm1 = nn.RMSNorm(d_model)  # Prenorm for self-attentioner attention
         
         # Feed-forward sublayer components
         self.ffnn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward,** factory_kwargs),
-            nn.GELU(),  # Modern activation (better than ReLU)
-            nn.Dropout(dropout),  # Dropout in feed-forward
-            nn.Linear(dim_feedforward, d_model, **factory_kwargs)
+            nn.Linear(d_model, dim_feedforward),
+            nn.SiLU(),  # Modern activation (better than ReLU)
+            nn.Linear(dim_feedforward, d_model)
         )
-        self.norm2 = nn.LayerNorm(d_model,** factory_kwargs)  # Prenorm for feed-forward
-        self.dropout2 = nn.Dropout(dropout)  # Dropout after feed-forward
+        self.norm2 = nn.RMSNorm(d_model)  # Prenorm for feed-forward
         
         # Initialize weights properly
         self._reset_parameters()
@@ -180,7 +176,6 @@ class TransformerDecoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass of the decoder layer.
@@ -200,16 +195,13 @@ class TransformerDecoderLayer(nn.Module):
             query=x_norm,
             key=x_norm,
             value=x_norm,
-            attn_mask=attn_mask,
             is_causal=True  # Decoder uses causal mask to prevent future token access
         )
-        attn_output = self.dropout1(attn_output)  # Apply dropout
         x = x + attn_output  # Residual connection
         
         # Feed-forward sublayer with prenorm
         x_norm2 = self.norm2(x)  # Apply norm first (prenorm)
         ff_output = self.ffnn(x_norm2)  # Feed-forward
-        ff_output = self.dropout2(ff_output)  # Apply dropout
         x = x + ff_output  # Residual connection
         
         return x

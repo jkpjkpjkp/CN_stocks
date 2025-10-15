@@ -34,7 +34,7 @@ def get_mask_mod(mask_mod: _mask_mod_signature, offset: int):
 @dataclass
 class ModelArgs:
     block_size: int = 2048
-    vocab_size: int = 32000
+    patch_size: int = 8
     n_layer: int = 32
     n_head: int = 32
     dim: int = 4096
@@ -117,10 +117,11 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
 
-        self.patch_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.patch_dim = config.patch_size
+        self.patch_embeddings = nn.Linear(config.patch_size, config.dim)
         self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        self.output = nn.Linear(config.dim, config.patch_size, bias=False)
 
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
@@ -146,17 +147,18 @@ class Transformer(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
 
-    def forward(self, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, mask: BlockMask, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
-        x = self.tok_embeddings(idx)
+        x = x.unflatten(-1, (-1, self.patch_dim))
+        x = self.patch_embeddings(x)
 
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
-        logits = self.output(x)
-        return logits
+        preds = self.output(x)
+        return preds
 
     @classmethod
     def from_name(cls, name: str):

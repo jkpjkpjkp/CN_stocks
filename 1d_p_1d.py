@@ -61,13 +61,13 @@ dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 
 print("--- 4. Model Definition (Simplified Transformer) ---")
-seq_len = 7
-pred_len = 8
 
 
 class TransformerModel(nn.Module):
     def __init__(
         self,
+        seq_len,
+        pred_len,
         input_dim=1,
         d_model=32,
         nhead=2,
@@ -88,21 +88,27 @@ class TransformerModel(nn.Module):
         )
         self.input_proj = nn.Linear(input_dim, d_model)
         self.output_proj = nn.Linear(d_model, input_dim)
-        self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len - 1, d_model))
         self.pos_decoder = nn.Parameter(torch.zeros(1, pred_len, d_model))
 
-    def forward(self, src):
-        breakpoint()
+    def forward(self, src, tgt):
+        b, s = src.shape
         src = self.input_proj(src.unsqueeze(-1)) + self.pos_encoder
-        output = self.transformer(src)
-        return self.output_proj(output)
+        assert src.shape[:2] == (b, s)
+        d_model = src.shape[-1]
+        tgt = self.input_proj(tgt.unsqueeze(-1)) + self.pos_decoder
+        output = self.transformer(src, tgt)
+        assert output.shape == (b, s, d_model)
+        return self.output_proj(output).squeeze(-1)
 
 
 # --- 5. Training ---
 print("--- 5. Training ---")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-model = TransformerModel().to(device)
+seq_len = 8
+pred_len = 8
+model = TransformerModel(seq_len, pred_len).to(device)
 criterion = nn.HuberLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
 
