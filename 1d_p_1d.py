@@ -13,14 +13,13 @@ parser.add_argument("-e", type=int, default=1000, help="Number of epochs")
 args = parser.parse_args()
 
 
-
 N_DAYS_LOOKBACK = args.n
 batch_size = args.b
 def get_df(N_DAYS_LOOKBACK, head=None):
-    print("--- 1. Data Loading ---")
     df = pl.scan_parquet("../data/a_30min.pq")
-
-    df = df.drop(['open', 'high', 'low', 'close', 'volume']).rename({
+    df = df.drop(
+        ['open', 'high', 'low', 'close', 'volume', 'total_turnover']
+    ).rename({
         'open_post': 'open',
         'high_post': 'high',
         'low_post': 'low',
@@ -33,16 +32,18 @@ def get_df(N_DAYS_LOOKBACK, head=None):
 
     df = df.collect()
 
-    print("--- 2. Polars Processing ---")
     df = df.with_columns(
         avg_price=(pl.col("open") + pl.col("high") + pl.col("low") + pl.col("close")) / 4
     ).drop(
         ["open", "high", "low", "close"]
-    )#.with_columns(
-    #     traded_capita=pl.col("volume") * pl.col("avg_price")
-    # )
+    )
 
-    # market_avg = df.group_by("datetime").agg(pl.col("traded_capita").sum().alias("total_capita"), (pl.col("avg_price") * pl.col("traded_capita")).sum().alias("total_price"))
+    # market_avg = df.select(
+    #     pl.col("volume") * pl.col("avg_price").alias("vwp")
+    # ).group_by("datetime").agg(
+    #     pl.col("vwp").sum().alias("total_vp"),
+    #     pl.col("volume").sum().alias("total_volume")
+    # )
     # market_avg = market_avg.select(
     #     "datetime",
     #     pl.col("total_price") / pl.col("total_capita").alias("market_price")
@@ -59,37 +60,30 @@ def get_df(N_DAYS_LOOKBACK, head=None):
 
     daily_prices = (
         df
-        .sort(["order_book_id", "datetime"])
         .group_by(["order_book_id", "date"])
-        .agg(pl.col("avg_price").alias("prices"))
+        .agg(pl.col("avg_price").alias("prices"), pl.col("datetime").alias("datetimes"))
     )
 
-    assert daily_prices["prices"].list.len().max() == 8, daily_prices["prices"].list.len().max()
+    assert daily_prices["prices"].list.len().max() == 8
     daily_prices = daily_prices.filter(pl.col("prices").list.len() == 8)
 
+    daily_prices = daily_prices.sort(["order_book_id", "date"])
 
-
-    # Create expressions for the past N days of prices.
-    # We want the sequence to be chronological [day_T-13, day_T-12, ..., day_T].
-    # shift(0) is the current day, shift(13) is 13 days ago.
     price_sequence_expr = [
         pl.col("prices").shift(i).over("order_book_id")
         for i in range(N_DAYS_LOOKBACK - 1, -1, -1)
     ]
 
-    # Combine the expressions to create the final DataFrame
-    # 'price_sequence' will be our feature (X): a list of 14 daily price lists
-    # 'next_day_prices' will be our target (y): the list of prices for the next day
     sequences_df = daily_prices.with_columns(
         pl.concat_list(price_sequence_expr).alias("price_sequence"),
         pl.col("prices").shift(-1).over("order_book_id").alias("next_day_prices"),
     ).drop_nulls()
 
-    # As a sanity check, ensure all our sequences have the correct length
-    sequences_df = sequences_df.filter(pl.col("price_sequence").list.len() == N_DAYS_LOOKBACK * 8)
+    assert len(sequences_df) == len(sequences_df.filter(pl.col("price_sequence").list.len() == N_DAYS_LOOKBACK * 8))
 
     print(f"Created {len(sequences_df)} samples of {N_DAYS_LOOKBACK}-day sequences.")
     return sequences_df
+
 
 df = get_df(N_DAYS_LOOKBACK, head=int(1e6))
 print("--- 3. Custom Dataset and DataLoader ---")
@@ -102,7 +96,6 @@ class StockDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        # Retrieve the raw sequence and target lists for the given index
         price_sequence = self.sequences[idx]
         next_day_prices = self.targets[idx]
 
@@ -112,19 +105,27 @@ class StockDataset(Dataset):
         # Normalize based on the last price of the last day in the input sequence
         val = x_np[-1]
         
-        # Avoid division by zero, though unlikely with price data
-        if val == 0:
-            val = 1 
+        assert val != 0, f"price is zero at index {idx}"
 
         x_normalized = (x_np / val) - 1
         y_normalized = (y_np / val) - 1
 
-        scale_up = 1 / 0.030319097
+        scale_up = 1 / 0.015   # so variance is close to 1
 
-        # Convert normalized numpy arrays to PyTorch tensors
         return torch.from_numpy(x_normalized * scale_up), torch.from_numpy(y_normalized * scale_up)
 
 dataset = StockDataset(df)
+
+def compute_scaleup(dataset):
+    xs = []
+    ys = []
+    for x, y in dataset:
+        xs.append(x)
+        ys.append(y)
+    nxs = np.concatenate(xs, axis=0)
+    nys = np.concatenate(ys, axis=0)
+    breakpoint()
+
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
 
 print("--- 4. Model ---")
@@ -142,7 +143,10 @@ targs = ModelArgs(
 
 def vis(t):
     import matplotlib.pyplot as plt
-    plt.plot(t.cpu().numpy())
+    assert t.shape[:-1] == (batch_size, ), t.shape
+    x = np.arange(t.shape[1])
+    for i in t:
+        plt.plot(x, i.cpu().numpy())
     plt.show()
 
 
@@ -159,18 +163,14 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=10)
 num_epochs = args.e
 
-tot = 0
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
     for batch_X, batch_y in tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
         batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
-        tot += 1
-        if tot % 10 == 0:
-            vis(batch_X[:100])
-            vis(batch_y[:100])
-
+        vis(batch_X)
+        vis(batch_y)
         optimizer.zero_grad()
         with torch.autocast(device_type="cuda"):
             output = model(batch_X)
