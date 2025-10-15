@@ -10,6 +10,7 @@ parser = argparse.ArgumentParser(description="1d_p_1d")
 parser.add_argument("-b", type=int, default=32768, help="Batch size")
 parser.add_argument("-n", type=int, default=2, help="N_DAYS_LOOKBACK")
 parser.add_argument("-e", type=int, default=1000, help="Number of epochs")
+parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
 args = parser.parse_args()
 
 
@@ -152,13 +153,10 @@ def vis(t):
 
 
 print("--- 5. Training ---")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-seq_len = 8
-pred_len = 8
+device = 'cuda'
 model = Transformer(targs).to(device)
 criterion = nn.HuberLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=10)
 num_epochs = args.e
@@ -169,8 +167,6 @@ for epoch in range(num_epochs):
     for batch_X, batch_y in tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
         batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
-        vis(batch_X)
-        vis(batch_y)
         optimizer.zero_grad()
         with torch.autocast(device_type="cuda"):
             output = model(batch_X)
