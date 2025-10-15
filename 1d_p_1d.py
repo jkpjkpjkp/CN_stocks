@@ -4,10 +4,18 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from tqdm import tqdm
+import argparse
+
+parser = argparse.ArgumentParser(description="1d_p_1d")
+parser.add_argument("-b", type=int, default=32768, help="Batch size")
+parser.add_argument("-n", type=int, default=2, help="N_DAYS_LOOKBACK")
+parser.add_argument("-e", type=int, default=1000, help="Number of epochs")
+args = parser.parse_args()
 
 
-N_DAYS_LOOKBACK = 2
-batch_size = 256
+
+N_DAYS_LOOKBACK = args.n
+batch_size = args.b
 def get_df(N_DAYS_LOOKBACK, head=None):
     print("--- 1. Data Loading ---")
     df = pl.scan_parquet("../data/a_30min.pq")
@@ -83,7 +91,7 @@ def get_df(N_DAYS_LOOKBACK, head=None):
     print(f"Created {len(sequences_df)} samples of {N_DAYS_LOOKBACK}-day sequences.")
     return sequences_df
 
-df = get_df(N_DAYS_LOOKBACK, head=int(1e5))
+df = get_df(N_DAYS_LOOKBACK, head=int(1e6))
 print("--- 3. Custom Dataset and DataLoader ---")
 class StockDataset(Dataset):
     def __init__(self, df: pl.DataFrame):
@@ -91,7 +99,6 @@ class StockDataset(Dataset):
         self.targets = df["next_day_prices"].to_numpy()
 
     def __len__(self):
-        return 1024
         return len(self.sequences)
 
     def __getitem__(self, idx):
@@ -99,14 +106,10 @@ class StockDataset(Dataset):
         price_sequence = self.sequences[idx]
         next_day_prices = self.targets[idx]
 
-        # Convert lists to numpy arrays for numerical operations
-        # The input X will have shape (14, 8)
-        # The target y will have shape (8,)
         x_np = np.array(price_sequence, dtype=np.float32)
         y_np = np.array(next_day_prices, dtype=np.float32)
 
         # Normalize based on the last price of the last day in the input sequence
-        # This helps the model predict relative price changes
         val = x_np[-1]
         
         # Avoid division by zero, though unlikely with price data
@@ -122,21 +125,25 @@ class StockDataset(Dataset):
         return torch.from_numpy(x_normalized * scale_up), torch.from_numpy(y_normalized * scale_up)
 
 dataset = StockDataset(df)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
 
 print("--- 4. Model ---")
 from model import Transformer, ModelArgs
 
-args = ModelArgs(
+targs = ModelArgs(
     block_size=N_DAYS_LOOKBACK,
     patch_size=8,
     n_head=4,
     n_layer=2,
-    dim=128,
+    dim=256,
     rope_base=1024,
     max_batch_size=batch_size,
 )
+
+def vis(t):
+    import matplotlib.pyplot as plt
+    plt.plot(t.cpu().numpy())
+    plt.show()
 
 
 
@@ -145,22 +152,29 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 seq_len = 8
 pred_len = 8
-model = Transformer(args).to(device)
+model = Transformer(targs).to(device)
 criterion = nn.HuberLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=10)
-num_epochs = 1000
+num_epochs = args.e
 
+tot = 0
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
     for batch_X, batch_y in tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
         batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
+        tot += 1
+        if tot % 10 == 0:
+            vis(batch_X[:100])
+            vis(batch_y[:100])
+
         optimizer.zero_grad()
-        output = model(batch_X)
-        loss = criterion(output, batch_y)
+        with torch.autocast(device_type="cuda"):
+            output = model(batch_X)
+            loss = criterion(output, batch_y)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()

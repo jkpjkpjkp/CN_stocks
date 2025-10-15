@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "ipykernel>=7.0.0",
+    "matplotlib>=3.10.7",
     "polars[pandas]>=1.34.0",
     "torch>=2.8.0",
     "tqdm>=4.67.1",
