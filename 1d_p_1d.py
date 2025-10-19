@@ -12,84 +12,92 @@ parser.add_argument("-n", type=int, default=2, help="N_DAYS_LOOKBACK")
 parser.add_argument("-e", type=int, default=1000, help="Number of epochs")
 parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
 parser.add_argument("--cross-section-normalize", type=bool, default=False, help="Normalize whole market VWAP to 1")
-parser.add_argument("--dim", type=int, default=256, help="Dimension of model")
-parser.add_argument("--n-layer", type=int, default=2, help="Number of layers")
+parser.add_argument("-d", "--dim", type=int, default=256, help="Dimension of model")
+parser.add_argument("-l", "--n-layer", type=int, default=2, help="Number of layers")
 args = parser.parse_args()
-
 
 N_DAYS_LOOKBACK = args.n
 batch_size = args.b
-def get_df(N_DAYS_LOOKBACK, head=None):
-    df = pl.scan_parquet("../data/a_30min.pq")
-    df = df.drop(
-        ['open', 'high', 'low', 'close', 'volume', 'total_turnover']
-    ).rename({
-        'open_post': 'open',
-        'high_post': 'high',
-        'low_post': 'low',
-        'close_post': 'close',
-        'volume_post': 'volume',
-    })
 
-    if head is not None:
-        df = df.head(head)
+def get_df(N_DAYS_LOOKBACK, head=None, cache=True):
+    cache_dir = "../data/cache/a_30min_get_df.pq"
+    if cache and not head and pl.path_exists(cache_dir):
+        df = pl.scan_parquet(cache_dir)
+    else:
+        df = pl.scan_parquet("../data/a_30min.pq")
+        df = df.drop(
+            ['open', 'high', 'low', 'close', 'volume', 'total_turnover']
+        ).rename({
+            'open_post': 'open',
+            'high_post': 'high',
+            'low_post': 'low',
+            'close_post': 'close',
+            'volume_post': 'volume',
+        })
 
-    df = df.collect()
+        if head is not None:
+            df = df.head(head)
 
-    df = df.with_columns(
-        avg_price=(pl.col("open") + pl.col("high") + pl.col("low") + pl.col("close")) / 4
-    ).drop(
-        ["open", "high", "low", "close"]
-    )
+        df = df.collect()
 
-    # market_avg = df.select(
-    #     pl.col("volume") * pl.col("avg_price").alias("vwp")
-    # ).group_by("datetime").agg(
-    #     pl.col("vwp").sum().alias("total_vp"),
-    #     pl.col("volume").sum().alias("total_volume")
-    # )
-    # market_avg = market_avg.select(
-    #     "datetime",
-    #     pl.col("total_price") / pl.col("total_capita").alias("market_price")
-    # )
+        df = df.with_columns(
+            avg_price=(pl.col("open") + pl.col("high") + pl.col("low") + pl.col("close")) / 4
+        ).drop(
+            ["open", "high", "low", "close"]
+        )
 
-    # df = df.join(market_avg, on="datetime", how="left")
-    # df.with_columns(
-    #     price=pl.col("avg_price") / pl.col("market_price")
-    # ).drop(["avg_price", "traded_capita"])
+        df = df.with_columns(
+            pl.col("datetime").dt.date().alias("date")
+        )
 
-    df = df.with_columns(
-        pl.col("datetime").dt.date().alias("date")
-    )
-
-    daily_prices = (
-        df
-        .group_by(["order_book_id", "date"])
-        .agg(pl.col("avg_price").alias("prices"), pl.col("datetime").alias("datetimes"))
-    )
-
-    assert daily_prices["prices"].list.len().max() == 8
-    daily_prices = daily_prices.filter(pl.col("prices").list.len() == 8)
-
-    daily_prices = daily_prices.sort(["order_book_id", "date"])
-
-    price_sequence_expr = [
-        pl.col("prices").shift(i).over("order_book_id")
-        for i in range(N_DAYS_LOOKBACK - 1, -1, -1)
-    ]
-
-    sequences_df = daily_prices.with_columns(
-        pl.concat_list(price_sequence_expr).alias("price_sequence"),
-        pl.col("prices").shift(-1).over("order_book_id").alias("next_day_prices"),
-    ).drop_nulls()
-
-    assert len(sequences_df) == len(sequences_df.filter(pl.col("price_sequence").list.len() == N_DAYS_LOOKBACK * 8))
-
-    print(f"Created {len(sequences_df)} samples of {N_DAYS_LOOKBACK}-day sequences.")
-    return sequences_df
+        if cache and not head:
+            df.write_parquet(cache_dir)
 
 
-df = get_df(N_DAYS_LOOKBACK)
+    # Split data into train and validation based on year
+    train_df = df.filter(pl.col("datetime").dt.year() < 2024)
+    val_df = df.filter(pl.col("datetime").dt.year() == 2024)
+    
+    print(f"Train data: {len(train_df)} rows")
+    print(f"Validation data: {len(val_df)} rows")
+
+    def process_subset(subset_df):
+        daily_prices = (
+            subset_df
+            .group_by(["order_book_id", "date"])
+            .agg(pl.col("avg_price").alias("prices"), pl.col("datetime").alias("datetimes"))
+        )
+
+        assert daily_prices["prices"].list.len().max() == 8
+        daily_prices = daily_prices.filter(pl.col("prices").list.len() == 8)
+
+        daily_prices = daily_prices.sort(["order_book_id", "date"])
+
+        price_sequence_expr = [
+            pl.col("prices").shift(i).over("order_book_id")
+            for i in range(N_DAYS_LOOKBACK - 1, -1, -1)
+        ]
+
+        sequences_df = daily_prices.with_columns(
+            pl.concat_list(price_sequence_expr).alias("price_sequence"),
+            pl.col("prices").shift(-1).over("order_book_id").alias("next_day_prices"),
+        ).drop_nulls()
+
+        assert len(sequences_df) == len(sequences_df.filter(pl.col("price_sequence").list.len() == N_DAYS_LOOKBACK * 8))
+        
+        return sequences_df
+
+    train_sequences = process_subset(train_df)
+    val_sequences = process_subset(val_df)
+    
+    print(f"Created {len(train_sequences)} training samples of {N_DAYS_LOOKBACK}-day sequences.")
+    print(f"Created {len(val_sequences)} validation samples of {N_DAYS_LOOKBACK}-day sequences.")
+    
+    return train_sequences, val_sequences
+
+# Get both train and validation data
+train_df, val_df = get_df(N_DAYS_LOOKBACK)
+
 print("--- 3. Custom Dataset and DataLoader ---")
 class StockDataset(Dataset):
     def __init__(self, df: pl.DataFrame):
@@ -118,7 +126,9 @@ class StockDataset(Dataset):
 
         return torch.from_numpy(x_normalized * scale_up), torch.from_numpy(y_normalized * scale_up)
 
-dataset = StockDataset(df)
+# Create separate datasets for training and validation
+train_dataset = StockDataset(train_df)
+val_dataset = StockDataset(val_df)
 
 def compute_scaleup(dataset):
     xs = []
@@ -130,8 +140,9 @@ def compute_scaleup(dataset):
     nys = np.concatenate(ys, axis=0)
     breakpoint()
 
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
-
+# Create separate dataloaders
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8)
 
 from model import Transformer, ModelArgs
 
@@ -153,8 +164,6 @@ def vis(t):
         plt.plot(x, i.cpu().numpy())
     plt.show()
 
-
-
 print("--- 5. Training ---")
 device = 'cuda'
 model = Transformer(targs).to(device)
@@ -164,11 +173,15 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=10)
 num_epochs = args.e
 
+# Track best validation loss
+best_val_loss = float('inf')
+
 try:
     for epoch in range(num_epochs):
+        # Training phase
         model.train()
-        total_loss = 0
-        for batch_X, batch_y in tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
+        total_train_loss = 0
+        for batch_X, batch_y in tqdm(train_dataloader, desc=f"Epoch {epoch + 1} Training"):
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
             optimizer.zero_grad()
@@ -177,15 +190,46 @@ try:
                 loss = criterion(output, batch_y)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-        scheduler.step(total_loss / len(dataloader))
-
+            total_train_loss += loss.item()
+        
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        
+        # Validation phase
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch_X, batch_y in tqdm(val_dataloader, desc=f"Epoch {epoch + 1} Validation"):
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
+                with torch.autocast(device_type=device):
+                    output = model(batch_X)
+                    loss = criterion(output, batch_y)
+                total_val_loss += loss.item()
+        
+        avg_val_loss = total_val_loss / len(val_dataloader)
+        
+        # Step scheduler based on validation loss
+        scheduler.step(avg_val_loss)
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), 'best_model.pth')
+        
         print(
-            f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {total_loss / len(dataloader)}"
+            f"Epoch [{epoch + 1}/{num_epochs}], "
+            f"Train Loss: {avg_train_loss:.4f}, "
+            f"Val Loss: {avg_val_loss:.4f}, "
+            f"Best Val Loss: {best_val_loss:.4f}"
         )
+        
 except Exception as e:
-        print(f"Error at epoch {epoch + 1}: {e}")
-        breakpoint()
+    print(f"Error at epoch {epoch + 1}: {e}")
+    breakpoint()
+
+# Load best model for final evaluation
+print("Loading best model for final evaluation...")
+model.load_state_dict(torch.load('best_model.pth'))
 
 breakpoint()
 print("Training finished.")

@@ -5,15 +5,23 @@
 # LICENSE file in the root directory of this source tree.
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import (
+    _mask_mod_signature,
     BlockMask,
     flex_attention,
 )
+
+def get_mask_mod(mask_mod: _mask_mod_signature, offset: int):
+    def _mask_mod(b, h, q, kv):
+        return mask_mod(b, h, q + offset, kv)
+
+    return _mask_mod
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -125,12 +133,6 @@ transformer_configs = {
         intermediate_size=14336,
         vocab_size=128256,
         rope_base=500000,
-        rope_scaling=dict(
-            factor=8.0,
-            low_freq_factor=1.0,
-            high_freq_factor=4.0,
-            original_max_position_embeddings=8192,
-        ),
     ),
     "llama-3.1-70b": dict(
         block_size=131072,
@@ -141,12 +143,6 @@ transformer_configs = {
         intermediate_size=28672,
         vocab_size=128256,
         rope_base=500000,
-        rope_scaling=dict(
-            factor=8.0,
-            low_freq_factor=1.0,
-            high_freq_factor=4.0,
-            original_max_position_embeddings=8192,
-        ),
     ),
     "llama-3.1-405b": dict(
         block_size=131072,
@@ -157,12 +153,6 @@ transformer_configs = {
         intermediate_size=53248,
         vocab_size=128256,
         rope_base=500000,
-        rope_scaling=dict(
-            factor=8.0,
-            low_freq_factor=1.0,
-            high_freq_factor=4.0,
-            original_max_position_embeddings=8192,
-        ),
     ),
 }
 
@@ -233,7 +223,6 @@ class Transformer(nn.Module):
             self.config.dim // self.config.n_head,
             self.config.rope_base,
             dtype,
-            self.config.rope_scaling,
         )
 
     def forward(
@@ -361,42 +350,15 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-def apply_rope_scaling(freqs: torch.Tensor, rope_scaling: Optional[dict] = None):
-    factor = rope_scaling["factor"]
-    low_freq_factor = rope_scaling["low_freq_factor"]
-    high_freq_factor = rope_scaling["high_freq_factor"]
-    old_context_len = rope_scaling["original_max_position_embeddings"]
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-    new_freqs = []
-    for freq in freqs:
-        wavelen = 2 * math.pi / freq
-        if wavelen < high_freq_wavelen:
-            new_freqs.append(freq)
-        elif wavelen > low_freq_wavelen:
-            new_freqs.append(freq / factor)
-        else:
-            assert low_freq_wavelen != high_freq_wavelen
-            smooth = (old_context_len / wavelen - low_freq_factor) / (
-                high_freq_factor - low_freq_factor
-            )
-            new_freqs.append((1 - smooth) * freq / factor + smooth * freq)
-    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
-
-
 def precompute_freqs_cis(
     seq_len: int,
     n_elem: int,
     base: int = 10000,
     dtype: torch.dtype = torch.bfloat16,
-    rope_scaling: Optional[dict] = None,
 ) -> Tensor:
     freqs = 1.0 / (
         base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
     )
-    if rope_scaling is not None:
-        freqs = apply_rope_scaling(freqs, rope_scaling)
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
