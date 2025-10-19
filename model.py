@@ -245,10 +245,6 @@ class Transformer(nn.Module):
         preds = self.output(x)
         return preds
 
-    @classmethod
-    def from_name(cls, name: str):
-        return cls(ModelArgs.from_name(name))
-
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
