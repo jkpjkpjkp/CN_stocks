@@ -11,6 +11,9 @@ parser.add_argument("-b", type=int, default=32768, help="Batch size")
 parser.add_argument("-n", type=int, default=2, help="N_DAYS_LOOKBACK")
 parser.add_argument("-e", type=int, default=1000, help="Number of epochs")
 parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+parser.add_argument("--cross-section-normalize", type=bool, default=False, help="Normalize whole market VWAP to 1")
+parser.add_argument("--dim", type=int, default=256, help="Dimension of model")
+parser.add_argument("--n-layer", type=int, default=2, help="Number of layers")
 args = parser.parse_args()
 
 
@@ -86,7 +89,7 @@ def get_df(N_DAYS_LOOKBACK, head=None):
     return sequences_df
 
 
-df = get_df(N_DAYS_LOOKBACK, head=int(1e6))
+df = get_df(N_DAYS_LOOKBACK)
 print("--- 3. Custom Dataset and DataLoader ---")
 class StockDataset(Dataset):
     def __init__(self, df: pl.DataFrame):
@@ -129,15 +132,15 @@ def compute_scaleup(dataset):
 
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
 
-print("--- 4. Model ---")
+
 from model import Transformer, ModelArgs
 
 targs = ModelArgs(
     block_size=N_DAYS_LOOKBACK,
     patch_size=8,
     n_head=4,
-    n_layer=2,
-    dim=256,
+    n_layer=args.n_layer,
+    dim=args.dim,
     rope_base=1024,
     max_batch_size=batch_size,
 )
@@ -161,23 +164,28 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=10)
 num_epochs = args.e
 
-for epoch in range(num_epochs):
-    model.train()
-    total_loss = 0
-    for batch_X, batch_y in tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
-        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+try:
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        for batch_X, batch_y in tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
-        optimizer.zero_grad()
-        with torch.autocast(device_type="cuda"):
-            output = model(batch_X)
-            loss = criterion(output, batch_y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    scheduler.step(total_loss / len(dataloader))
+            optimizer.zero_grad()
+            with torch.autocast(device_type=device):
+                output = model(batch_X)
+                loss = criterion(output, batch_y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step(total_loss / len(dataloader))
 
-    print(
-        f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {total_loss / len(dataloader)}"
-    )
+        print(
+            f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {total_loss / len(dataloader)}"
+        )
+except Exception as e:
+        print(f"Error at epoch {epoch + 1}: {e}")
+        breakpoint()
 
+breakpoint()
 print("Training finished.")
