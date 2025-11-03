@@ -1,11 +1,11 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 from lightning import LightningModule as Module, LightningDataModule as DataModule
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import MLFlowLogger
-from lightning.pytorch.callbacks import RichProgressBar
+from lightning.pytorch.callbacks import Callback, RichProgressBar
 from lightning.pytorch.utilities import grad_norm
 import numpy as np
 
@@ -28,10 +28,10 @@ def apply_rotary_emb(x, cos, sin):
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
 
-class dm(DataModule):
-    def __init__(self):
+class ds(Dataset):
+    def __init__(self, filename):
         super().__init__()
-        self.data = np.load('../data/data.npy')[:1000000 * 119]
+        self.data = np.load(filename)
     
     def __len__(self):
         return len(self.data) // 119
@@ -41,9 +41,6 @@ class dm(DataModule):
         x = torch.tensor(x)
         x = (torch.clamp(x, 0.99, 1.01) - 1) * 420
         return x
-
-    def train_dataloader(self):
-        return DataLoader(self, 1024, num_workers=32, shuffle=True)
 
 class tm(Module):
     def __init__(self):
@@ -118,31 +115,37 @@ class tm(Module):
         if batch_idx % 10 == 0:
             self.log('train/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
         return loss
+
+    def validation_step(self, batch, batch_idx):
+        y = self(batch[:, :-1])
+        loss = nn.HuberLoss()(batch[:, 1:] * 3, y * 3)
+        if batch_idx % 10 == 0:
+            self.log('eval/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
+        return loss
         
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=3e-4)
 
-    def on_before_optimizer_step(self, optimizer):
-        layer_norms = grad_norm(self, norm_type=2)
-        self.log_dict(layer_norms, on_step=True, on_epoch=True, logger=True)
-    
-    def on_train_epoch_end(self):
-        weight_norms = {}
-        for name, param in self.named_parameters():
-            if 'weight' in name and param.requires_grad:  # Focus on weight tensors
-                norm = torch.norm(param).item()  # L2 norm (default); use p=1 for L1
-                weight_norms[f"{name}_weight_norm"] = norm
-        
-        self.log_dict(weight_norms, on_epoch=True, logger=True)
+class loggingMixin(Callback):
+    def __init__(self, every_n_steps):
+        super().__init__()
+        self.every_n_steps = every_n_steps
 
+    def on_before_optimizer_step(self, model, closure, optimizer):
+        layer_norms = grad_norm(closure, norm_type=2)
+        self.log_dict(layer_norms, on_step=True, on_epoch=True, logger=True)
 
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('medium')
+
+    model = tm()
     trainer = Trainer(
         max_epochs=42,
-        gradient_clip_val=1.,
-        callbacks=[RichProgressBar()],
+        gradient_clip_val=2.,
+        callbacks=[RichProgressBar(), loggingMixin(every_n_steps=20)],
         logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./ml-runs"),
     )
 
-    trainer.fit(tm(), dm())
+    trainer.fit(model, DataModule.from_datasets(ds('../data/train.npy'), ds('../data/eval.npy'), batch_size=2048))
+
+    breakpoint()
