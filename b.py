@@ -2,12 +2,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from lightning import LightningModule as Module, LightningDataModule as DataModule
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import MLFlowLogger
-from lightning.pytorch.callbacks import Callback, RichProgressBar
+from lightning.pytorch.callbacks import Callback, RichProgressBar, ModelCheckpoint
 from lightning.pytorch.utilities import grad_norm
 import numpy as np
+from einops import rearrange
+
+torch.autograd.set_detect_anomaly(True)
 
 def _precompute_rotary_embeddings(seq_len, head_dim, base=4242, device='cuda'):
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
@@ -19,13 +23,14 @@ def _precompute_rotary_embeddings(seq_len, head_dim, base=4242, device='cuda'):
         return cos, sin
 
 def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 3
+    assert x.shape[1:] == (118, 128)
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     out = torch.cat([y1, y2], -1) # re-assemble
-    out = out.to(x.dtype) # ensure input/output dtypes match
+    assert out.shape[1:] == (118, 128)
+    out = out.to(x.dtype)
     return out
 
 class ds(Dataset):
@@ -68,6 +73,31 @@ class tm(Module):
         x = torch.view_as_real(x * self.freq.unsqueeze(0)).flatten(3)
         return x.to(dtype)
     
+    def attention_block(self, x, b):
+        q, k, v = torch.chunk(self.qkv(x), 3, -1)
+        q = apply_rotary_emb(q, self.cos, self.sin)
+        k = apply_rotary_emb(k, self.cos, self.sin)
+
+        shape = (b, 118, 32, 4)
+        assert q.shape == (b, 118, 128)
+        assert k.shape == (b, 118, 128)
+        assert v.shape == (b, 118, 128)
+        q = rearrange(q.view(*shape), 'b l d h -> b h l d')
+        k = rearrange(k.view(*shape), 'b l d h -> b h l d')
+        v = rearrange(v.view(*shape), 'b l d h -> b h l d')
+        assert q.shape == (b, 4, 118, 32)
+        assert k.shape == (b, 4, 118, 32)
+        assert v.shape == (b, 4, 118, 32)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        assert y.shape == (b, 4, 118, 32)
+        y = y.transpose(1, 2).contiguous()
+        assert y.shape == (b, 118, 4, 32)
+        y = y.view(b, 118, 128)
+        y = self.fc2(y)
+        y = F.silu(y)
+        return y
+    
     def forward(self, x):
         b = x.shape[0]
         assert x.shape == (b, 118)
@@ -75,37 +105,10 @@ class tm(Module):
         x = self.fc1(x.unsqueeze(-1))
         x = F.silu(x)
 
-        q, k, v = torch.chunk(self.qkv(x), 3, -1)
-        q = apply_rotary_emb(q, self.cos, self.sin)
-        k = apply_rotary_emb(k, self.cos, self.sin)
+        x1 = self.attention_block(x, b)
 
-        shape = (b, 118, 32, 4)
-        q = q.view(*shape)
-        k = k.view(*shape)
-        v = v.view(*shape)
-
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(b, 118, 128)
-        y = self.fc2(y)
-        y = F.silu(y)
-
-        x = y
-        y = self.norm(y)
-        q, k, v = torch.chunk(self.qkv(x), 3, -1)
-        q = apply_rotary_emb(q, self.cos, self.sin)
-        k = apply_rotary_emb(k, self.cos, self.sin)
-
-        shape = (b, 118, 32, 4)
-        q = q.view(*shape)
-        k = k.view(*shape)
-        v = v.view(*shape)
-
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(b, 118, 128)
-        y = self.fc2(y)
-        y = F.silu(y)
-
-        y = self.fc3(x + y).squeeze(-1)
+        x2 = x1 + self.attention_block(self.norm(x1), b)
+        y = self.fc3(x2).squeeze(-1)
 
         return y
     
@@ -120,11 +123,22 @@ class tm(Module):
         y = self(batch[:, :-1])
         loss = nn.HuberLoss()(batch[:, 1:] * 3, y * 3)
         if batch_idx % 10 == 0:
-            self.log('eval/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
+            self.log('val/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
         return loss
         
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=3e-4)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=3e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=42 * 10419, eta_min=0.1)
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step', # or 'step'
+                'frequency': 1,
+            }
+        }
+
+
 
 class loggingMixin(Callback):
     def __init__(self, every_n_steps):
@@ -142,7 +156,11 @@ if __name__ == '__main__':
     trainer = Trainer(
         max_epochs=42,
         gradient_clip_val=2.,
-        callbacks=[RichProgressBar(), loggingMixin(every_n_steps=20)],
+        callbacks=[
+            RichProgressBar(), 
+            loggingMixin(every_n_steps=20),
+            ModelCheckpoint(dirpath="./ml-runs/models/", save_top_k=2, monitor="val/loss"),
+        ],
         logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./ml-runs"),
     )
 
