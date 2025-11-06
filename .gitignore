@@ -13,3 +13,4 @@ best_model.pth
 
 /ml-runs/
 *.npy
+*.pt
