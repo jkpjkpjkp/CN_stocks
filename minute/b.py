@@ -12,7 +12,7 @@ import numpy as np
 from einops import rearrange
 import random
 import matplotlib.pyplot as plt
-c
+
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
@@ -43,12 +43,11 @@ class ds(Dataset):
         return x
 
 class mha(Module):
-    def __init__(self):
+    def __init__(self, device='cpu'):
         super().__init__()
         self.qkv = nn.Linear(128, 3 * 128)
         self.fc2 = nn.Linear(128, 128)
         
-        device='cuda'
         channel_range = torch.arange(0, 128, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (10000 ** (channel_range / 128))
         t = torch.arange(118, dtype=torch.float32, device=device)
@@ -80,13 +79,13 @@ class mha(Module):
         return y
 
 class tm(Module):
-    def __init__(self):
+    def __init__(self, device='cpu'):
         super().__init__()
         self.emb = nn.Embedding(128, 128)
         self.fc1 = nn.Linear(1, 128)
         
-        self.attn1 = mha()
-        self.attn2 = mha()
+        self.attn1 = mha(device=device)
+        self.attn2 = mha(device=device)
 
         self.l1 = nn.Linear(128, 256)
         self.l2 = nn.Linear(256, 128)
@@ -162,7 +161,7 @@ class loggingMixin(Callback):
         trainer.logger.experiment.log_figure(trainer.logger.run_id, fig, f"val/plt{batch_idx}.png") 
         plt.close(fig)
 
-
+ 
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('medium')
 
@@ -174,9 +173,9 @@ if __name__ == '__main__':
         callbacks=[
             RichProgressBar(), 
             loggingMixin(every_n_steps=20),
-            ModelCheckpoint(dirpath="./ml-runs/models/", save_top_k=2, monitor="val/loss"),
+            ModelCheckpoint(dirpath="./mlruns/models/", save_top_k=2, monitor="val/loss"),
         ],
-        logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./ml-runs", artifact_location='./ml-runs/artifacts/'),
+        logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./mlruns", artifact_location='./ml-runs/artifacts/'),
     )
 
     trainer.fit(model, data)

@@ -10,11 +10,12 @@ from lightning import LightningModule, LightningDataModule
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import MLFlowLogger
 from lightning.pytorch.callbacks import Callback, RichProgressBar, ModelCheckpoint
+from functools import partial
 
 torch.autograd.set_detect_anomaly(True)
 torch.set_float32_matmul_precision('high')
 
-class NeierNorm(nn.LayerNorm):
+class NanLayerNrom(nn.LayerNorm):
     def forward(self, x):
         x = x - x.nanmean(dim=-1).unsqueeze(-1)
         x = x / (x.square().nanmean(dim=-1).sqrt().unsqueeze(-1) + self.eps)
@@ -26,7 +27,7 @@ def c_ret(x): # of shape f t i
     nnan = ret1d[ret1d.isnan().logical_not()]
     ret1d = torch.clamp(ret1d, nnan.quantile(0.01), nnan.quantile(0.99))
     with torch.no_grad():
-        norm = NeierNorm(5327)
+        norm = NanLayerNrom(5327)
         norm.to('cuda')
         norm.requires_grad_(False)
         ret1d = norm(ret1d).detach().cpu()
@@ -35,13 +36,13 @@ def c_ret(x): # of shape f t i
 
 
 class mod(LightningModule):
-    def __init__(self, n_feat=234, medi=16):
+    def __init__(self, n_feat=234, medi=32):
         super().__init__()
         # self.automatic_optimization = False
-        self.n1 = nn.BatchNorm1d(n_feat)
+        self.n1 = nn.LayerNorm(n_feat)
         self.ff1 = nn.Conv1d(n_feat, medi, 1)
 
-        self.n2 = nn.BatchNorm1d(medi)
+        self.n2 = nn.LayerNorm(medi)
         self.ff2 = nn.Conv1d(medi, medi, 1)
 
         self.ff3 = nn.Conv1d(medi * 2, 1, 1)
@@ -49,14 +50,14 @@ class mod(LightningModule):
     def forward(self, x):
         f, t, i = x.shape
         cnt = x.isnan().sum()
-        x = self.n1(x)
+        x = self.n1(x.transpose(1,2)).transpose(1,2)
         assert x.isnan().sum() == cnt
         x2 = self.ff1(rearrange(x.nan_to_num(0), 't f i -> t f i'))
 
         assert x2.isnan().logical_not().all()
         x = x2
         l = F.silu(x).log1p()
-        l = self.n2(l)
+        l = self.n2(l.transpose(1,2)).transpose(1,2)
         assert l.isnan().logical_not().all()
         l = self.ff2(l)
         assert l.isnan().logical_not().all()
@@ -80,15 +81,16 @@ class mod(LightningModule):
         return loss
     
     def training_step(self, batch, batch_id):
+        
         loss = self.step(batch)
         assert loss.isfinite()
-        self.log('train/loss', loss)
+        self._log('train/loss', loss, on_step=True)
         return loss
 
-    def validation_step(self, batch, batch_id):
-        loss = self.step(batch)
-        self.log('val/loss', loss)
-        return loss
+    # def validation_step(self, batch, batch_id):
+    #     loss = self.step(batch)
+    #     self._log('val/loss', loss)
+    #     return loss
 
     def configure_optimizers(self):
         n1_params = list(self.n1.parameters())
@@ -105,6 +107,9 @@ class mod(LightningModule):
             lr=3e-4,
             betas=(0.9, 0.95),
         )
+
+    def _log(self, *args, **kwargs):
+        return partial(self.log, on_epoch=True, logger=True, prog_bar=True)(*args, **kwargs)
 
 class dat(Dataset):
     def __init__(self, c, p, v):
@@ -134,18 +139,19 @@ def datasets():
 
 def main():
     trainer = Trainer(
-        max_epochs=42,
+        overfit_batches=1,
+        max_epochs=4200,
         gradient_clip_val=1.,
         callbacks=[
             RichProgressBar(),
             ModelCheckpoint(dirpath="./ml-runs/models/", save_top_k=2, monitor="val/loss"),
         ],
-        logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./ml-runs", artifact_location='./ml-runs/artifacts/'),
+        logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./mlruns", artifact_location='./ml-runs/artifacts/'),
         log_every_n_steps=1,
     )
 
     model = mod()
-    data = LightningDataModule.from_datasets(*datasets(), batch_size=2, num_workers=16)
+    data = LightningDataModule.from_datasets(*datasets(), batch_size=2, num_workers=2)
 
     trainer.fit(model, data)
     breakpoint()

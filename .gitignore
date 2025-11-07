@@ -12,5 +12,6 @@ uv.lock
 best_model.pth
 
 /ml-runs/
+/mlruns/
 *.npy
 *.pt

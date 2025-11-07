@@ -20,7 +20,10 @@ def a(df, filename):
 
     df = df.filter(pl.col.id_hd.is_in(full['id_hd']))
 
+    df = df.group_by(pl.col.datetime.dt.date(), (pl.col.datetime.dt.time() < datetime.time(12)))
+    df = df.sort(pl.col.datetime.dt.date(), (pl.col.datetime.dt.time() < datetime.time(12)), 'id', 'datetime')
     data = df['ret'].to_numpy()
+    time = df['datetime'].to_numpy()
 
     np.save(filename, data)
 
