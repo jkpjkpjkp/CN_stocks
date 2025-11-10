@@ -142,19 +142,19 @@ class loggingMixin(Callback):
         layer_norms = grad_norm(closure, norm_type=2)
         self.log_dict(layer_norms, on_step=True, on_epoch=True, logger=True)
     
-    def on_train_batch_end(self, trainer: Trainer, pl_module: Module, outputs, batch, batch_idx: int) -> None:
-        fig, ax = plt.subplots()
-        ax.plot(np.arange(118), outputs['sample'][1:], label='gt')
-        ax.plot(np.arange(118), outputs['pred'], label='pred')
-        trainer.logger.experiment.log_figure(trainer.logger.run_id, fig, f"train/plt{batch_idx}.png") 
-        plt.close(fig)
+    # def on_train_batch_end(self, trainer: Trainer, pl_module: Module, outputs, batch, batch_idx: int) -> None:
+    #     fig, ax = plt.subplots()
+    #     ax.plot(np.arange(118), outputs['sample'][1:], label='gt')
+    #     ax.plot(np.arange(118), outputs['pred'], label='pred')
+    #     trainer.logger.experiment.log_figure(trainer.logger.run_id, fig, f"train/plt{batch_idx}.png") 
+    #     plt.close(fig)
     
-    def on_val_batch_end(self, trainer: Trainer, pl_module: Module, outputs, batch, batch_idx: int) -> None:
-        fig, ax = plt.subplots()
-        ax.plot(np.arange(118), outputs['sample'][1:], label='gt')
-        ax.plot(np.arange(118), outputs['pred'], label='pred')
-        trainer.logger.experiment.log_figure(trainer.logger.run_id, fig, f"val/plt{batch_idx}.png") 
-        plt.close(fig)
+    # def on_val_batch_end(self, trainer: Trainer, pl_module: Module, outputs, batch, batch_idx: int) -> None:
+    #     fig, ax = plt.subplots()
+    #     ax.plot(np.arange(118), outputs['sample'][1:], label='gt')
+    #     ax.plot(np.arange(118), outputs['pred'], label='pred')
+    #     trainer.logger.experiment.log_figure(trainer.logger.run_id, fig, f"val/plt{batch_idx}.png") 
+    #     plt.close(fig)
 
 
 if __name__ == '__main__':

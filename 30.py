@@ -27,9 +27,9 @@ class ds(Dataset):
 
     def __getitem__(self, idx):
         x = self.data[idx * 119 : (idx+1) * 119]
-        x = np.searchsorted(self.q, x)
         y = np.prod(np.lib.stride_tricks.sliding_window_view(x, 30), axis=-1).flatten()
         y = np.searchsorted(self.q30, y)
+        x = np.searchsorted(self.q, x)
         return x, y
 
 random.seed(42)
@@ -44,7 +44,7 @@ class t30m(Module):
         
         self.attn1 = mha(device=device)
         self.attn2 = mha(device=device)
-
+  
         self.l1 = nn.Linear(128, 256)
         self.l2 = nn.Linear(256, 128)
 
@@ -54,13 +54,12 @@ class t30m(Module):
         self.fc1 = nn.Linear(1, 128)
     
     def forward(self, x):
-        with torch.no_grad():
-            x = self.emb(x)
+        x = self.emb(x)
 
-            x = x + self.attn1(x)
-            x = x + self.l2(F.silu(self.l1(x)))
+        x = x + self.attn1(x)
+        x = x + self.l2(F.silu(self.l1(x)))
 
-            x = x + self.attn2(self.norm(x))
+        x = x + self.attn2(self.norm(x))
         
         x = self.fc3(x)
         return x
@@ -76,7 +75,7 @@ class t30m(Module):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x[:, :-35])
-        loss = nn.CrossEntropyLoss()(y_hat.view(-1, 128), y[:, 5:].contiguous().view(-1))
+        loss = nn.CrossEntropyLoss()(y_hat.view(-1, 128), y[:, 6:].contiguous().view(-1))
         if batch_idx % 10 == 0:
             self.log('val/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
         return loss
@@ -88,7 +87,7 @@ class t30m(Module):
         }
 
 def main():
-    model = t30m.load_from_checkpoint('ml-runs/models/epoch=40-step=213610.ckpt')
+    model = t30m.load_from_checkpoint('mlruns/models/epoch=14-step=78150.ckpt')
     
     torch.set_float32_matmul_precision('medium')
     data = DataModule.from_datasets(ds('../data/train.npy'), ds('../data/eval.npy'), batch_size=4096, num_workers=16)
@@ -98,7 +97,7 @@ def main():
         callbacks=[
             RichProgressBar(), 
             loggingMixin(every_n_steps=20),
-            ModelCheckpoint(dirpath="./mlruns/models/", save_top_k=2, monitor="val/loss"),
+            ModelCheckpoint(dirpath="./mlruns/models_/", save_top_k=2, monitor="val/loss"),
         ],
         logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./mlruns", artifact_location='./ml-runs/artifacts/'),
     )
