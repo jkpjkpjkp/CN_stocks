@@ -21,7 +21,7 @@ class ds(Dataset):
         self.data = np.load(filename)
         self.q = np.load('q.npy')
         self.q30 = np.load('q30.npy')
-        self
+        
     def __len__(self):
         return len(self.data) // 119
 
@@ -54,31 +54,27 @@ class t30m(Module):
         self.fc1 = nn.Linear(1, 128)
     
     def forward(self, x):
-        x = self.emb(x)
+        with torch.no_grad():
+            x = self.emb(x)
 
-        x = x + self.attn1(x)
-        x = x + self.l2(F.silu(self.l1(x)))
+            x = x + self.attn1(x)
+            x = x + self.l2(F.silu(self.l1(x)))
 
-        x = x + self.attn2(self.norm(x))
+            x = x + self.attn2(self.norm(x))
         
         x = self.fc3(x)
         return x
     
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx, train = 'train'):
         x, y = batch
-        y_hat = self(x[:, :-35])
-        loss = nn.CrossEntropyLoss()(y_hat.view(-1, 128), y[:, 6:].contiguous().view(-1))
+        y_hat = self(x)
+        loss = nn.CrossEntropyLoss()(y_hat[:, 29:, :].contiguous().view(-1, 128), y.contiguous().view(-1))
         if batch_idx % 10 == 0:
-            self.log('train/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
+            self.log(f'{train}/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x[:, :-35])
-        loss = nn.CrossEntropyLoss()(y_hat.view(-1, 128), y[:, 6:].contiguous().view(-1))
-        if batch_idx % 10 == 0:
-            self.log('val/loss', loss, prog_bar=True, on_epoch=True, on_step=True, logger=True)
-        return loss
+        return self.training_step(batch, batch_idx, train='val')
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=3e-4)
@@ -87,17 +83,26 @@ class t30m(Module):
         }
 
 def main():
-    model = t30m.load_from_checkpoint('mlruns/models/epoch=14-step=78150.ckpt')
+    model = t30m.load_from_checkpoint('mlruns/models_predict_past/epoch=0-step=5210.ckpt')
     
     torch.set_float32_matmul_precision('medium')
-    data = DataModule.from_datasets(ds('../data/train.npy'), ds('../data/eval.npy'), batch_size=4096, num_workers=16)
+    data = DataModule.from_datasets(
+        ds('../data/train.npy'), 
+        ds('../data/eval.npy'), 
+        batch_size=4096, 
+        num_workers=16,
+    )
     trainer = Trainer(
         max_epochs=42,
         gradient_clip_val=1.,
+        precision="bf16-mixed",
+        accelerator="gpu",
+        devices=1,
+        num_nodes=1,
         callbacks=[
-            RichProgressBar(), 
+            RichProgressBar(),
             loggingMixin(every_n_steps=20),
-            ModelCheckpoint(dirpath="./mlruns/models_/", save_top_k=2, monitor="val/loss"),
+            ModelCheckpoint(dirpath="./mlruns/models_predict_past/", save_top_k=2, monitor="val/loss"),
         ],
         logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./mlruns", artifact_location='./ml-runs/artifacts/'),
     )

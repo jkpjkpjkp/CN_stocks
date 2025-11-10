@@ -26,7 +26,7 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin[:l]) + x2 * cos[:l]
     out = torch.cat([y1, y2], -1) # re-assemble
     assert out.shape[2:] == (128,)
-    assert out.shape[1] <= 118
+    assert out.shape[1] <= 119
     out = out.to(x.dtype)
     return out
 
@@ -52,7 +52,7 @@ class mha(Module):
         
         channel_range = torch.arange(0, 128, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (10000 ** (channel_range / 128))
-        t = torch.arange(118, dtype=torch.float32, device=device)
+        t = torch.arange(119, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         self.cos, self.sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
 
