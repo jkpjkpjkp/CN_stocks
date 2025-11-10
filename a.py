@@ -1,21 +1,8 @@
-import os
-import h5py
 import numpy as np
 
-def get_file(file):
-    with h5py.File(file, 'r') as f:
-        return np.array(f['values'])
+x = np.load('../data/train.npy')
 
-data = []
-from os.path import join, getsize
-for root, dirs, files in os.walk('/data/share/data'):
-    for file in files:
-        if ('_' not in file or file[-5] == '_' and file[-4] == '0') and getsize(join(root, file)) == 163213752:
-            data.append(get_file(join(root, file)))
+x = x.reshape(-1, 119)
 
-data = np.concat(data)
-
-print(data.shape)
-
-
-
+y = np.prod(np.lib.stride_tricks.sliding_window_view(x, (1,30)), axis=-1)
+print(y)
