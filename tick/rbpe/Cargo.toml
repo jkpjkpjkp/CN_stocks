@@ -3,5 +3,9 @@ name = "rbpe"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rbpe"
+crate-type = ["cdylib"]
+
 [dependencies]
 rayon = "1.11.0"

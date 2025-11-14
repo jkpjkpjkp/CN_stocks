@@ -1,8 +1,11 @@
 use std::fs;
 use std::io;
-use rayon::prelude::*;
+use std::env;
 use std::collections::HashMap;
 use std::cmp::Reverse;
+use std::bstr::ByteString;
+
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Pair(u16, u16);
@@ -77,32 +80,28 @@ fn read_binary_file_to_vec(path: &str) -> io::Result<Vec<u8>> {
 }
 
 fn convert_bytes_to_tokens(bytes: &[u8]) -> Vec<u16> {
-    bytes.iter()
+    bytes.par_iter()
         .map(|&b| b as u16)
         .collect()
 }
 
-fn main() {
-    let bytes: Vec<u8>;
-    let Ok(bytes) = read_binary_file_to_vec("../../0_500.bin") else {
-        eprintln!("Error reading binary file");
-        return;
-    };
-    println!("Successfully read {} bytes from the binary file.", bytes.len());
-    
-    // Convert bytes to initial token IDs (0-255 for bytes, 256+ for merges)
+fn bpe(bytes: &Vec<u8>, next_id: u16 = 256, num_merges: usize = 10) {
     let mut tokens = convert_bytes_to_tokens(&bytes);
     
     // Initialize pair counting
     let mut pair_counts = count_byte_pairs_parallel(&tokens);
     
     let mut merges = Vec::new();
-    let mut next_id = 256;
-    let target_merges = 1000;
+    let mut next_id = next_id;
     
     println!("Starting BPE training with {} tokens...", tokens.len());
     
-    for i in 0..target_merges {
+    let mut token_to_str: HashMap<u16, ByteString> = HashMap::new();
+    for i in -63..=63{
+        token_to_str[i + 64 as u16] = ByteString::from(vec![i as u8]);
+    }
+
+    for i in 0..num_merges {
         if pair_counts.is_empty() {
             println!("No more pairs to merge at iteration {}", i);
             break;
@@ -132,6 +131,7 @@ fn main() {
         
         // Record the merge
         merges.push((current_pair, next_id));
+        token_to_str[next_id] = &token_to_str[current_pair.0].clone() + &token_to_str[current_pair.1].clone();
         
         println!("Iteration {}: merged pair ({}, {}) -> {} (count: {})", 
                     i, current_pair.0, current_pair.1, next_id, current_count);
@@ -146,4 +146,14 @@ fn main() {
     for (i, &(pair, id)) in merges.iter().enumerate().take(10) {
         println!("{}: ({}, {}) -> {}", i, pair.0, pair.1, id);
     }
+}
+
+fn mian() {
+    let bytes: Vec<u8>;
+    let Ok(bytes) = read_binary_file_to_vec("../../0_500.bin") else {
+        eprintln!("Error reading binary file");
+        return;
+    };
+    println!("Successfully read {} bytes from the binary file.", bytes.len());
+    bpe(&bytes)
 }

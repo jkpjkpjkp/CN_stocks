@@ -1,10 +1,14 @@
 import polars as pl
 
-series = pl.scan_parquet(
-    '/dev/shm/0_500.pq'
+pl.scan_parquet(
+    '/dev/shm/600000_600200.pq'
 ).select(
-    'id', 'datetime', 'close',
-).select(
+    'id', 'datetime', 'close', 'a1'
+).sort('id', 'datetime'
+).sink_parquet('/dev/shm/0_2h_sorted.pq')
+
+
+select(
     pl.col.close - pl.col.close.shift(1).over('id')
 ).select(
     pl.when(pl.col.close.abs() < 64)
