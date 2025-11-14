@@ -31,7 +31,7 @@ def apply_rotary_emb(x, cos, sin):
     return out
 
 class ds(Dataset):
-    def __init__(self, filename):
+    def __init__(self, filename='../data/train.npy'):
         super().__init__()
         self.data = np.load(filename)
         self.q = np.load('q.npy')
@@ -83,6 +83,7 @@ class mha(Module):
 class tm(Module):
     def __init__(self, device='cuda'):
         super().__init__()
+        self.fc1 = nn.Linear(1, 128) # useless. legacy reasons
         self.emb = nn.Embedding(128, 128)
         
         self.attn1 = mha(device=device)
