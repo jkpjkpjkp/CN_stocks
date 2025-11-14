@@ -29,9 +29,49 @@ pub fn count_byte_pairs(bytes: &[u8]) -> HashMap<(u8, u8), usize> {
         )
 }
 
-pub fn most_frequent_pair(bytes: &[u8]) -> Option<((u8, u8), usize)> {
+pub fn most_frequent_pair(bytes: &[u16]) -> Option<((u8, u8), usize)> {
     count_byte_pairs(bytes).into_iter().max_by_key(|(_, count)| *count)
 }
+
+fn merge_pair(ids: Vec<u16>, pair: (u16, u16), new_id: u16) -> Vec<(Pair, i32)> {
+    let (a, b) = pair;
+    let n = ids.len();
+    if n < 2 {
+        return Vec::new();
+    }
+
+    let mut out: Vec<u32> = Vec::with_capacity(n);
+    let mut deltas: Vec<(Pair, i32)> = Vec::with_capacity(6);
+
+    let mut i = 0;
+    while i < n {
+        if i + 1 < n && ids[i] == a && ids[i + 1] == b {
+            let left = out.last().copied();
+            let right = if i + 2 < n { Some(ids[i + 2]) } else { None };
+
+            // remove old pairs
+            if let Some(x) = left {
+                deltas.push(((x, a), -1));
+                deltas.push(((x, new_id), 1));
+            }
+            deltas.push(((a, b), -1));
+            if let Some(y) = right {
+                deltas.push(((b, y), -1));
+                deltas.push(((new_id, y), 1));
+            }
+
+            // write merged token
+            out.push(new_id);
+            i += 2; // skip 'a' and 'b'
+        } else {
+            out.push(self.ids[i]);
+            i += 1;
+        }
+    }
+    
+    (out, deltas)
+}
+
 
 fn read_binary_file_to_vec(path: &str) -> io::Result<Vec<u8>> {
     fs::read(path)
@@ -58,6 +98,6 @@ fn main() {
         let pair = most_frequent_pair(bytes);
         merges.push((pair.unwrap(), tot));
         tot += 1;
-        
+
     }
 }
