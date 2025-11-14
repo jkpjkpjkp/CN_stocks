@@ -7,8 +7,8 @@ series = pl.scan_parquet(
 ).select(
     pl.col.close - pl.col.close.shift(1).over('id')
 ).select(
-    pl.when(pl.col.close.abs() < 128)
-        .then(pl.col.close + 128)
+    pl.when(pl.col.close.abs() < 64)
+        .then(pl.col.close + 64)
         .otherwise(pl.lit(0))
         .cast(pl.UInt8)
 ).collect()[
