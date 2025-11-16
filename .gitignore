@@ -15,5 +15,6 @@ best_model.pth
 /mlruns/
 *.npy
 *.pt
-/checkpoint/
+/.checkpoints/
+/.data/
 /*.bin
