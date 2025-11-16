@@ -12,11 +12,24 @@ import numpy as np
 from einops import rearrange
 import random
 import matplotlib.pyplot as plt
+from transformers import PreTrainedModel, PretrainedConfig
 
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
+
+class transformerConfig(PretrainedConfig):
+    model_type = "t1p1"
+    layers=7
+    hidden_size=256
+    intermediate_size=384 # as per Ettin, weirdly small
+    attention_heads=4
+    lr=3e-3
+    weight_decay=3e-4
+    warmup_tokens=int(4*10**9)
+    batch_warmup=int(125*10**9)
+    
 
 def apply_rotary_emb(x, cos, sin):
     l = x.shape[1]
@@ -34,7 +47,7 @@ class ds(Dataset):
     def __init__(self, filename='../data/train.npy'):
         super().__init__()
         self.data = np.load(filename)
-        self.q = np.load('q.npy')
+        self.q = np.load('./.results/128th_quantiles_of_1min_ret.npy')
 
     def __len__(self):
         return len(self.data) // 119
@@ -169,9 +182,9 @@ if __name__ == '__main__':
         callbacks=[
             RichProgressBar(), 
             loggingMixin(every_n_steps=20),
-            ModelCheckpoint(dirpath="./mlruns/models/", save_top_k=2, monitor="val/loss"),
+            ModelCheckpoint(dirpath="./.checkpoints/mlruns/models/", save_top_k=2, monitor="val/loss"),   # TODO: dirpath
         ],
-        logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./mlruns", artifact_location='./ml-runs/artifacts/'),
+        logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri="file:./.checkpoints/mlruns", artifact_location='./ml-runs/artifacts/'),
     )
 
     trainer.fit(model, data)

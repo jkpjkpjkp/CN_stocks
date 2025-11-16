@@ -10,6 +10,6 @@ the same model can only achieve a 3.5 train loss. (unsaturated) -> bigger model
 
 
 ## 1min p 30min
-
+> ./min/models/quantile_quantized/t1p30.py
 enlarged model following Ettin (2507.11412v1), which itself follows ModernBert
 

@@ -11,7 +11,7 @@ import random
 import os
 import subprocess
 
-from min.t1p1 import mha, loggingMixin
+from min.models.quantile_quantized.t1p1 import mha, loggingMixin
 
 # @numba.jit(nopython=True)
 def item_factory(slice, q, q30):
