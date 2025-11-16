@@ -1,0 +1,1 @@
+Write code for HUMAN to read, not computer
