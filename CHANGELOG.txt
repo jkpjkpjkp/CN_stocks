@@ -1,9 +1,15 @@
-## 1min p 1min
+## 1min p 1min      
+> ./min/models/quantile_quantized/t1p1.py
 we discretized 1-min returns evenly into 128 bins and use a half-day context to predict next-1-min return.
 works tremendously well and can achieve 10^5 top-tenth gain if we can at no cost trade per-minute. 
 the model is exactly the same as a dense LLM
 
 the model achieves 2.0 val loss (cross entropy).
-the same model can only achieve a 3.5 train loss.  (unsaturated)
+the same model can only achieve a 3.5 train loss. (unsaturated) -> bigger model
+               diverged after 190k steps -> StableAdamW
 
+
+## 1min p 30min
+
+enlarged model following Ettin (2507.11412v1), which itself follows ModernBert
 
