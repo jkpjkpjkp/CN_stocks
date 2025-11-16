@@ -11,6 +11,4 @@ wheels/
 uv.lock
 best_model.pth
 
-/ml-runs/
-/mlruns/
 /.checkpoints/
