@@ -17,6 +17,7 @@ dependencies = [
     "pytorch-lightning>=2.5.5",
     "redis[hiredis]>=7.0.1",
     "rich>=14.2.0",
+    "seaborn>=0.13.2",
     "torch>=2.8.0",
     "tqdm>=4.67.1",
     "transformers>=4.57.1",

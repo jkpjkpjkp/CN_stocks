@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F, Module
 from einops import rearrange
-from .model import dummyLightning
+from .main import dummyLightning
 
 def apply_rotary_emb(x, cos, sin):
     l = x.shape[1]

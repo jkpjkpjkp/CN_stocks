@@ -15,3 +15,10 @@ enlarged model following Ettin (2507.11412v1), which itself follows ModernBert
 
 very weirdly, enlarging model do not drop loss below 3.5
 investigating logits to see why
+
+
+
+## compression
+is absolutely the way to go
+
+the only left algorithmic task is to discover inter-id relations
