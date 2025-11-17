@@ -1,4 +1,5 @@
 from torch.nn import Module
+from torch.utils.data import DataLoader
 import mlflow
 import random
 from datetime import timedelta
@@ -53,6 +54,21 @@ class dummyLightning(Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+    
+    def training_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+            shuffle=True,
+        )
+    
+    def validation_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+        )
     
     def optimizer_step(self):
         self.optimizer.step()

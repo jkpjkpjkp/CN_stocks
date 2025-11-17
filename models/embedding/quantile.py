@@ -7,6 +7,7 @@ import mlflow
 import random
 
 from ..prelude.model import dummyLightning
+from ..prelude.data import halfdayData
 
 class quantile_1min(Dataset):
     def __init__(self, config, filename='../data/train.npy'):
@@ -24,18 +25,15 @@ class quantile_1min(Dataset):
         x = np.searchsorted(self.q, x)
         return x
 
-class _quantile_30min(Dataset):
+
+class _quantile_30min(Dataset, halfdayData):
     def __init__(self, filename):
-        super().__init__()
-        self.data = np.load(filename) if isinstance(filename, str) else filename
+        super().__init__(filename)
         self.q = np.load('./.results/128th_quantiles_of_1min_ret.npy')
         self.q30 = np.load('./.results/q30.npy')
     
-    def __len__(self):
-        return len(self.data) // 119
-
     def __getitem__(self, idx):
-        x = self.data[idx * 119 : (idx+1) * 119]
+        x = super()[idx]
         y = np.prod(np.lib.stride_tricks.sliding_window_view(x, 30), axis=-1).flatten()
         y = np.searchsorted(self.q30, y)
         x = np.searchsorted(self.q, x)
@@ -47,28 +45,10 @@ class quantile_30min(dummyLightning):
         self.trunk = trunk
         self.train_dataset = _quantile_30min('../data/train.npy')
         self.val_dataset = _quantile_30min('../data/val.npy')
-        self.batch_size = config.batch_size
-        self.num_workers = config.num_workers
         
         self.emb1 = Embedding(config.vocab_size, config.hidden_size)
         self.emb30 = Embedding(config.vocab_size, config.hidden_size)
         self.readout = Linear(config.hidden_size, config.vocab_size)
-        
-    
-    def training_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=True,
-        )
-    
-    def validation_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-        )
     
     def forward(self, x1, x30):
         b = x1.shape[0]
