@@ -44,6 +44,7 @@ class _quantile_30min(Dataset):
 class quantile_30min(dummyLightning):
     def __init__(self, config, trunk):
         super().__init__(config)
+        self.trunk = trunk
         self.train_dataset = _quantile_30min('../data/train.npy')
         self.val_dataset = _quantile_30min('../data/val.npy')
         self.batch_size = config.batch_size
@@ -74,10 +75,7 @@ class quantile_30min(dummyLightning):
         x1 = self.emb1(x1)
         x30 = self.emb30(x30)
         return x1 + torch.concat((torch.zeros((b, 29, self.config.hidden_size), device=x30.device, dtype=x30.dtype), x30), dim=1)
-    
-    def readout(self, h):
-        return self.readout(h)
-    
+
     def step(self, batch):
         x, y = batch
         emb = self(x[:, :-30], y[:, :-30])
@@ -98,7 +96,13 @@ class quantile_30min(dummyLightning):
         else:
             self.eval()
         for batch in dataloader:
-            batch = {k: v.to(self.config.device) for k, v in batch.items()}
+            if isinstance(batch, (list, tuple)):
+                batch = [item.to(self.config.device) for item in batch]
+            elif isinstance(batch, dict):
+                batch = {k: v.to(self.config.device) for k, v in batch.items()}
+            else:
+                batch = batch.to(self.config.device)
+            
             self.optimizer.zero_grad()
             outputs = self.step(batch)
             if train:
@@ -109,15 +113,17 @@ class quantile_30min(dummyLightning):
                 self.optimizer_step()
             if random.randint(0, 9) == 0:
                 mlflow.log_metric(f'{"train" if train else "val"}_loss', outputs['loss'].item(), step=self.global_step)
+            self.global_step += 1
 
     def fit(self):
-        mlflow.set_experiment()
+        mlflow.set_experiment("quantile_30min")
         self.to(self.config.device)
         self.activate()
         
         train_dataloader = self.training_dataloader()
         val_dataloader = self.validation_dataloader()
         
+        self.global_step = 0
         for _ in range(self.config.epochs):
             self._iteration(train_dataloader, train=True)
             self._iteration(val_dataloader, train=False)

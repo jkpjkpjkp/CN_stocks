@@ -53,7 +53,7 @@ class t30m(Module):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
         def warmup_lambda(step):
-            return min(step / self.config.warmup_tokens, 1.0)
+            return min(step / (self.config.warmup_steps + 1e-10), 1.0)
         
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, 
@@ -76,7 +76,7 @@ def main(checkpoint_dir):
         intermediate_ratio=2,
         layers=4,
         lr=3e-4,
-        warmup_tokens=1000,
+        warmup_steps=1000,
     )
     model = t30m(config)
 

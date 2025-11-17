@@ -80,4 +80,4 @@ class tm(dummyLightning):
         return x
 
     def configure_optimizers(self):
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
+        return torch.optim.AdamW(self.parameters(), lr=self.config.lr)

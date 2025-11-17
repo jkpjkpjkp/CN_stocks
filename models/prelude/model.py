@@ -9,7 +9,7 @@ class dummyLightning(Module):
     def optimizer_step(self):
         self.optimizer.step()
         self.optimizer.zero_grad()
-        if self.scheduler:
+        if hasattr(self, 'scheduler') and self.scheduler:
             self.scheduler.step()
         
         for name, module in self.named_children():

@@ -12,3 +12,4 @@ uv.lock
 best_model.pth
 
 /.checkpoint*
+/mlruns/

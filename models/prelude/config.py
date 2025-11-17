@@ -10,8 +10,8 @@ class transformerConfig(PretrainedConfig):
     weight_decay=3e-4
     norm='LayerNorm'
     device='cuda'
-    warmup_tokens=int(4*10**9)
-    batch_warmup=int(125*10**9)
+    warmup_steps=0
+    batch_warmup=0
     seq_len=119
     vocab_size=128
     mlflow_dir='./.checkpoint/mlruns'
