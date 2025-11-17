@@ -24,4 +24,4 @@ class chrono(dummyLightning):
         return x
     
     def step(self, batch):
-        
+        pass

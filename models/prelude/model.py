@@ -1,3 +1,4 @@
+import torch
 from torch.nn import Module
 from torch.utils.data import DataLoader
 import mlflow
@@ -80,7 +81,7 @@ class dummyLightning(Module):
             if isinstance(module, dummyLightning):
                 module.optimizer_step()
     
-    def activate(self):
+    def _activate(self):
         opt = self.configure_optimizers()
         if isinstance(opt, dict):
             self.optimizer = opt['optimizer']
@@ -90,7 +91,11 @@ class dummyLightning(Module):
         
         for name, module in self.named_children():
             if isinstance(module, dummyLightning):
-                module.activate()
+                module._activate()
+        
+    def activate(self):
+        self._activate()
+        self.forward = torch.autocast(device_type=self.config.device, dtype=torch.bfloat16)(torch.compile(self.forward))
     
     def _iteration(self, dataloader, progress, epoch, num_epochs, train=True):
         if train:
@@ -126,6 +131,7 @@ class dummyLightning(Module):
     def fit(self):
         self.to(self.config.device)
         self.activate()
+        torch.set_float32_matmul_precision('medium')
         
         train_dataloader = self.training_dataloader()
         val_dataloader = self.validation_dataloader()
