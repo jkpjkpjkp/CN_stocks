@@ -95,8 +95,8 @@ def main(checkpoint_dir):
     data = DataModule.from_datasets(
         ds('../data/train.npy'), 
         ds('../data/eval.npy'), 
-        batch_size=2048, 
-        num_workers=16,
+        batch_size=4096,
+        num_workers=64,
     )
     trainer = Trainer(
         max_epochs=62,
@@ -107,7 +107,7 @@ def main(checkpoint_dir):
         num_nodes=1,
         callbacks=[
             RichProgressBar(),
-            loggingMixin(every_n_steps=20),
+            loggingMixin(every_n_steps=100),
             ModelCheckpoint(dirpath=checkpoint_dir, save_top_k=2, monitor="val/loss"),
         ],
         logger=MLFlowLogger(experiment_name="lightning_logs", tracking_uri=f"file:{config.mlflow_dir}", artifact_location=f'{config.mlflow_dir}/artifacts/'),
