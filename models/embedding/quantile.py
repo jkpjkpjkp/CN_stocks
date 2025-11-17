@@ -52,7 +52,12 @@ class quantile_30min(dummyLightning):
             'loss': loss,
             'logits': y_hat,
         }
-
+    
+    def investigate(self, batch):
+        for x in batch:
+            d = self.step(x.unsqueeze(0))
+            print(d['logits'])
+            breakpoint()
 
 if __name__ == '__main__':
     from ..prelude.config import transformerConfig
