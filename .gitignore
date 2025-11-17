@@ -11,4 +11,4 @@ wheels/
 uv.lock
 best_model.pth
 
-/.checkpoints/
+/.checkpoint*
