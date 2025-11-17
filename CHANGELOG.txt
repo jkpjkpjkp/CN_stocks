@@ -13,3 +13,5 @@ the same model can only achieve a 3.5 train loss. (unsaturated) -> bigger model
 > ./min/models/quantile_quantized/t1p30.py
 enlarged model following Ettin (2507.11412v1), which itself follows ModernBert
 
+very weirdly, enlarging model do not drop loss below 3.5
+investigating logits to see why

@@ -52,10 +52,7 @@ class quantile_30min(dummyLightning):
             'loss': loss,
             'logits': y_hat,
         }
-    
-    def optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.config.lr)
-    
+
 
 if __name__ == '__main__':
     from ..prelude.config import transformerConfig

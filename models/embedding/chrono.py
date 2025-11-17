@@ -56,9 +56,6 @@ class chrono(dummyLightning):
         loss = quantile_loss(y_hat, y[:, 1:])
         return loss
     
-    def optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.config.lr)
-
 if __name__ == '__main__':
     from ..prelude.config import transformerConfig
     from ..prelude.tm import tm

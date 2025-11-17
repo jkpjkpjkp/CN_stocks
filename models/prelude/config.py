@@ -6,8 +6,7 @@ class transformerConfig(PretrainedConfig):
     hidden_size=256
     intermediate_ratio=2.5
     num_heads=4
-    lr=3e-3
-    weight_decay=3e-4
+    lr=3e-4
     norm='LayerNorm'
     device='cuda'
     warmup_steps=0

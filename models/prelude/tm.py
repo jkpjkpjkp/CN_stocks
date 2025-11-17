@@ -78,6 +78,3 @@ class tm(dummyLightning):
         for layer in self.layers:
             x = layer(x)
         return x
-
-    def optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.config.lr)

@@ -71,6 +71,11 @@ class dummyLightning(Module):
             num_workers=self.config.num_workers,
         )
     
+    def optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, step / (1e-10 + self.config.warmup_steps)))
+        return {'optimizer': optimizer, 'scheduler': scheduler}
+    
     def optimizer_step(self):
         self.optimizer.step()
         self.optimizer.zero_grad()
@@ -117,14 +122,12 @@ class dummyLightning(Module):
             
             self.optimizer.zero_grad()
             outputs = self.step(batch)
+            loss = outputs['loss'] if isinstance(outputs, dict) else outputs
             if train:
-                if isinstance(outputs, dict):
-                    outputs['loss'].backward()
-                else:
-                    outputs.backward()
+                loss.backward()
                 self.optimizer_step()
             if random.randint(0, 9) == 0:
-                self.log(f'{"train" if train else "val"}/loss', outputs['loss'].item())
+                self.log(f'{"train" if train else "val"}/loss', loss.item())
             self.global_step += 1
             progress.update(task, advance=1, metrics=self.prog_bar_metrics)
 
