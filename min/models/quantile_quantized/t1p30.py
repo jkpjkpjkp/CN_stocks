@@ -12,28 +12,7 @@ import os
 import subprocess
 
 from min.models.quantile_quantized.t1p1 import decoderLayer, loggingMixin, transformerConfig
-
-class ds(Dataset):
-    def __init__(self, filename, x=None):
-        super().__init__()
-        self.data = np.load(filename) if filename else x
-        self.q = np.load('./.results/128th_quantiles_of_1min_ret.npy')
-        self.q30 = np.load('./.results/q30.npy')
-
-    @classmethod
-    def from_array(cls, x):
-        return cls(None, x)
-    
-    def __len__(self):
-        return len(self.data) // 119
-
-    def __getitem__(self, idx):
-        x = self.data[idx * 119 : (idx+1) * 119]
-        y = np.prod(np.lib.stride_tricks.sliding_window_view(x, 30), axis=-1).flatten()
-        y = np.searchsorted(self.q30, y)
-        x = np.searchsorted(self.q, x)
-        return x, y
-
+from ..embeddings.quantile import quantile_30min as ds
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)

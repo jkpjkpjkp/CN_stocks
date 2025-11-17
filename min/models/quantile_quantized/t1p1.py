@@ -13,6 +13,7 @@ from einops import rearrange
 import random
 import matplotlib.pyplot as plt
 from transformers import PreTrainedModel, PretrainedConfig
+from ..embeddings.quantile import quantile_1min as ds
 
 random.seed(42)
 np.random.seed(42)
@@ -50,22 +51,6 @@ def apply_rotary_emb(x, cos, sin):
     out = torch.cat([y1, y2], -1) # re-assemble
     out = out.to(x.dtype)
     return out
-
-class ds(Dataset):
-    def __init__(self, config: transformerConfig, filename='../data/train.npy'):
-        super().__init__()
-        self.data = np.load(filename)
-        self.q = np.load('./.results/128th_quantiles_of_1min_ret.npy')
-        self.seq_len=config.seq_len
-        assert self.data.shape[0] % self.seq_len == 0
-
-    def __len__(self):
-        return len(self.data) // self.seq_len
-
-    def __getitem__(self, idx):
-        x = self.data[idx * self.seq_len : (idx+1) * self.seq_len]
-        x = np.searchsorted(self.q, x)
-        return x
 
 class mha(Module):
     def __init__(self, config: transformerConfig):
