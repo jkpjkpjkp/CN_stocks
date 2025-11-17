@@ -23,7 +23,7 @@ class transformerConfig(PretrainedConfig):
     model_type = "t1p1"
     layers=7
     hidden_size=256
-    intermediate_ratio=1.5 # as per Ettin, weirdly small
+    intermediate_ratio=2.5
     num_heads=4
     lr=3e-3
     weight_decay=3e-4

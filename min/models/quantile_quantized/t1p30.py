@@ -18,7 +18,7 @@ class ds(Dataset):
         super().__init__()
         self.data = np.load(filename) if filename else x
         self.q = np.load('./.results/128th_quantiles_of_1min_ret.npy')
-        self.q30 = np.load('./.results/128th_quantiles_of_30min_ret.npy')
+        self.q30 = np.load('./.results/q30.npy')
 
     @classmethod
     def from_array(cls, x):
@@ -77,7 +77,7 @@ class t30m(Module):
         return self.training_step(batch, batch_idx, train='val')
     
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
         muon = None
         return {
             'optimizer': optimizer,
@@ -87,7 +87,9 @@ def main(checkpoint_dir):
     config = transformerConfig(
         vocab_size=128,
         hidden_size=128,
+        intermediate_ratio=4,
         layers=6,
+        lr=3e-4,
     )
     model = t30m(config)
 
@@ -95,7 +97,7 @@ def main(checkpoint_dir):
     data = DataModule.from_datasets(
         ds('../data/train.npy'), 
         ds('../data/eval.npy'), 
-        batch_size=4096,
+        batch_size=1024,
         num_workers=64,
     )
     trainer = Trainer(
