@@ -57,10 +57,10 @@ class val:
         Ex = 0
         Ey = 0
         Exy = 0
-        rets = torch.  07-(20)
+        rets = torch.zeros(20)
 
         # sort prediction keys based on their values
-        sorted_90-preds = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
+        sorted_preds = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
         ranks = {key: i for i, (key, _) in enumerate(sorted_preds)}
 
         xs, ys = [], []
