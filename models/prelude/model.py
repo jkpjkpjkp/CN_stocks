@@ -82,7 +82,7 @@ class dummyLightning(Module):
                 module.optimizer_step()
     
     def _activate(self):
-        opt = self.configure_optimizers()
+        opt = self.optimizers()
         if isinstance(opt, dict):
             self.optimizer = opt['optimizer']
             self.scheduler = opt.get('scheduler', None)
@@ -129,6 +129,7 @@ class dummyLightning(Module):
             progress.update(task, advance=1, metrics=self.prog_bar_metrics)
 
     def fit(self):
+        mlflow.set_experiment(self.__class__.__name__)
         self.to(self.config.device)
         self.activate()
         torch.set_float32_matmul_precision('medium')

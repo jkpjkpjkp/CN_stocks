@@ -9,23 +9,6 @@ import random
 from ..prelude.model import dummyLightning
 from ..prelude.data import halfdayData
 
-class quantile_1min(Dataset):
-    def __init__(self, config, filename='../data/train.npy'):
-        super().__init__()
-        self.data = np.load(filename)
-        self.q = np.load('./.results/128th_quantiles_of_1min_ret.npy')
-        self.seq_len=config.seq_len
-        assert self.data.shape[0] % self.seq_len == 0
-
-    def __len__(self):
-        return len(self.data) // self.seq_len
-
-    def __getitem__(self, idx):
-        x = self.data[idx * self.seq_len : (idx+1) * self.seq_len]
-        x = np.searchsorted(self.q, x)
-        return x
-
-
 class _quantile_30min(Dataset, halfdayData):
     def __init__(self, filename):
         super().__init__(filename)
@@ -70,18 +53,17 @@ class quantile_30min(dummyLightning):
             'logits': y_hat,
         }
     
-    def configure_optimizers(self):
+    def optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.config.lr)
     
 
 if __name__ == '__main__':
     from ..prelude.config import transformerConfig
-    from ..tm import tm
+    from ..prelude.tm import tm
     config = transformerConfig(
         batch_size=1024
     )
     model = quantile_30min(config, tm(config))
     
-    mlflow.set_experiment("quantile_30min")
     model.fit()
     breakpoint()

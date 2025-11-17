@@ -88,7 +88,7 @@ class tm(LightningModule):
     def validation_step(self, batch, batch_idx):
         return self.training_step(batch, batch_idx, train='val')
         
-    def configure_optimizers(self):
+    def optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
         return {
             'optimizer': optimizer,

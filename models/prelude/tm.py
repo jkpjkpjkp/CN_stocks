@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F, Module
 from einops import rearrange
-from models.prelude.model import dummyLightning
+from .model import dummyLightning
 
 def apply_rotary_emb(x, cos, sin):
     l = x.shape[1]
@@ -72,12 +72,12 @@ class tm(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.layers = nn.ModuleList([decoderLayer(config) for _ in range(config.layers)])
-        self.configure_optimizers()
+        self.optimizers()
     
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
         return x
 
-    def configure_optimizers(self):
+    def optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.config.lr)

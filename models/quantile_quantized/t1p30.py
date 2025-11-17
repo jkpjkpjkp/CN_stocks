@@ -50,7 +50,7 @@ class t30m(Module):
     def validation_step(self, batch, batch_idx):
         return self.training_step(batch, batch_idx, train='val')
     
-    def configure_optimizers(self):
+    def optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
         def warmup_lambda(step):
             return min(step / (self.config.warmup_steps + 1e-10), 1.0)
