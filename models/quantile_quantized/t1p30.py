@@ -11,8 +11,8 @@ import random
 import os
 import subprocess
 
-from min.models.quantile_quantized.t1p1 import decoderLayer, loggingMixin, transformerConfig
-from ..embeddings.quantile import quantile_30min as ds
+from models.models.quantile_quantized.t1p1 import decoderLayer, loggingMixin, transformerConfig
+from ..embedding.quantile import quantile_30min as ds
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
@@ -21,8 +21,7 @@ torch.cuda.manual_seed(42)
 class t30m(Module):
     def __init__(self, config: transformerConfig):
         super().__init__()
-        self.emb1 = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.emb30 = nn.Embedding(config.vocab_size, config.hidden_size)
+        
         self.layers = nn.ModuleList([decoderLayer(config) for _ in range(config.layers)])
         
         self.readout = nn.Linear(config.hidden_size, config.vocab_size)
@@ -77,9 +76,9 @@ class t30m(Module):
 def main(checkpoint_dir):
     config = transformerConfig(
         vocab_size=128,
-        hidden_size=128,
-        intermediate_ratio=4,
-        layers=6,
+        hidden_size=32,
+        intermediate_ratio=2,
+        layers=4,
         lr=3e-4,
         warmup_tokens=1000,
     )
