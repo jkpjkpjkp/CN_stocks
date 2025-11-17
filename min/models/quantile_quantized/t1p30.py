@@ -78,10 +78,22 @@ class t30m(Module):
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
-        muon = None
+        def warmup_lambda(step):
+            return min(step / self.config.warmup_tokens, 1.0)
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, 
+            lr_lambda=warmup_lambda
+        )
+        
         return {
             'optimizer': optimizer,
-        }
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step',
+                'frequency': 1,
+            }
+         }
 
 def main(checkpoint_dir):
     config = transformerConfig(
@@ -90,6 +102,7 @@ def main(checkpoint_dir):
         intermediate_ratio=4,
         layers=6,
         lr=3e-4,
+        warmup_tokens=1000,
     )
     model = t30m(config)
 
@@ -97,11 +110,11 @@ def main(checkpoint_dir):
     data = DataModule.from_datasets(
         ds('../data/train.npy'), 
         ds('../data/eval.npy'), 
-        batch_size=1024,
-        num_workers=64,
+        batch_size=2048,
+        num_workers=16,
     )
     trainer = Trainer(
-        max_epochs=62,
+        max_epochs=42,
         gradient_clip_val=1.,
         precision="bf16-mixed",
         accelerator="gpu",
