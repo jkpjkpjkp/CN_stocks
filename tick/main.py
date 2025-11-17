@@ -9,12 +9,12 @@ import matplotlib.pyplot as plt
 from transformers import PreTrainedModel, PreTrainedConfig
 
 class tickConfig(PreTrainedConfig):
-    model_type = 'tick',
-    vocab_size = 1024,
-    hidden_size = 512,
-    num_layers = 8,
-    num_heads = 8,
-    device = 'cuda',
+    model_type = 'tick'
+    vocab_size = 1024
+    hidden_size = 512
+    num_layers = 8
+    num_heads = 8
+    device = 'cuda'
 
 
 class mha(Module):
@@ -69,7 +69,7 @@ class TransformerDecoderLayer(Module):
         z = self.fc2(z)
         return y + z
 
-class tickModel(PreTrainedModel, LightningModule):
+class tickModel(PreTrainedModel):
     config_class = tickConfig
     
     def precompute_freqs(self, config: tickConfig):
@@ -96,10 +96,9 @@ class tickModel(PreTrainedModel, LightningModule):
         return x
     
     def training_step(self, batch, batch_idx):
-        y_hat = self(batch)
-        
+        x, y = batch
+        logits = self(x)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
     
     def custom_optimizer(self):
