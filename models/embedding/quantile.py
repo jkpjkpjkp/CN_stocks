@@ -75,7 +75,6 @@ class quantile_30min(dummyLightning):
         x1 = self.emb1(x1)
         x30 = self.emb30(x30)
         return x1 + torch.concat((torch.zeros((b, 29, self.config.hidden_size), device=x30.device, dtype=x30.dtype), x30), dim=1)
-
     def step(self, batch):
         x, y = batch
         emb = self(x[:, :-30], y[:, :-30])
@@ -90,48 +89,13 @@ class quantile_30min(dummyLightning):
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.config.lr)
     
-    def _iteration(self, dataloader, train=True):
-        if train:
-            self.train()
-        else:
-            self.eval()
-        for batch in dataloader:
-            if isinstance(batch, (list, tuple)):
-                batch = [item.to(self.config.device) for item in batch]
-            elif isinstance(batch, dict):
-                batch = {k: v.to(self.config.device) for k, v in batch.items()}
-            else:
-                batch = batch.to(self.config.device)
-            
-            self.optimizer.zero_grad()
-            outputs = self.step(batch)
-            if train:
-                if isinstance(outputs, dict):
-                    outputs['loss'].backward()
-                else:
-                    outputs.backward()
-                self.optimizer_step()
-            if random.randint(0, 9) == 0:
-                mlflow.log_metric(f'{"train" if train else "val"}_loss', outputs['loss'].item(), step=self.global_step)
-            self.global_step += 1
-
-    def fit(self):
-        mlflow.set_experiment("quantile_30min")
-        self.to(self.config.device)
-        self.activate()
-        
-        train_dataloader = self.training_dataloader()
-        val_dataloader = self.validation_dataloader()
-        
-        self.global_step = 0
-        for _ in range(self.config.epochs):
-            self._iteration(train_dataloader, train=True)
-            self._iteration(val_dataloader, train=False)
 
 if __name__ == '__main__':
     from ..prelude.config import transformerConfig
     from ..tm import tm
     config = transformerConfig()
     model = quantile_30min(config, tm(config))
+    
+    mlflow.set_experiment("quantile_30min")
     model.fit()
     breakpoint()
