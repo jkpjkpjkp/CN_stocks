@@ -72,18 +72,10 @@ class cross(dummyLightning):
         self.param_prepare(config)
 
     def data_prepare(self, config):
-        df = pl.scan_parquet('../data/a_1min.pq')
-        if config.debug_data:
-            df = df.head(100000)
-        df = df.drop_nulls().with_columns(
-            date = pl.col('datetime').dt.date(),
-            time = pl.col('datetime').dt.time(),
-        ).collect()
-
         # every minute from 9:30 to 11:30, from 13:00 to 15:00, to use as join
         times = pl.DataFrame({
             'datetime': pl.datetime_range(
-                start=pl.datetime(1970, 1, 1, 9, 31), end=pl.datetime(1970, 1, 1, 9, 30), interval='1m', eager=True
+                start=pl.datetime(1970, 1, 1, 9, 31), end=pl.datetime(1970, 1, 1, 11, 30), interval='1m', eager=True
             )
         }).vstack(pl.DataFrame({
             'datetime': pl.datetime_range(
@@ -92,9 +84,19 @@ class cross(dummyLightning):
         })).select(
             time = pl.col('datetime').dt.time(),
         )
+        assert len(times) == 240
+        
+        df = pl.scan_parquet('../data/a_1min.pq')
+        if config.debug_data:
+            df = df.head(100000)
+        df = df.drop_nulls().with_columns(
+            date = pl.col('datetime').dt.date(),
+            time = pl.col('datetime').dt.time(),
+        ).collect()
 
         ids = df.select('id').unique().sort('id').with_row_index()
         self.num_ids = len(ids)
+        assert self.num_ids < 6000, self.num_ids
         id_map = {row['id']: row['index'] for row in ids.rows(named=True)}
 
         @dataclass
@@ -102,7 +104,7 @@ class cross(dummyLightning):
             i: int
             date: datetime.date
             ids: torch.Tensor
-            data: torch.Tensor
+            x: torch.Tensor
         
         date_groups = [x for x in df.group_by('date', maintain_order=True)]
         
@@ -127,27 +129,26 @@ class cross(dummyLightning):
             for x in arr[1:]:
                 df = df.vstack(x[1])
             unique_ids = df.select('id').unique()
-            dates = arr[0][1].head(1)
-            for x in arr[1:]:
-                dates = dates.vstack(x[1].head(1))
-            dt = dates.join(times, how='cross')
-            full_times_per_id = unique_ids.join(dt, how='cross')
+            
+            full_times_per_id = unique_ids.join(times, how='cross')
+            assert len(full_times_per_id) == len(unique_ids) * len(times), f"{len(full_times_per_id)} != {len(unique_ids)} * {len(times)}"
 
             df = full_times_per_id.join(
                 df,
                 on=['id', 'time'],
                 how='left'
             )
-            date = df['date'][0]
-            ids = torch.tensor([id_map[id] for id in unique_ids['id']])
             data = df.select(
                 'open', 'high', 'low', 'close', 'volume'
             ).to_torch()
-            assert data.shape[-1] == 5
-            data = data.view(len(unique_ids), -1, 5)
-            self.data.append(per_day(i, date, ids, data))
+            data = data.view(len(unique_ids), 240 * config.window_days, 5)
+            self.data.append(per_day(
+                i, 
+                date=df['date'][0], 
+                ids=torch.tensor([id_map[id] for id in unique_ids['id']]),
+                x=data))
         
-        contents = torch.concat([x.data for x in self.data], dim=0)
+        contents = torch.concat([x.x for x in self.data], dim=0)
         self.m = contents.mean(dim=(0, 1)).view(1, 1, -1)
         self.s = contents.std(dim=(0, 1)).view(1, 1, -1)
 
@@ -156,14 +157,14 @@ class cross(dummyLightning):
     
     def __getitem__(self, idx):
         ret = self.data[idx]
-        data = (ret.data - self.m) / self.s
+        x = (ret.x - self.m) / self.s
         y = self.ohlcv[ret.ids, ret.i+1 : ret.i + self.config.window_days + 1, :]
         y = (y - self.m) / self.s
-        assert data.ndim == 3, data.shape
+        assert x.ndim == 3, x.shape
         assert y.ndim == 3, y.shape
-        assert data.shape[0] == y.shape[0], f"data.shape[0] != y.shape[0], {data.shape} != {y.shape}"
-        assert data.shape[1] == y.shape[1] * 240, f"data.shape[1] != y.shape[1], {data.shape} != {y.shape}"
-        return torch.asinh(data), ret.ids, y
+        assert x.shape[0] == y.shape[0], f"data.shape[0] != y.shape[0], {x.shape} != {y.shape}"
+        assert x.shape[1] == y.shape[1] * 240, f"x.shape[1] != y.shape[1], {x.shape} != {y.shape}"
+        return torch.asinh(x), ret.ids, y
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -178,11 +179,11 @@ class cross(dummyLightning):
         self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles * 5)
 
     def class_embed(self, ids):
-        return torch.concat([self._class_embed(ids), torch.zeros_like(ids)], dim=-1)
+        ret = self._class_embed(ids)
+        return torch.concat([ret, torch.zeros_like(ret)], dim=-1)
     
     def embed(self, x):
-        breakpoint()
-        x = x.view(-1, 240 * self.config.window_days // self.config.window_minutes, self.config.window_minutes * 5)
+        x = x.view(-1, 240 * self.config.window_days // self.config.window_minutes, self.config.window_minutes, 5).flatten(2)
         direct = self.emb['direct'](x)
         l1 = F.silu(self.emb['l1'](x))
         l2 = self.emb['l2'](l1)
