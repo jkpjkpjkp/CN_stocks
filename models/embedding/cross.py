@@ -281,7 +281,7 @@ if __name__ == '__main__':
         debug_data = True
         window_days = 5
         window_minutes = 10
-        num_quantiles = 4
+        num_quantiles = 8
         train_ratio = 0.85
         huber_threashold = 1.
         num_workers=0,
@@ -294,10 +294,11 @@ if __name__ == '__main__':
             self.id_dim = self.attn_dim // 2
 
     x = cross(debug_config(
-        num_workers=2,
+        num_workers=8,
         hidden_dim=128,
         num_layers=5,
-        epochs=1000,
+        epochs=32,
+        debug_data=False,
     ))
     
     x.fit()
