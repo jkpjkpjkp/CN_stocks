@@ -83,11 +83,11 @@ class cross(dummyLightning):
         # every minute from 9:30 to 11:30, from 13:00 to 15:00, to use as join
         times = pl.DataFrame({
             'datetime': pl.datetime_range(
-                start=pl.datetime(1970, 1, 1, 9, 30), end=pl.datetime(1970, 1, 1, 9, 30), interval='1m', eager=True
+                start=pl.datetime(1970, 1, 1, 9, 31), end=pl.datetime(1970, 1, 1, 9, 30), interval='1m', eager=True
             )
         }).vstack(pl.DataFrame({
             'datetime': pl.datetime_range(
-                start=pl.datetime(1970, 1, 1, 1, 0), end=pl.datetime(1970, 1, 1, 3, 0), interval='1m', eager=True
+                start=pl.datetime(1970, 1, 1, 13, 1), end=pl.datetime(1970, 1, 1, 15, 0), interval='1m', eager=True
             )
         })).select(
             time = pl.col('datetime').dt.time(),
@@ -156,10 +156,14 @@ class cross(dummyLightning):
     
     def __getitem__(self, idx):
         ret = self.data[idx]
-        ret.data = (ret.data - self.m) / self.s
-        y = self.ohlcv[ret.ids, ret.i+1 : ret.i + self.config.window_days + 1]
+        data = (ret.data - self.m) / self.s
+        y = self.ohlcv[ret.ids, ret.i+1 : ret.i + self.config.window_days + 1, :]
         y = (y - self.m) / self.s
-        return torch.asinh(ret.data), ret.ids, y
+        assert data.ndim == 3, data.shape
+        assert y.ndim == 3, y.shape
+        assert data.shape[0] == y.shape[0], f"data.shape[0] != y.shape[0], {data.shape} != {y.shape}"
+        assert data.shape[1] == y.shape[1] * 240, f"data.shape[1] != y.shape[1], {data.shape} != {y.shape}"
+        return torch.asinh(data), ret.ids, y
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -177,6 +181,7 @@ class cross(dummyLightning):
         return torch.concat([self._class_embed(ids), torch.zeros_like(ids)], dim=-1)
     
     def embed(self, x):
+        breakpoint()
         x = x.view(-1, 240 * self.config.window_days // self.config.window_minutes, self.config.window_minutes * 5)
         direct = self.emb['direct'](x)
         l1 = F.silu(self.emb['l1'](x))
