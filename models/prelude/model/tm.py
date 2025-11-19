@@ -5,7 +5,6 @@ from einops import rearrange
 from .main import dummyLightning
 
 def apply_rotary_emb(x, cos, sin):
-    breakpoint()
     l = x.shape[1]
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves

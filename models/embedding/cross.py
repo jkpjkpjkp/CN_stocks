@@ -74,12 +74,12 @@ class _cross(Dataset):
         self.s = s
     
     def __len__(self):
-        return len(self.data)
+        return len(self.data) - 1
     
     def __getitem__(self, idx):
         ret = self.data[idx]
         x = (ret.x - self.m) / self.s
-        y = self.ohlcv[ret.i+1 : ret.i + self.config.window_days + 1, ret.ids, :]
+        y = self.ohlcv[ret.ids, ret.i+1 : ret.i + self.config.window_days + 1, :]
         y = (y - self.m) / self.s
         assert x.ndim == 3, x.shape
         assert y.ndim == 3, y.shape
@@ -119,10 +119,10 @@ class cross(dummyLightning):
             time = pl.col('datetime').dt.time(),
         ).collect()
 
-        ids = df.select('id').unique().sort('id').with_row_index()
+        ids = df.select('id').unique().sort('id')
         self.num_ids = len(ids)
         assert self.num_ids < 6000, self.num_ids
-        id_map = {row['id']: row['index'] for row in ids.rows(named=True)}
+        id_map = {x: i for i, x in enumerate(ids['id'])}
 
         @dataclass
         class per_day: # window
@@ -133,18 +133,21 @@ class cross(dummyLightning):
         
         date_groups = [x for x in df.group_by('date', maintain_order=True)]
         
+        all_dates = df.select('date').unique().sort('date')
+        all_di = ids.join(all_dates, how='cross')
         ohlcv = df.group_by('date', 'id').agg(
             pl.col.open.first(),
             pl.col.high.max(),
             pl.col.low.min(),
             pl.col.close.last(),
             pl.col.volume.sum(),
-        ).sort('date', 'id')
+        ).join(all_di, on=['id', 'date'], how='right')
         ohlcv = ohlcv.select(
             'open', 'high', 'low', 'close', 'volume'
         ).to_torch()
         assert ohlcv.shape[-1] == 5
         ohlcv = ohlcv.view(len(ids), -1, 5)
+        assert ohlcv.shape[1] == len(date_groups)
         self.ohlcv = ohlcv
 
         self.data = []
@@ -163,7 +166,8 @@ class cross(dummyLightning):
                 on=['id', 'time'],
                 how='left'
             )
-            data = df.select(
+            data = df.sort('id', 'datetime'
+            ).select(
                 'open', 'high', 'low', 'close', 'volume'
             ).to_torch()
             data = data.view(len(unique_ids), 240 * config.window_days, 5)
@@ -181,13 +185,13 @@ class cross(dummyLightning):
     def train_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[:cutoff+1], self.ohlcv[:cutoff+1], self.config, self.m, self.s)
+        return _cross(self.data[:cutoff], self.ohlcv[:, :cutoff, :], self.config, self.m, self.s)
     
     @property
     def val_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[cutoff:], self.ohlcv[cutoff:], self.config, self.m, self.s)
+        return _cross(self.data[cutoff:], self.ohlcv[:, cutoff:, :], self.config, self.m, self.s)
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -231,9 +235,9 @@ class cross(dummyLightning):
         y_hat = self(data, ids).view(y.shape[0], y.shape[1], 5, -1)
         y_hat = torch.sinh(y_hat)
         ge = (y_hat >= y.unsqueeze(-1))
-        coeff = torch.arange(0, 1, 1 / (self.config.num_quantiles + 1))[1:]
+        coeff = torch.arange(0, 1, 1 / (self.config.num_quantiles + 1), device=y_hat.device)[1:]
         coeff = coeff.view(1, 1, 1, -1).expand(y_hat.shape[0], y_hat.shape[1], 5, -1)
-        coeff = coeff[ge] + (1 - coeff)[~ge]
+        coeff = coeff * ge + (1 - coeff) * (~ge)
         loss = coeff * self.huber(y_hat - y.unsqueeze(-1)).view(y_hat.shape[0], y_hat.shape[1], 5, -1)
         return {
             'y_hat': y_hat,
@@ -250,6 +254,7 @@ if __name__ == '__main__':
         num_quantiles = 4
         head_dim = 2
         train_ratio = 0.85
+        huber_threashold = 1.
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.id_dim = self.hidden_dim // 2
