@@ -191,7 +191,7 @@ class cross(dummyLightning):
     def val_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[cutoff:], self.ohlcy, self.config, self.m, self.s)
+        return _cross(self.data[cutoff:], self.ohlcv, self.config, self.m, self.s)
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
