@@ -103,17 +103,8 @@ class cross(dummyLightning):
             date: datetime.date
             ids: torch.Tensor
             data: torch.Tensor
-            y: torch.Tensor
         
         date_groups = [x for x in df.group_by('date', maintain_order=True)]
-
-        def to_torch(df):
-            data = df.select(
-                'open', 'high', 'low', 'close', 'volume'
-            ).to_torch()
-            assert data.shape[-1] == 5
-            data = data.view(len(unique_ids), -1, 5)
-            return data
         
         ohlcv = df.group_by('date', 'id').agg(
             pl.col.open.first(),
@@ -122,7 +113,12 @@ class cross(dummyLightning):
             pl.col.close.last(),
             pl.col.volume.sum(),
         ).sort('id', 'date')
-        self.ohlcv = to_torch(ohlcv)
+        ohlcv = ohlcv.select(
+            'open', 'high', 'low', 'close', 'volume'
+        ).to_torch()
+        assert ohlcv.shape[-1] == 5
+        ohlcv = ohlcv.view(len(ids), -1, 5)
+        self.ohlcv = ohlcv
 
         self.data = []
         for i in range(len(date_groups) - config.window_days):
@@ -144,14 +140,12 @@ class cross(dummyLightning):
             )
             date = df['date'][0]
             ids = torch.tensor([id_map[id] for id in unique_ids['id']])
-            data = to_torch(df)
-
-            y = []
-            for j in range(config.window_days):
-                y_ = torch.stack([date_dicts[i+j+1][id] for id in ids])
-                y.append(y_)
-            y = torch.concat(y, dim=1)
-            self.data.append(per_day(i, date, ids, data, y))
+            data = df.select(
+                'open', 'high', 'low', 'close', 'volume'
+            ).to_torch()
+            assert data.shape[-1] == 5
+            data = data.view(len(unique_ids), -1, 5)
+            self.data.append(per_day(i, date, ids, data))
         
         contents = torch.concat([x.data for x in self.data], dim=0)
         self.m = contents.mean(dim=(0, 1)).view(1, 1, -1)
@@ -202,9 +196,9 @@ class cross(dummyLightning):
         mask = x > self.config.huber_threashold
         return x.abs() * mask * self.config.huber_threashold + (x ** 2) * (~mask)
 
-    def step(self, x, y):
-        x = x.squeeze(0)
-        y = y.squeeze(0)
+    def step(self, batch):
+        x = batch[0].squeeze(0)
+        y = batch[1].squeeze(0)
         y_hat = self(x.data, x.ids).view(y.shape[0], y.shape[1], 5, -1)
         y_hat = torch.sinh(y_hat)
         ge = (y_hat >= y.unsqueeze(-1))
