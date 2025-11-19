@@ -93,30 +93,39 @@ class cross(dummyLightning):
             time = pl.col('datetime').dt.time(),
         )
 
-        ids = df.select(oid = pl.col.id).unique().with_row_index()
+        ids = df.select('id').unique().sort('id').with_row_index()
         self.num_ids = len(ids)
-        id_map = {row['oid']: row['index'] for row in ids.rows(named=True)}
+        id_map = {row['id']: row['index'] for row in ids.rows(named=True)}
 
         @dataclass
-        class per_day:
+        class per_day: # window
+            i: int
             date: datetime.date
             ids: torch.Tensor
             data: torch.Tensor
+            y: torch.Tensor
         
-        ohlc = df.group_by('date', 'id', maintain_order=True).agg(
+        date_groups = [x for x in df.group_by('date', maintain_order=True)]
+
+        def to_torch(df):
+            data = df.select(
+                'open', 'high', 'low', 'close', 'volume'
+            ).to_torch()
+            assert data.shape[-1] == 5
+            data = data.view(len(unique_ids), -1, 5)
+            return data
+        
+        ohlcv = df.group_by('date', 'id').agg(
             pl.col.open.first(),
             pl.col.high.max(),
             pl.col.low.min(),
             pl.col.close.last(),
-        )
-        df = df.with_columns(
-            high = pl.col.high / pl.col.open,
-            low = pl.col.open / pl.col.low,
-            close = pl.col.close / pl.col.close.shift(1).over('id')
-        )
-        date_groups = [x for x in df.group_by('date', maintain_order=True)]
+            pl.col.volume.sum(),
+        ).sort('id', 'date')
+        self.ohlcv = to_torch(ohlcv)
+
         self.data = []
-        for i in range(len(date_groups) - config.window_days + 1):
+        for i in range(len(date_groups) - config.window_days):
             arr = date_groups[i: i + config.window_days]
             df = arr[0][1]
             for x in arr[1:]:
@@ -134,11 +143,15 @@ class cross(dummyLightning):
                 how='left'
             )
             date = df['date'][0]
-            ids = torch.tensor([id_map[id] for id in df['id'].unique()])
-            data = df.select(pl.col('open', 'high', 'low', 'close', 'volume')).to_torch()
-            assert data.shape[-1] == 5
-            data = data.view(len(unique_ids), -1, 5)
-            self.data.append(per_day(date, ids, data))
+            ids = torch.tensor([id_map[id] for id in unique_ids['id']])
+            data = to_torch(df)
+
+            y = []
+            for j in range(config.window_days):
+                y_ = torch.stack([date_dicts[i+j+1][id] for id in ids])
+                y.append(y_)
+            y = torch.concat(y, dim=1)
+            self.data.append(per_day(i, date, ids, data, y))
         
         contents = torch.concat([x.data for x in self.data], dim=0)
         self.m = contents.mean(dim=(0, 1)).view(1, 1, -1)
@@ -148,8 +161,12 @@ class cross(dummyLightning):
         return len(self.data)
     
     def __getitem__(self, idx):
-        ret = (self.data[self.cum_lens[idx]: self.cum_lens[idx+1]] - self.m) / self.s
+        ret = self.data[idx]
+        ret.data = (ret.data - self.m) / self.s
+        y = self.ohlcv[ret.ids, ret.i+1 : ret.i + self.config.window_days + 1]
+        y = (y - self.m) / self.s
         ret = torch.asinh(ret)
+        return ret, y
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -161,7 +178,7 @@ class cross(dummyLightning):
 
         self.layers = nn.ModuleList([mhaa(config) for _ in range(config.num_layers)])
 
-        self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles * 4)
+        self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles * 5)
 
     def class_embed(self, ids):
         return torch.concat([self._class_embed(ids), torch.zeros_like(ids)], dim=-1)
@@ -181,12 +198,23 @@ class cross(dummyLightning):
         x = self.readout(x.view(-1, self.config.window_days, self.config.hidden_dim * 240 // self.config.window_minutes))
         return torch.sinh(x)
         
-    def step(self, x):
-        y_hat = self(x.data, x.ids)
-        y_hat = torch.sinh(y_hat)
+    def huber(self, x):
+        mask = x > self.config.huber_threashold
+        return x.abs() * mask * self.config.huber_threashold + (x ** 2) * (~mask)
 
+    def step(self, x, y):
+        x = x.squeeze(0)
+        y = y.squeeze(0)
+        y_hat = self(x.data, x.ids).view(y.shape[0], y.shape[1], 5, -1)
+        y_hat = torch.sinh(y_hat)
+        ge = (y_hat >= y.unsqueeze(-1))
+        coeff = torch.arange(0, 1, 1 / (self.config.num_quantiles + 1))[1:]
+        coeff = coeff.view(1, 1, 1, -1).expand(y_hat.shape[0], y_hat.shape[1], 5, -1)
+        coeff = coeff[ge] + (1 - coeff)[~ge]
+        loss = coeff * self.huber(y_hat - y.unsqueeze(-1)).view(y_hat.shape[0], y_hat.shape[1], 5, -1)
         return {
             'y_hat': y_hat,
+            'loss': loss,
         }
 
 
@@ -201,6 +229,7 @@ if __name__ == '__main__':
         head_dim = 2
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
-    x = cross(debug_config())
+    x = cross(debug_config(batch_size = 1))
     print(x.step(x[42]))
+    x.fit()
     breakpoint()
