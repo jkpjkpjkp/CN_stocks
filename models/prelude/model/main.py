@@ -37,7 +37,16 @@ class MetricsTextColumn(ProgressColumn):
         metrics = task.fields.get("metrics", {})
         if not metrics:
             return Text("")
-        metrics_str = " • ".join([f"{name}: {value:.4f}" if not isinstance(value, (int, str)) else f"{name}: {value}" for name, value in sorted(metrics.items())])
+        
+        # Format metrics with special handling for different types
+        formatted_metrics = []
+        for name, value in sorted(metrics.items()):
+            if isinstance(value, float):
+                formatted_metrics.append(f"{name}: {value:.4f}")
+            elif isinstance(value, (int, str)):
+                formatted_metrics.append(f"{name}: {value}")
+        
+        metrics_str = " • ".join(formatted_metrics)
         return Text(metrics_str, style="progress.data.speed")
 
 def create_progress_bar():
@@ -49,6 +58,7 @@ def create_progress_bar():
         ProcessingSpeedColumn(),
         MetricsTextColumn(),
         expand=True,
+        transient=False,  # Keep progress bars visible after completion
     )
 
 class dummyLightning(Module):
@@ -110,12 +120,17 @@ class dummyLightning(Module):
             self.train()
         else:
             self.eval()
+        
+        # Initialize epoch loss tracking
+        epoch_losses = []
+        
         task = progress.add_task(
             f"{'Training' if train else 'Validation'} Epoch {epoch + 1}/{num_epochs}",
             total=len(dataloader),
             metrics={}
         )
-        for batch in dataloader:
+        
+        for batch_idx, batch in enumerate(dataloader):
             if isinstance(batch, (list, tuple)):
                 batch = [item.to(self.config.device) for item in batch]
             elif isinstance(batch, dict):
@@ -126,13 +141,31 @@ class dummyLightning(Module):
             self.optimizer.zero_grad()
             outputs = self.step(batch)
             loss = outputs['loss'] if isinstance(outputs, dict) else outputs
+            
             if train:
                 loss.backward()
                 self.optimizer_step()
-            if random.randint(0, 9) == 0:
+            
+            # Track loss for epoch average
+            epoch_losses.append(loss.item())
+            
+            # Log step loss periodically
+            if random.randint(0, 9) == 0 or batch_idx == len(dataloader) - 1:
                 self.log(f'{"train" if train else "val"}/loss', loss.item())
-            self.global_step += 1
+            
+            # Update progress bar with current metrics
             progress.update(task, advance=1, metrics=self.prog_bar_metrics)
+            
+            # Also update the task description to show current epoch loss average
+            if batch_idx > 0:
+                current_avg_loss = sum(epoch_losses) / len(epoch_losses)
+                progress.update(task, description=f"{'Training' if train else 'Validation'} Epoch {epoch + 1}/{num_epochs} (avg: {current_avg_loss:.4f})")
+            
+            self.global_step += 1
+        
+        # Calculate and return epoch average loss
+        epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
+        return epoch_avg_loss
 
     def fit(self):
         mlflow.set_experiment(self.__class__.__name__)
@@ -148,8 +181,23 @@ class dummyLightning(Module):
         with progress:
             self.prog_bar_metrics = {}
             for epoch in range(self.config.epochs):
-                self._iteration(train_dataloader, progress, epoch, self.config.epochs, train=True)
-                self._iteration(val_dataloader, progress, epoch, self.config.epochs, train=False)
+                # Reset metrics for new epoch
+                self.prog_bar_metrics = {}
+                
+                # Run training and validation iterations and get epoch losses
+                train_epoch_loss = self._iteration(train_dataloader, progress, epoch, self.config.epochs, train=True)
+                val_epoch_loss = self._iteration(val_dataloader, progress, epoch, self.config.epochs, train=False)
+                
+                # Log epoch-level losses to MLflow
+                self.log('train/epoch_loss', train_epoch_loss, prog_bar=False)
+                self.log('val/epoch_loss', val_epoch_loss, prog_bar=False)
+                
+                # Update progress bar with epoch summary
+                epoch_metrics = {
+                    'train_epoch': train_epoch_loss,
+                    'val_epoch': val_epoch_loss,
+                }
+                progress.console.print(f"Epoch {epoch + 1}/{self.config.epochs} completed - Train Loss: {train_epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}")
     
     def log(self, name, value, prog_bar=True, logger=True):
         if logger:

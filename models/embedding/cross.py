@@ -204,7 +204,41 @@ class cross(dummyLightning):
         self.layers = nn.ModuleList([mhaa(config) for _ in range(config.num_layers)])
 
         self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles * 5)
+
+        self._init_weights()
         
+    def _init_weights(self):
+        def init_linear(module, std=0.02, zero_init=False):
+            if zero_init:
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            else:
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        for module in self.emb.values():
+            init_linear(module, std=0.02)
+        
+        nn.init.normal_(self._class_embed.weight, mean=0.0, std=0.02)
+        
+        for layer in self.layers:
+            # Time attention (self-attention with RoPE)
+            init_linear(layer.time_attn.qkv, std=0.02)
+            init_linear(layer.time_attn.readout, zero_init=True)  # Critical for stability
+            
+            # Cross attention (scaled by alpha)
+            init_linear(layer.cross_attn.qkv, std=0.01)  # Smaller due to alpha scaling
+            init_linear(layer.cross_attn.readout, zero_init=True)
+            
+            init_linear(layer.ffn[1], std=0.02)  # Expansion layer
+            init_linear(layer.ffn[3], std=0.02)  # Projection layer
+            
+            nn.init.constant_(layer.alpha, 0.001)
+        
+        init_linear(self.readout, zero_init=True)
+    
     def class_embed(self, ids):
         ret = self._class_embed(ids)
         return torch.concat([ret, torch.zeros_like(ret)], dim=-1)
@@ -251,7 +285,6 @@ if __name__ == '__main__':
         window_days = 5
         window_minutes = 10
         num_quantiles = 4
-        head_dim = 2
         train_ratio = 0.85
         huber_threashold = 1.
         num_workers=0,
@@ -259,10 +292,13 @@ if __name__ == '__main__':
             super().__init__(**kwargs)
             self.id_dim = self.hidden_dim // 2
             self.seq_len = self.window_days * 240 // self.window_minutes
-            self.batch_size = 1
+            self.batch_size = 16
+            self.head_dim = self.hidden_dim // self.num_heads // 2
 
     x = cross(debug_config(
         num_workers=2,
+        hidden_dim=128,
+        num_layers=5,
     ))
     
     x.fit()

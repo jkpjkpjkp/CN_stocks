@@ -9,7 +9,7 @@ class transformerConfig(PretrainedConfig):
     lr=3e-4
     norm='LayerNorm'
     device='cuda'
-    warmup_steps=0
+    warmup_steps=1000
     batch_warmup=0
     seq_len=119
     vocab_size=128
