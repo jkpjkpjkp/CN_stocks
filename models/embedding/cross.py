@@ -181,7 +181,7 @@ class cross(dummyLightning):
     def train_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[:cutoff], self.ohlcv[cutoff:], self.config, self.m, self.s)
+        return _cross(self.data[:cutoff+1], self.ohlcv[:cutoff+1], self.config, self.m, self.s)
     
     @property
     def val_dataset(self):
