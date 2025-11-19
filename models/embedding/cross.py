@@ -44,6 +44,10 @@ class mha(dummyLightning):
         y = y.view(b, -1, self.config.num_heads * self.config.head_dim)
 
         return self.readout(y)
+    
+    def init_weights(self, std):
+        self.qkv.weight.data.normal_(mean=0.0, std=std)
+        self.readout.weight.data.normal_(mean=0.0, std=std)
 
 class mhaa(dummyLightning):
     def __init__(self, config):
@@ -61,9 +65,15 @@ class mhaa(dummyLightning):
     
     def forward(self, x, embeddings):
         x = x + self.time_attn(self.ln1(x))
-        x = x + self.cross_attn(self.ln2(x).transpose(0, 1), embeddings).transpose(0, 1)
+        x = x + self.cross_attn(self.ln2(x).transpose(0, 1), embeddings).transpose(-3, -2)
         x = x + self.ffn(x)
         return x
+    
+    def init_weights(self):
+        self.time_attn.init_weights(0.02)
+        self.cross_attn.init_weights(0.0002)
+        self.ffn[1].weight.data.normal_(mean=0.0, std=0.02)
+        self.ffn[3].weight.data.normal_(mean=0.0, std=0.02)
 
 class _cross(Dataset):
     def __init__(self, data, ohlcv, config, m, s):
@@ -87,7 +97,7 @@ class _cross(Dataset):
         assert x.shape[1] == y.shape[1] * 240, f"x.shape[1] != y.shape[1], {x.shape} != {y.shape}"
         
         return torch.asinh(x), ret.ids, y
-    
+
 
 class cross(dummyLightning):
     
@@ -204,13 +214,16 @@ class cross(dummyLightning):
         self.layers = nn.ModuleList([mhaa(config) for _ in range(config.num_layers)])
 
         self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles * 5)
+        
+        for layer in self.layers:
+            layer.init_weights()
 
     def class_embed(self, ids):
         ret = self._class_embed(ids)
         return torch.concat([ret, torch.zeros_like(ret)], dim=-1)
     
     def embed(self, x):
-        x = x.view(-1, 240 * self.config.window_days // self.config.window_minutes, self.config.window_minutes, 5).flatten(2)
+        x = x.unflatten(-2, (240 * self.config.window_days // self.config.window_minutes, self.config.window_minutes)).flatten(-2)
         direct = self.emb['direct'](x)
         l1 = F.silu(self.emb['l1'](x))
         l2 = self.emb['l2'](l1)
@@ -221,18 +234,19 @@ class cross(dummyLightning):
         class_embeddings = self.class_embed(ids)
         for layer in self.layers:
             x = layer(x, class_embeddings)
-        x = self.readout(x.view(-1, self.config.window_days, self.config.hidden_dim * 240 // self.config.window_minutes))
+        x = self.readout(x.unflatten(-1, (self.config.window_days, self.config.hidden_dim * 240 // self.config.window_minutes)))
         return torch.sinh(x)
         
     def huber(self, x):
+        x = x.abs
         mask = x > self.config.huber_threashold
-        return x.abs() * mask * self.config.huber_threashold + (x ** 2) * (~mask)
+        return x * mask * self.config.huber_threashold + (x ** 2) * (~mask)
 
     def step(self, batch):
-        data = batch[0].squeeze(0)
-        ids = batch[1].squeeze(0)
-        y = batch[2].squeeze(0)
-        y_hat = self(data, ids).view(y.shape[0], y.shape[1], 5, -1)
+        data = batch[0]
+        ids = batch[1]
+        y = batch[2]
+        y_hat = self(data, ids).unflatten(-1, (5, -1))
         ge = (y_hat >= y.unsqueeze(-1))
         coeff = torch.arange(0, 1, 1 / (self.config.num_quantiles + 1), device=y_hat.device)[1:]
         coeff = coeff.view(1, 1, 1, -1).expand(y_hat.shape[0], y_hat.shape[1], 5, -1)
