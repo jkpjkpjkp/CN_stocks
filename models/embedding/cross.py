@@ -185,13 +185,13 @@ class cross(dummyLightning):
     def train_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[:cutoff], self.ohlcv[:, :cutoff, :], self.config, self.m, self.s)
+        return _cross(self.data[:cutoff], self.ohlcv[:, :cutoff+self.config.window_days, :], self.config, self.m, self.s)
     
     @property
     def val_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[cutoff:], self.ohlcv[:, cutoff:, :], self.config, self.m, self.s)
+        return _cross(self.data[cutoff:], self.ohlcy, self.config, self.m, self.s)
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -241,7 +241,7 @@ class cross(dummyLightning):
         loss = coeff * self.huber(y_hat - y.unsqueeze(-1)).view(y_hat.shape[0], y_hat.shape[1], 5, -1)
         return {
             'y_hat': y_hat,
-            'loss': loss,
+            'loss': loss.mean(),
         }
 
 
