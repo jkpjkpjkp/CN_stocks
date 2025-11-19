@@ -29,15 +29,15 @@ class quantile_30min(dummyLightning):
         self.train_dataset = _quantile_30min('../data/train.npy')
         self.val_dataset = _quantile_30min('../data/val.npy')
         
-        self.emb1 = Embedding(config.vocab_size, config.hidden_size)
-        self.emb30 = Embedding(config.vocab_size, config.hidden_size)
-        self.readout = Linear(config.hidden_size, config.vocab_size)
+        self.emb1 = Embedding(config.vocab_size, config.hidden_dim)
+        self.emb30 = Embedding(config.vocab_size, config.hidden_dim)
+        self.readout = Linear(config.hidden_dim, config.vocab_size)
     
     def pre_proc(self, x1, x30):
         b = x1.shape[0]
         x1 = self.emb1(x1)
         x30 = self.emb30(x30)
-        return x1 + torch.concat((torch.zeros((b, 29, self.config.hidden_size), device=x30.device, dtype=x30.dtype), x30), dim=1)
+        return x1 + torch.concat((torch.zeros((b, 29, self.config.hidden_dim), device=x30.device, dtype=x30.dtype), x30), dim=1)
     
     def forward(self, x1, x30):
         emb = self.pre_proc(x1, x30)
@@ -250,7 +250,7 @@ class quantile_30min(dummyLightning):
         print(f"Summary plots and statistics saved to {output_dir}/")
 
 if __name__ == '__main__':
-    from ..prelude.config import transformerConfig
+    from ..prelude.model.config import transformerConfig
     from ..prelude.tm import tm
     config = transformerConfig(
         batch_size=1024

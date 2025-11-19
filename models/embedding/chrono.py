@@ -30,12 +30,12 @@ class chrono(dummyLightning):
         self.val_dataset = _chrono('../data/val.npy')
         
         self.l1 = nn.Conv1d(config.patch_size, config.intermediate_size, config.patch_size)
-        self.l2 = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.s1 = nn.Conv1d(config.patch_size, config.hidden_size, config.patch_size)
+        self.l2 = nn.Linear(config.intermediate_size, config.hidden_dim)
+        self.s1 = nn.Conv1d(config.patch_size, config.hidden_dim, config.patch_size)
         
-        self.l3 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.l3 = nn.Linear(config.hidden_dim, config.intermediate_size)
         self.l4 = nn.Linear(config.intermediate_size, config.vocab_size * config.patch_size)
-        self.s2 = nn.Linear(config.hidden_size, config.vocab_size * config.patch_size)
+        self.s2 = nn.Linear(config.hidden_dim, config.vocab_size * config.patch_size)
         
     def pre_proc(self, x):
         x = x.view(x.shape[0], self.config.patch_size, -1)
@@ -57,7 +57,7 @@ class chrono(dummyLightning):
         return loss
     
 if __name__ == '__main__':
-    from ..prelude.config import transformerConfig
+    from ..prelude.model.config import transformerConfig
     from ..prelude.tm import tm
     
     class chronoConfig(transformerConfig):

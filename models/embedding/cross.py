@@ -6,18 +6,18 @@ from torch import nn
 from torch.nn import functional as F
 from dataclasses import dataclass
 from einops import rearrange
-from ..prelude.model import dummyLightning, apply_rotary_emb
+from ..prelude.model import dummyLightning, apply_rotary_emb, transformerConfig
 
 class mha(dummyLightning):
     def __init__(self, config, pos_emb=True):
-        super().__init__()
+        super().__init__(config)
         self.pos_emb = pos_emb
-        self.qkv = nn.Linear(config.hidden_size, 3 * config.num_heads * config.head_dim)
-        self.readout = nn.Linear(config.num_heads * config.head_dim, config.hidden_size)
+        self.qkv = nn.Linear(config.hidden_dim, 3 * config.num_heads * config.head_dim)
+        self.readout = nn.Linear(config.num_heads * config.head_dim, config.hidden_dim)
         
         device = config.device
-        channel_range = torch.arange(0, config.hidden_size, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (10000 ** (channel_range / config.hidden_size))
+        channel_range = torch.arange(0, config.hidden_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (10000 ** (channel_range / config.hidden_dim))
         t = torch.arange(config.seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         self.cos, self.sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
@@ -44,9 +44,9 @@ class mha(dummyLightning):
 
         return self.readout(y)
 
-class mhaa(nn.Module):
+class mhaa(dummyLightning):
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         self.time_attn = mha(config)
         self.cross_attn = mha(config, pos_emb=False)
         self.ffn = nn.Sequential(
@@ -69,6 +69,7 @@ class cross(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.data_prepare(config)
+        self.param_prepare(config)
 
     def data_prepare(self, config):
         df = pl.scan_parquet('../data/a_1min.pq')
@@ -77,10 +78,6 @@ class cross(dummyLightning):
         df = df.drop_nulls().with_columns(
             date = pl.col('datetime').dt.date(),
             time = pl.col('datetime').dt.time(),
-        ).with_columns(
-            open = pl.col.open / pl.col.close,
-            high = pl.col.high / pl.col.close,
-            low = pl.col.low / pl.col.close,
         ).collect()
 
         # every minute from 9:30 to 11:30, from 13:00 to 15:00, to use as join
@@ -106,8 +103,19 @@ class cross(dummyLightning):
             ids: torch.Tensor
             data: torch.Tensor
         
+        ohlc = df.group_by('date', 'id', maintain_order=True).agg(
+            pl.col.open.first(),
+            pl.col.high.max(),
+            pl.col.low.min(),
+            pl.col.close.last(),
+        )
+        df = df.with_columns(
+            high = pl.col.high / pl.col.open,
+            low = pl.col.open / pl.col.low,
+            close = pl.col.close / pl.col.close.shift(1).over('id')
+        )
         date_groups = [x for x in df.group_by('date', maintain_order=True)]
-        data_list = []
+        self.data = []
         for i in range(len(date_groups) - config.window_days + 1):
             arr = date_groups[i: i + config.window_days]
             df = arr[0][1]
@@ -127,18 +135,14 @@ class cross(dummyLightning):
             )
             date = df['date'][0]
             ids = torch.tensor([id_map[id] for id in df['id'].unique()])
-            data = df.select(pl.col('open', 'high', 'low', 'close', 'volume')).to_numpy()
+            data = df.select(pl.col('open', 'high', 'low', 'close', 'volume')).to_torch()
             assert data.shape[-1] == 5
-            data = data.reshape(len(unique_ids), -1, 5)
-            data_list.append(per_day(date, ids, data))
-
-        self.lens = torch.tensor([len(x.ids) for x in data_list])
-        self.cum_lens = torch.cumsum(self.lens, dim=0)
-        self.cum_lens = torch.cat([torch.tensor([0]), self.cum_lens], dim=0)
+            data = data.view(len(unique_ids), -1, 5)
+            self.data.append(per_day(date, ids, data))
         
-        contents = torch.concat((x.data for x in data_list), dim=0)
-        self.m = contents.mean(dim=(0, 1)).view(None, None, -1)
-        self.s = contents.std(dim=(0, 1)).view(None, None, -1)
+        contents = torch.concat([x.data for x in self.data], dim=0)
+        self.m = contents.mean(dim=(0, 1)).view(1, 1, -1)
+        self.s = contents.std(dim=(0, 1)).view(1, 1, -1)
 
     def __len__(self):
         return len(self.data)
@@ -153,12 +157,14 @@ class cross(dummyLightning):
             'l1': nn.Linear(config.window_minutes * 5, config.intermediate_dim),
             'l2': nn.Linear(config.intermediate_dim, config.hidden_dim),
         })
-        self.class_embed = torch.nn.Embedding(self.num_ids, config.id_dim)
+        self._class_embed = torch.nn.Embedding(self.num_ids, config.id_dim)
 
         self.layers = nn.ModuleList([mhaa(config) for _ in range(config.num_layers)])
 
-        self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles)
+        self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles * 4)
 
+    def class_embed(self, ids):
+        return torch.concat([self._class_embed(ids), torch.zeros_like(ids)], dim=-1)
     
     def embed(self, x):
         x = x.view(-1, 240 * self.config.window_days // self.config.window_minutes, self.config.window_minutes * 5)
@@ -172,10 +178,13 @@ class cross(dummyLightning):
         class_embeddings = self.class_embed(ids)
         for layer in self.layers:
             x = layer(x, class_embeddings)
-        return self.readout(x.view(-1, self.config.window_days, self.config.hidden_dim * 240 // self.config.window_minutes))
+        x = self.readout(x.view(-1, self.config.window_days, self.config.hidden_dim * 240 // self.config.window_minutes))
+        return torch.sinh(x)
         
     def step(self, x):
         y_hat = self(x.data, x.ids)
+        y_hat = torch.sinh(y_hat)
+
         return {
             'y_hat': y_hat,
         }
@@ -183,9 +192,15 @@ class cross(dummyLightning):
 
 if __name__ == '__main__':
     @dataclass
-    class debug_config:
+    class debug_config(transformerConfig):
         debug_data = True
         window_days = 5
-    x = cross(debug_config)
+        window_minutes = 10
+        num_quantiles = 4
+        id_dim = 8
+        head_dim = 2
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+    x = cross(debug_config())
     print(x.step(x[42]))
     breakpoint()

@@ -2,10 +2,10 @@ from transformers import PretrainedConfig
 
 class transformerConfig(PretrainedConfig):
     model_type = "t1p30"
-    layers=7
-    hidden_size=256
+    num_layers=7
+    hidden_dim=16
     intermediate_ratio=2.5
-    num_heads=4
+    num_heads=2
     lr=3e-4
     norm='LayerNorm'
     device='cuda'
@@ -19,7 +19,8 @@ class transformerConfig(PretrainedConfig):
     num_workers=16
     epochs=32
 
-    def __init__(self, intermediate_ratio=1.5, **kwargs):
-        self.intermediate_ratio = intermediate_ratio
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.intermediate_size = int(self.hidden_size * self.intermediate_ratio)
+        self.intermediate_size = int(self.hidden_dim * self.intermediate_ratio)
+        self.intermediate_dim = self.intermediate_size
+        self.head_dim = self.hidden_dim // self.num_heads
