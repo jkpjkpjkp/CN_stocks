@@ -100,6 +100,9 @@ class dummyLightning(Module):
         
     def activate(self):
         self._activate()
+        for name, param in self.named_parameters():
+            if name[-5:] == '.bias':
+                param.data.zero_()
         self.forward = torch.autocast(device_type=self.config.device, dtype=torch.bfloat16)(torch.compile(self.forward))
     
     def _iteration(self, dataloader, progress, epoch, num_epochs, train=True):

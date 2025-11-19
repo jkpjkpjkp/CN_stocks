@@ -238,13 +238,11 @@ class cross(dummyLightning):
         coeff = torch.arange(0, 1, 1 / (self.config.num_quantiles + 1), device=y_hat.device)[1:]
         coeff = coeff.view(1, 1, 1, 1, -1).expand(y_hat.shape[0], y_hat.shape[1], y_hat.shape[2], 5, -1)
         coeff = coeff * ge + (1 - coeff) * (~ge)
-        breakpoint()
         loss = coeff * self.huber(y_hat - y.unsqueeze(-1))
         return {
             'y_hat': y_hat,
             'loss': loss.mean(),
         }
-
 
 if __name__ == '__main__':
     @dataclass
@@ -263,4 +261,5 @@ if __name__ == '__main__':
             self.batch_size = 1
 
     x = cross(debug_config())
+    
     x.fit()
