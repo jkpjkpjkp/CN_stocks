@@ -159,8 +159,7 @@ class cross(dummyLightning):
         ret.data = (ret.data - self.m) / self.s
         y = self.ohlcv[ret.ids, ret.i+1 : ret.i + self.config.window_days + 1]
         y = (y - self.m) / self.s
-        ret = torch.asinh(ret)
-        return ret, y
+        return torch.asinh(ret.data), ret.ids, y
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -197,9 +196,10 @@ class cross(dummyLightning):
         return x.abs() * mask * self.config.huber_threashold + (x ** 2) * (~mask)
 
     def step(self, batch):
-        x = batch[0].squeeze(0)
-        y = batch[1].squeeze(0)
-        y_hat = self(x.data, x.ids).view(y.shape[0], y.shape[1], 5, -1)
+        data = batch[0].squeeze(0)
+        ids = batch[1].squeeze(0)
+        y = batch[2].squeeze(0)
+        y_hat = self(data, ids).view(y.shape[0], y.shape[1], 5, -1)
         y_hat = torch.sinh(y_hat)
         ge = (y_hat >= y.unsqueeze(-1))
         coeff = torch.arange(0, 1, 1 / (self.config.num_quantiles + 1))[1:]
@@ -224,6 +224,7 @@ if __name__ == '__main__':
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
     x = cross(debug_config(batch_size = 1))
+    print(x[42])
     print(x.step(x[42]))
     x.fit()
     breakpoint()
