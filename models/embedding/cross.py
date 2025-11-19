@@ -17,8 +17,9 @@ class mha(dummyLightning):
         self.readout = nn.Linear(config.num_heads * config.head_dim, config.hidden_dim)
         
         device = config.device
-        channel_range = torch.arange(0, config.hidden_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (10000 ** (channel_range / config.hidden_dim))
+        attn_dim = config.head_dim * config.num_heads
+        channel_range = torch.arange(0, attn_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (10000 ** (channel_range / attn_dim))
         t = torch.arange(config.seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         self.cos, self.sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
@@ -57,11 +58,10 @@ class mhaa(dummyLightning):
         )
         self.ln1 = nn.LayerNorm(config.hidden_dim)
         self.ln2 = nn.LayerNorm(config.hidden_dim)
-        self.alpha = nn.Parameter(torch.tensor(0.001))
     
     def forward(self, x, embeddings):
         x = x + self.time_attn(self.ln1(x))
-        x = x + self.alpha * self.cross_attn(self.ln2(x).transpose(-3, -2), embeddings).transpose(-3, -2)
+        x = x + self.cross_attn(self.ln2(x).transpose(-3, -2), embeddings).transpose(-3, -2)
         x = x + self.ffn(x)
         return x
     
@@ -228,19 +228,16 @@ class cross(dummyLightning):
             init_linear(layer.time_attn.qkv, std=0.02)
             init_linear(layer.time_attn.readout, zero_init=True)  # Critical for stability
             
-            # Cross attention (scaled by alpha)
-            init_linear(layer.cross_attn.qkv, std=0.01)  # Smaller due to alpha scaling
+            init_linear(layer.cross_attn.qkv, std=0.01)
             init_linear(layer.cross_attn.readout, zero_init=True)
             
             init_linear(layer.ffn[1], std=0.02)  # Expansion layer
             init_linear(layer.ffn[3], std=0.02)  # Projection layer
-            
-            nn.init.constant_(layer.alpha, 0.001)
         
         init_linear(self.readout, zero_init=True)
     
     def class_embed(self, ids):
-        ret = self._class_embed(ids)
+        ret = self._class_embed(ids).unsqueeze(1)
         return torch.concat([ret, torch.zeros_like(ret)], dim=-1)
     
     def embed(self, x):
@@ -290,15 +287,17 @@ if __name__ == '__main__':
         num_workers=0,
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
-            self.id_dim = self.hidden_dim // 2
             self.seq_len = self.window_days * 240 // self.window_minutes
             self.batch_size = 16
-            self.head_dim = self.hidden_dim // self.num_heads // 2
+            self.attn_dim = self.hidden_dim // 2
+            self.head_dim = self.attn_dim // self.num_heads
+            self.id_dim = self.attn_dim // 2
 
     x = cross(debug_config(
         num_workers=2,
         hidden_dim=128,
         num_layers=5,
+        epochs=1000,
     ))
     
     x.fit()

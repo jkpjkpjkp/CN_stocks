@@ -5,7 +5,7 @@ from einops import rearrange
 from .main import dummyLightning
 
 def apply_rotary_emb(x, cos, sin):
-    l = x.shape[1]
+    l = x.shape[-2]
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
     y1 = x1 * cos[:l] + x2 * sin[:l] # rotate pairs of dims

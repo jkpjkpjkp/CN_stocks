@@ -144,6 +144,7 @@ class dummyLightning(Module):
             
             if train:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), self.config.grad_clip)
                 self.optimizer_step()
             
             # Track loss for epoch average

@@ -18,6 +18,7 @@ class transformerConfig(PretrainedConfig):
     batch_size=128
     num_workers=2
     epochs=32
+    grad_clip=1.
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
