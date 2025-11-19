@@ -65,7 +65,7 @@ class mhaa(dummyLightning):
     
     def forward(self, x, embeddings):
         x = x + self.time_attn(self.ln1(x))
-        x = x + self.cross_attn(self.ln2(x).transpose(0, 1), embeddings).transpose(-3, -2)
+        x = x + self.cross_attn(self.ln2(x).transpose(-3, -2), embeddings).transpose(-3, -2)
         x = x + self.ffn(x)
         return x
     
