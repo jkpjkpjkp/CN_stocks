@@ -4,6 +4,7 @@ import datetime
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import Dataset
 from dataclasses import dataclass
 from einops import rearrange
 from ..prelude.model import dummyLightning, apply_rotary_emb, transformerConfig
@@ -64,6 +65,30 @@ class mhaa(dummyLightning):
         x = x + self.ffn(x)
         return x
 
+class _cross(Dataset):
+    def __init__(self, data, ohlcv, config, m, s):
+        self.data = data
+        self.ohlcv = ohlcv
+        self.config = config
+        self.m = m
+        self.s = s
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        ret = self.data[idx]
+        x = (ret.x - self.m) / self.s
+        y = self.ohlcv[ret.i+1 : ret.i + self.config.window_days + 1, ret.ids, :]
+        y = (y - self.m) / self.s
+        assert x.ndim == 3, x.shape
+        assert y.ndim == 3, y.shape
+        assert x.shape[0] == y.shape[0], f"data.shape[0] != y.shape[0], {x.shape} != {y.shape}"
+        assert x.shape[1] == y.shape[1] * 240, f"x.shape[1] != y.shape[1], {x.shape} != {y.shape}"
+        
+        return torch.asinh(x), ret.ids, y
+    
+
 class cross(dummyLightning):
     
     def __init__(self, config):
@@ -114,7 +139,7 @@ class cross(dummyLightning):
             pl.col.low.min(),
             pl.col.close.last(),
             pl.col.volume.sum(),
-        ).sort('id', 'date')
+        ).sort('date', 'id')
         ohlcv = ohlcv.select(
             'open', 'high', 'low', 'close', 'volume'
         ).to_torch()
@@ -152,19 +177,15 @@ class cross(dummyLightning):
         self.m = contents.mean(dim=(0, 1)).view(1, 1, -1)
         self.s = contents.std(dim=(0, 1)).view(1, 1, -1)
 
-    def __len__(self):
-        return len(self.data)
+    def train_dataset(self):
+        tot = len(self.data)
+        cutoff = int(tot * self.config.train_ratio)
+        return _cross(self.data[:cutoff], self.ohlcv[cutoff:], self.config, self.m, self.s)
     
-    def __getitem__(self, idx):
-        ret = self.data[idx]
-        x = (ret.x - self.m) / self.s
-        y = self.ohlcv[ret.ids, ret.i+1 : ret.i + self.config.window_days + 1, :]
-        y = (y - self.m) / self.s
-        assert x.ndim == 3, x.shape
-        assert y.ndim == 3, y.shape
-        assert x.shape[0] == y.shape[0], f"data.shape[0] != y.shape[0], {x.shape} != {y.shape}"
-        assert x.shape[1] == y.shape[1] * 240, f"x.shape[1] != y.shape[1], {x.shape} != {y.shape}"
-        return torch.asinh(x), ret.ids, y
+    def val_dataset(self):
+        tot = len(self.data)
+        cutoff = int(tot * self.config.train_ratio)
+        return _cross(self.data[cutoff:], self.ohlcv[cutoff:], self.config, self.m, self.s)
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -225,12 +246,13 @@ if __name__ == '__main__':
         window_days = 5
         window_minutes = 10
         num_quantiles = 4
-        id_dim = 8
         head_dim = 2
+        train_ratio = 0.85
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
-    x = cross(debug_config(batch_size = 1))
-    print(x[42])
-    print(x.step(x[42]))
+            self.id_dim = self.hidden_dim // 2
+            self.seq_len = self.window_days * 240 // self.window_minutes
+            self.batch_size = 1
+
+    x = cross(debug_config())
     x.fit()
-    breakpoint()
