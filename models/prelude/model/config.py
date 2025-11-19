@@ -16,7 +16,7 @@ class transformerConfig(PretrainedConfig):
     mlflow_dir='./.checkpoint/mlruns'
     
     batch_size=128
-    num_workers=16
+    num_workers=2
     epochs=32
 
     def __init__(self, **kwargs):

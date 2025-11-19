@@ -254,12 +254,15 @@ if __name__ == '__main__':
         head_dim = 2
         train_ratio = 0.85
         huber_threashold = 1.
+        num_workers=0,
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.id_dim = self.hidden_dim // 2
             self.seq_len = self.window_days * 240 // self.window_minutes
             self.batch_size = 1
 
-    x = cross(debug_config())
+    x = cross(debug_config(
+        num_workers=2,
+    ))
     
     x.fit()
