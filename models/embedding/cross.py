@@ -34,21 +34,16 @@ class mha(dummyLightning):
             k = k + embeddings
         b = x.shape[0]
         
-        shape = (b, -1, self.config.head_dim, self.config.num_heads)
-        q = rearrange(q.view(*shape), 'b l d h -> b h l d')
-        k = rearrange(k.view(*shape), 'b l d h -> b h l d')
-        v = rearrange(v.view(*shape), 'b l d h -> b h l d')
+        q = rearrange(q.unflatten(-1, (self.config.head_dim, self.config.num_heads)), '... l d h -> ... h l d')
+        k = rearrange(k.unflatten(-1, (self.config.head_dim, self.config.num_heads)), '... l d h -> ... h l d')
+        v = rearrange(v.unflatten(-1, (self.config.head_dim, self.config.num_heads)), '... l d h -> ... h l d')
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=self.pos_emb)
-        y = y.transpose(1, 2).contiguous()
-        y = y.view(b, -1, self.config.num_heads * self.config.head_dim)
+        y = y.transpose(-3, -2).contiguous()
+        y = y.flatten(-2)
 
         return self.readout(y)
     
-    def init_weights(self, std):
-        self.qkv.weight.data.normal_(mean=0.0, std=std)
-        self.readout.weight.data.normal_(mean=0.0, std=std)
-
 class mhaa(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
@@ -62,20 +57,15 @@ class mhaa(dummyLightning):
         )
         self.ln1 = nn.LayerNorm(config.hidden_dim)
         self.ln2 = nn.LayerNorm(config.hidden_dim)
+        self.alpha = nn.Parameter(torch.tensor(0.001))
     
     def forward(self, x, embeddings):
         x = x + self.time_attn(self.ln1(x))
-        x = x + self.cross_attn(self.ln2(x).transpose(-3, -2), embeddings).transpose(-3, -2)
+        x = x + self.alpha * self.cross_attn(self.ln2(x).transpose(-3, -2), embeddings).transpose(-3, -2)
         x = x + self.ffn(x)
         return x
     
-    def init_weights(self):
-        self.time_attn.init_weights(0.02)
-        self.cross_attn.init_weights(0.0002)
-        self.ffn[1].weight.data.normal_(mean=0.0, std=0.02)
-        self.ffn[3].weight.data.normal_(mean=0.0, std=0.02)
-
-class _cross(Dataset):
+class _data(Dataset):
     def __init__(self, data, ohlcv, config, m, s):
         self.data = data
         self.ohlcv = ohlcv
@@ -195,13 +185,13 @@ class cross(dummyLightning):
     def train_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[:cutoff], self.ohlcv[:, :cutoff+self.config.window_days, :], self.config, self.m, self.s)
+        return _data(self.data[:cutoff], self.ohlcv[:, :cutoff+self.config.window_days, :], self.config, self.m, self.s)
     
     @property
     def val_dataset(self):
         tot = len(self.data)
         cutoff = int(tot * self.config.train_ratio)
-        return _cross(self.data[cutoff:], self.ohlcv, self.config, self.m, self.s)
+        return _data(self.data[cutoff:], self.ohlcv, self.config, self.m, self.s)
     
     def param_prepare(self, config):
         self.emb = nn.ModuleDict({
@@ -215,9 +205,6 @@ class cross(dummyLightning):
 
         self.readout = nn.Linear(config.hidden_dim * 240 // config.window_minutes, config.num_quantiles * 5)
         
-        for layer in self.layers:
-            layer.init_weights()
-
     def class_embed(self, ids):
         ret = self._class_embed(ids)
         return torch.concat([ret, torch.zeros_like(ret)], dim=-1)
@@ -234,11 +221,11 @@ class cross(dummyLightning):
         class_embeddings = self.class_embed(ids)
         for layer in self.layers:
             x = layer(x, class_embeddings)
-        x = self.readout(x.unflatten(-1, (self.config.window_days, self.config.hidden_dim * 240 // self.config.window_minutes)))
+        x = self.readout(x.flatten(-2).unflatten(-1, (self.config.window_days, self.config.hidden_dim * 240 // self.config.window_minutes)))
         return torch.sinh(x)
         
     def huber(self, x):
-        x = x.abs
+        x = x.abs()
         mask = x > self.config.huber_threashold
         return x * mask * self.config.huber_threashold + (x ** 2) * (~mask)
 
@@ -249,9 +236,10 @@ class cross(dummyLightning):
         y_hat = self(data, ids).unflatten(-1, (5, -1))
         ge = (y_hat >= y.unsqueeze(-1))
         coeff = torch.arange(0, 1, 1 / (self.config.num_quantiles + 1), device=y_hat.device)[1:]
-        coeff = coeff.view(1, 1, 1, -1).expand(y_hat.shape[0], y_hat.shape[1], 5, -1)
+        coeff = coeff.view(1, 1, 1, 1, -1).expand(y_hat.shape[0], y_hat.shape[1], y_hat.shape[2], 5, -1)
         coeff = coeff * ge + (1 - coeff) * (~ge)
-        loss = coeff * self.huber(y_hat - y.unsqueeze(-1)).view(y_hat.shape[0], y_hat.shape[1], 5, -1)
+        breakpoint()
+        loss = coeff * self.huber(y_hat - y.unsqueeze(-1))
         return {
             'y_hat': y_hat,
             'loss': loss.mean(),
