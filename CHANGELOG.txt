@@ -22,3 +22,12 @@ investigating logits to see why
 is absolutely the way to go
 
 the only left algorithmic task is to discover inter-id relations
+
+
+
+## mega run
+
+next step is self adaptive training, because we are unsure of many things, architectural as well as hyperparameter-wise
+we cannot afford even simplest reruns, so we adapt on the fly
+
+identify bottleneck, use redundant gpu for ab testing

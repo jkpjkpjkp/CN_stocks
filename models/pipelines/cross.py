@@ -84,8 +84,9 @@ class _data(Dataset):
         assert y.ndim == 3, y.shape
         assert x.shape[0] == y.shape[0], f"data.shape[0] != y.shape[0], {x.shape} != {y.shape}"
         assert x.shape[1] == y.shape[1] * 240, f"x.shape[1] != y.shape[1], {x.shape} != {y.shape}"
-        
-        return torch.asinh(x), ret.ids, y
+        #assert no nan in ids
+        assert not torch.isnan(ret.ids).any(), ret.ids
+        return torch.asinh(x).nan_to_num(0), ret.ids, y.nan_to_num(0)
 
 
 class cross(dummyLightning):
@@ -122,7 +123,7 @@ class cross(dummyLightning):
         self.num_ids = len(ids)
         assert self.num_ids < 6000, self.num_ids
         id_map = {x: i for i, x in enumerate(ids['id'])}
-
+        
         @dataclass
         class per_day: # window
             i: int
@@ -131,7 +132,7 @@ class cross(dummyLightning):
             x: torch.Tensor
         
         all_dates = df.select('date').unique().sort('date').collect()
-        all_di = ids.join(all_dates, how='cross')
+        all_di = ids.join(all_dates, how='cross').lazy()
         ohlcv = df.group_by('date', 'id').agg(
             pl.col.open.first(),
             pl.col.high.max(),
@@ -149,7 +150,7 @@ class cross(dummyLightning):
         )
         ohlcv = ohlcv.select(
             'open', 'high', 'low', 'close', 'volume'
-        ).to_torch()
+        ).fill_null(float('nan')).collect().to_torch()
         assert ohlcv.shape[-1] == 5
         ohlcv = ohlcv.view(len(ids), -1, 5)
         assert ohlcv.shape[1] == len(all_dates)
@@ -159,33 +160,30 @@ class cross(dummyLightning):
         
         self.data = []
         for i in range(len(all_dates) - config.window_days):
-            arr = df.filter(pl.col.date.is_between(all_dates['date'][i], all_dates['date'][i + config.window_days])).collect()
-            df = arr[0][1]
-            for x in arr[1:]:
-                df = df.vstack(x[1])
-            unique_ids = df.select('id').unique()
+            window_df = df.filter(pl.col.date.is_between(all_dates['date'][i], all_dates['date'][i + config.window_days - 1])).collect()
+            unique_ids = window_df.select('id').unique()
             
             full_times_per_id = unique_ids.join(times, how='cross')
             assert len(full_times_per_id) == len(unique_ids) * len(times), f"{len(full_times_per_id)} != {len(unique_ids)} * {len(times)}"
 
-            df = full_times_per_id.join(
-                df,
+            window_df = full_times_per_id.join(
+                window_df,
                 on=['id', 'time'],
                 how='left'
             )
-            data = df.select(
+            data = window_df.select(
                 'open', 'high', 'low', 'close', 'volume'
-            ).to_torch()
+            ).fill_null(float('nan')).to_torch()
             data = data.view(len(unique_ids), 240 * config.window_days, 5)
             self.data.append(per_day(
                 i, 
-                date=df['date'][0], 
+                date=window_df['date'][0], 
                 ids=torch.tensor([id_map[id] for id in unique_ids['id']]),
                 x=data))
         
         contents = torch.concat([x.x for x in self.data], dim=0)
-        self.m = contents.mean(dim=(0, 1)).view(1, 1, -1)
-        self.s = contents.std(dim=(0, 1)).view(1, 1, -1)
+        self.m = contents.nanmean(dim=(0, 1)).view(1, 1, -1)
+        self.s = ((contents**2).nanmean(dim=(0, 1)) - self.m**2).view(1, 1, -1)
 
     @property
     def train_dataset(self):
@@ -299,12 +297,22 @@ if __name__ == '__main__':
             self.head_dim = self.attn_dim // self.num_heads
             self.id_dim = self.attn_dim // 2
 
-    x = cross(debug_config(
+    config = debug_config(
         num_workers=8,
         hidden_dim=128,
         num_layers=5,
         epochs=42,
         debug_data=False,
-    ))
+    )
+    #get all cli args and add to config. if key exists, convert value to type
+    # e.g. --debug-data False
+    import os, sys
+    for arg in sys.argv[1:]:
+        if arg.startswith('--'):
+            key, value = arg[2:].replace('-', '_').split('=')
+            if hasattr(config, key):
+                setattr(config, key, type(getattr(config, key))(value))
+    
+    x = cross(config)
     
     x.fit()
