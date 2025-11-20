@@ -33,7 +33,6 @@ class mha(dummyLightning):
         else:
             q = q + embeddings
             k = k + embeddings
-        b = x.shape[0]
         
         q = rearrange(q.unflatten(-1, (self.config.head_dim, self.config.num_heads)), '... l d h -> ... h l d')
         k = rearrange(k.unflatten(-1, (self.config.head_dim, self.config.num_heads)), '... l d h -> ... h l d')
@@ -142,6 +141,14 @@ class cross(dummyLightning):
             pl.col.close.last(),
             pl.col.volume.sum(),
         ).join(all_di, on=['id', 'date'], how='right')
+
+        ohlcv = ohlcv.sort('id', 'date').select(
+            pl.col.open / pl.col.open.shift(1),
+            pl.col.high / pl.col.high.shift(1),
+            pl.col.low / pl.col.low.shift(1),
+            pl.col.close / pl.col.close.shift(1),
+            pl.col.volume / pl.col.volume.shift(1),
+        )
         ohlcv = ohlcv.select(
             'open', 'high', 'low', 'close', 'volume'
         ).to_torch()
@@ -297,7 +304,7 @@ if __name__ == '__main__':
         num_workers=8,
         hidden_dim=128,
         num_layers=5,
-        epochs=32,
+        epochs=42,
         debug_data=False,
     ))
     

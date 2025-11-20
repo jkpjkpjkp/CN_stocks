@@ -154,17 +154,12 @@ class dummyLightning(Module):
             if random.randint(0, 9) == 0 or batch_idx == len(dataloader) - 1:
                 self.log(f'{"train" if train else "val"}/loss', loss.item())
             
-            # Update progress bar with current metrics
-            progress.update(task, advance=1, metrics=self.prog_bar_metrics)
-            
-            # Also update the task description to show current epoch loss average
-            if batch_idx > 0:
-                current_avg_loss = sum(epoch_losses) / len(epoch_losses)
-                progress.update(task, description=f"{'Training' if train else 'Validation'} Epoch {epoch + 1}/{num_epochs} (avg: {current_avg_loss:.4f})")
-            
             self.global_step += 1
-        
-        # Calculate and return epoch average loss
+            # Update progress bar with current metrics
+            if batch_idx + 1 == len(dataloader):
+                epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
+                self.prog_bar_metrics['train/loss'] = epoch_avg_loss
+            progress.update(task, advance=1, metrics=self.prog_bar_metrics)
         epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
         return epoch_avg_loss
 
@@ -176,28 +171,25 @@ class dummyLightning(Module):
         
         train_dataloader = self.training_dataloader()
         val_dataloader = self.validation_dataloader()
+
+        best_val_loss = float('inf')
         
         self.global_step = 0
         progress = create_progress_bar()
         with progress:
-            self.prog_bar_metrics = {}
             for epoch in range(self.config.epochs):
-                # Reset metrics for new epoch
                 self.prog_bar_metrics = {}
-                
-                # Run training and validation iterations and get epoch losses
                 train_epoch_loss = self._iteration(train_dataloader, progress, epoch, self.config.epochs, train=True)
+                self.prog_bar_metrics = {}
                 val_epoch_loss = self._iteration(val_dataloader, progress, epoch, self.config.epochs, train=False)
                 
-                # Log epoch-level losses to MLflow
                 self.log('train/epoch_loss', train_epoch_loss, prog_bar=False)
                 self.log('val/epoch_loss', val_epoch_loss, prog_bar=False)
+
+                if val_epoch_loss < best_val_loss:
+                    best_val_loss = val_epoch_loss
+                    self.save_checkpoint(f'./.checkpoints/{self.__class__.__name__}/_epoch={epoch}_step={self.global_step}_loss={val_epoch_loss:.4f}.pt', epoch, val_epoch_loss, train_epoch_loss)
                 
-                # Update progress bar with epoch summary
-                epoch_metrics = {
-                    'train_epoch': train_epoch_loss,
-                    'val_epoch': val_epoch_loss,
-                }
                 progress.console.print(f"Epoch {epoch + 1}/{self.config.epochs} completed - Train Loss: {train_epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}")
     
     def log(self, name, value, prog_bar=True, logger=True):
@@ -205,3 +197,24 @@ class dummyLightning(Module):
             mlflow.log_metric(name, value, step=self.global_step)
         if prog_bar:
             self.prog_bar_metrics[name] = value
+    
+    def save_checkpoint(self, path, epoch, val_epoch_loss, train_epoch_loss):
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        torch.save({
+            'epoch': epoch,
+            'global_step': self.global_step,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'val_epoch_loss': val_epoch_loss,
+            'train_epoch_loss': train_epoch_loss,
+        }, path)
+    
+    @classmethod
+    def load_checkpoint(cls, path):
+        checkpoint = torch.load(path)
+        model = cls.load_state_dict(checkpoint['model_state_dict'])
+        model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        model.global_step = checkpoint['global_step']
+        return model
