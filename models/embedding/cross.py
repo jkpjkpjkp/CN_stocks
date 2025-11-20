@@ -142,7 +142,7 @@ class cross(dummyLightning):
             pl.col.volume.sum(),
         ).join(all_di, on=['id', 'date'], how='right')
 
-        ohlcv = ohlcv.sort('id', 'date').select(
+        ohlcv = ohlcv.select(
             pl.col.open / pl.col.open.shift(1),
             pl.col.high / pl.col.high.shift(1),
             pl.col.low / pl.col.low.shift(1),
@@ -173,8 +173,7 @@ class cross(dummyLightning):
                 on=['id', 'time'],
                 how='left'
             )
-            data = df.sort('id', 'datetime'
-            ).select(
+            data = df.select(
                 'open', 'high', 'low', 'close', 'volume'
             ).to_torch()
             data = data.view(len(unique_ids), 240 * config.window_days, 5)
