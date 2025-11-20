@@ -144,9 +144,9 @@ class cross(dummyLightning):
 
         ohlcv = ohlcv.select(
             pl.col.open / pl.col.open.shift(1),
-            pl.col.high / pl.col.high.shift(1),
-            pl.col.low / pl.col.low.shift(1),
-            pl.col.close / pl.col.close.shift(1),
+            pl.col.high / pl.col.open.shift(1),
+            pl.col.low / pl.col.open.shift(1),
+            pl.col.close / pl.col.open.shift(1),
             pl.col.volume / pl.col.volume.shift(1),
         )
         ohlcv = ohlcv.select(
