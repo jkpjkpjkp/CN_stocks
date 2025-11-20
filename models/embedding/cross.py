@@ -116,9 +116,9 @@ class cross(dummyLightning):
         df = df.drop_nulls().with_columns(
             date = pl.col('datetime').dt.date(),
             time = pl.col('datetime').dt.time(),
-        ).collect()
+        )
 
-        ids = df.select('id').unique().sort('id')
+        ids = df.select('id').unique().sort('id').collect()
         self.num_ids = len(ids)
         assert self.num_ids < 6000, self.num_ids
         id_map = {x: i for i, x in enumerate(ids['id'])}
@@ -130,9 +130,7 @@ class cross(dummyLightning):
             ids: torch.Tensor
             x: torch.Tensor
         
-        date_groups = [x for x in df.group_by('date', maintain_order=True)]
-        
-        all_dates = df.select('date').unique().sort('date')
+        all_dates = df.select('date').unique().sort('date').collect()
         all_di = ids.join(all_dates, how='cross')
         ohlcv = df.group_by('date', 'id').agg(
             pl.col.open.first(),
@@ -154,12 +152,14 @@ class cross(dummyLightning):
         ).to_torch()
         assert ohlcv.shape[-1] == 5
         ohlcv = ohlcv.view(len(ids), -1, 5)
-        assert ohlcv.shape[1] == len(date_groups)
+        assert ohlcv.shape[1] == len(all_dates)
         self.ohlcv = ohlcv
 
+        num_dates = ohlcv.shape[1]
+        
         self.data = []
-        for i in range(len(date_groups) - config.window_days):
-            arr = date_groups[i: i + config.window_days]
+        for i in range(len(all_dates) - config.window_days):
+            arr = df.filter(pl.col.date.is_between(all_dates['date'][i], all_dates['date'][i + config.window_days])).collect()
             df = arr[0][1]
             for x in arr[1:]:
                 df = df.vstack(x[1])
