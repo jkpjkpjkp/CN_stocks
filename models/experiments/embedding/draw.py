@@ -128,6 +128,7 @@ def create_kline_pixel_graph(ohlcv_data: List[Dict[str, float]],
             return (36, 255, 36)
 
     # Draw each day's K-line and volume
+    prev_ma = None
     for day_idx in range(len(ohlcv_data)):
         day = ohlcv_data[day_idx]
 
@@ -165,13 +166,21 @@ def create_kline_pixel_graph(ohlcv_data: List[Dict[str, float]],
             draw.line([(x_left, open_y), (x_right, close_y)],
                       fill=day_color, width=1)
 
-        # 3. Draw moving average point
+        # 3. Draw moving average point/line (1-pixel wide)
+        color = (242, 142, 255)
         if not np.isnan(ma[day_idx]):
             ma_y = map_price_to_y(ma[day_idx])
-            # Paper: "移动均价像素点位」中间"
-            # Draw as a small 3x3 pixel square centered at MA point
-            ma_rect = [x_center-1, ma_y-1, x_center+1, ma_y+1]
-            draw.rectangle(ma_rect, fill=day_color, outline=day_color)
+            # Draw a single-pixel MA point at the center
+            # color is purple
+            draw.point((x_center, ma_y), fill=color)
+            # Connect to previous MA point with a 1-pixel line
+            if prev_ma is not None:
+                prev_x, prev_y = prev_ma
+                draw.line([(prev_x, prev_y), (x_center, ma_y)],
+                          fill=color, width=1)
+            prev_ma = (x_center, ma_y)
+        else:
+            prev_ma = None
 
         # 4. Draw volume bar in lower plot area
         # Paper: "下25%为交易量像素图"
