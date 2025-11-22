@@ -6,8 +6,7 @@ from typing import List, Dict, Tuple
 def create_kline_pixel_graph(ohlcv_data: List[Dict[str, float]],
                              moving_average: int = 20) -> Image:
     """
-    Replicate the exact K-line pixel graph construction from
-    "图以类聚：卷积神经网络、投资者异质性与中国股市预测性".
+    K-line graph from "图以类聚：卷积神经网络、投资者异质性与中国股市预测性".
 
     This function creates the 180×96 RGB pixel graph described in Section 3.1
       and Appendix B of the paper. The image is designed as input for a CNN
@@ -166,7 +165,6 @@ def create_kline_pixel_graph(ohlcv_data: List[Dict[str, float]],
             draw.line([(x_left, open_y), (x_right, close_y)],
                       fill=day_color, width=1)
 
-        # 3. Draw moving average point/line (1-pixel wide)
         color = (242, 142, 255)
         if not np.isnan(ma[day_idx]):
             ma_y = map_price_to_y(ma[day_idx])
