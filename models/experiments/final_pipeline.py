@@ -425,6 +425,9 @@ class MultiReadout(dummyLightning):
         """
         batch_size, seq_len, _ = x.shape
 
+        # Convert to float32 to match linear layer weights
+        x = x.float()
+
         if target_type == 'quantized':
             out = self.quantized_head(x)  # (batch, seq_len, quant_bins * num_horizons)
             return out.view(batch_size, seq_len, self.num_horizons, -1)  # (batch, seq_len, num_horizons, quant_bins)
@@ -702,7 +705,7 @@ class FinalPipeline(dummyLightning):
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
         x, y, events = batch
         # x: (batch, seq_len, features)
-        # y: (batch, pred_len) where pred_len = seq_len // 2
+        # y: (batch, pred_len, num_horizons) where pred_len = seq_len // 2
         # events: (batch, seq_len, 3)
 
         seq_len = x.shape[1]
@@ -711,14 +714,14 @@ class FinalPipeline(dummyLightning):
         features = self.forward(x, events)
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
-        pred_quantized = self.readout(features, 'quantized')  # (batch, seq_len, quant_bins)
-        pred_quantized = pred_quantized[:, seq_len//2:, :]  # (batch, pred_len, quant_bins)
+        pred_quantized = self.readout(features, 'quantized')  # (batch, seq_len, num_horizons, quant_bins)
+        pred_quantized = pred_quantized[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, quant_bins)
 
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
         quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=y.dtype)
-        target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len)
+        target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
         target_quantized = torch.clamp(target_quantized, 0, self.config.quant_bins - 1)
         losses['quantized'] = self.ce_loss(
             pred_quantized.reshape(-1, self.config.quant_bins),
@@ -726,21 +729,21 @@ class FinalPipeline(dummyLightning):
         )
 
         # Mean prediction loss (Huber)
-        pred_mean = self.readout(features, 'mean')  # (batch, seq_len, 1)
-        pred_mean = pred_mean[:, seq_len//2:, :]  # (batch, pred_len, 1)
+        pred_mean = self.readout(features, 'mean')  # (batch, seq_len, num_horizons, 1)
+        pred_mean = pred_mean[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, 1)
         losses['mean'] = self.huber_loss(pred_mean.squeeze(-1), y)
 
         # Mean + Variance prediction loss (NLL)
-        pred_mean_var = self.readout(features, 'mean_var')  # (batch, seq_len, 2)
-        pred_mean_var = pred_mean_var[:, seq_len//2:, :]  # (batch, pred_len, 2)
-        pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len)
-        pred_var = pred_mean_var[..., 1] + 1e-6  # (batch, pred_len)
+        pred_mean_var = self.readout(features, 'mean_var')  # (batch, seq_len, num_horizons, 2)
+        pred_mean_var = pred_mean_var[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, 2)
+        pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len, num_horizons)
+        pred_var = pred_mean_var[..., 1] + 1e-6  # (batch, pred_len, num_horizons)
         losses['nll'] = 0.5 * (torch.log(pred_var) + (y - pred_mean_nll) ** 2 / pred_var).mean()
 
         # Quantile prediction loss
-        pred_quantiles = self.readout(features, 'quantile')  # (batch, seq_len, 5)
-        pred_quantiles = pred_quantiles[:, seq_len//2:, :]  # (batch, pred_len, 5)
-        quantile_targets = self._compute_quantile_targets(y)  # (batch, pred_len, 5)
+        pred_quantiles = self.readout(features, 'quantile')  # (batch, seq_len, num_horizons, 5)
+        pred_quantiles = pred_quantiles[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, 5)
+        quantile_targets = self._compute_quantile_targets(y)  # (batch, pred_len, num_horizons, 5)
         losses['quantile'] = self._quantile_loss(pred_quantiles, quantile_targets)
 
         assert (
@@ -776,17 +779,17 @@ class FinalPipeline(dummyLightning):
         """
         Compute quantile targets for training.
 
-        y: (batch, pred_len) - targets for multiple positions
-        returns: (batch, pred_len, 5) - quantile targets
+        y: (batch, pred_len, num_horizons) - targets for multiple positions and horizons
+        returns: (batch, pred_len, num_horizons, 5) - quantile targets
         """
         # Compute empirical quantiles from training data (flatten all values)
         # Convert to float32 for numpy compatibility
         y_np = y.detach().cpu().float().numpy().flatten()
         quantiles = np.quantile(y_np, [0.1, 0.25, 0.5, 0.75, 0.9])
 
-        # Create targets - expand to (batch, pred_len, 5)
-        batch_size, pred_len = y.shape
-        targets = torch.zeros(batch_size, pred_len, 5, device=y.device, dtype=y.dtype)
+        # Create targets - expand to (batch, pred_len, num_horizons, 5)
+        batch_size, pred_len, num_horizons = y.shape
+        targets = torch.zeros(batch_size, pred_len, num_horizons, 5, device=y.device, dtype=y.dtype)
 
         for i, q in enumerate(quantiles):
             targets[..., i] = torch.where(y >= q, torch.ones_like(y), torch.zeros_like(y))
@@ -800,9 +803,9 @@ class FinalPipeline(dummyLightning):
 
         losses = []
         for i, q in enumerate(quantiles):
-            # Fix indexing: pred and target are (batch, pred_len, 5)
-            # We want the i-th quantile dimension, not the i-th sequence position
-            error = target[:, :, i] - pred[:, :, i]
+            # pred and target are (batch, pred_len, num_horizons, 5)
+            # We want the i-th quantile dimension (last dimension)
+            error = target[..., i] - pred[..., i]
 
             # Sided weighting
             weight = torch.where(error > 0,
