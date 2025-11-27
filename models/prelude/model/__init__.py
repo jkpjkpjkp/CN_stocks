@@ -1,3 +1,3 @@
 from .main import dummyLightning
-from .tm import apply_rotary_emb
+from .tm import Rope
 from .config import transformerConfig

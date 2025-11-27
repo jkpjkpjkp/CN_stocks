@@ -1,7 +1,7 @@
-## 1min p 1min      
+## 1min p 1min
 > ./min/models/quantile_quantized/t1p1.py
 we discretized 1-min returns evenly into 128 bins and use a half-day context to predict next-1-min return.
-works tremendously well and can achieve 10^5 top-tenth gain if we can at no cost trade per-minute. 
+works tremendously well and can achieve 10^5 top-tenth gain if we can at no cost trade per-minute.
 the model is exactly the same as a dense LLM
 
 the model achieves 2.0 val loss (cross entropy).
@@ -24,10 +24,5 @@ is absolutely the way to go
 the only left algorithmic task is to discover inter-id relations
 
 
-
-## mega run
-
-next step is self adaptive training, because we are unsure of many things, architectural as well as hyperparameter-wise
-we cannot afford even simplest reruns, so we adapt on the fly
-
-identify bottleneck, use redundant gpu for ab testing
+## trunk
+transformer and mamba-like layers

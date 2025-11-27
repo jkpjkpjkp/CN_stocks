@@ -14,6 +14,22 @@ def apply_rotary_emb(x, cos, sin):
     out = out.to(x.dtype)
     return out
 
+class Rope(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        device = config.device
+        attn_dim = config.head_dim * config.num_heads
+        channel_range = torch.arange(0, attn_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (10000 ** (channel_range / attn_dim))
+        t = torch.arange(config.seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+        self.cos, self.sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
+
+    def forward(self, x):
+        return apply_rotary_emb(x, self.cos, self.sin)
+
 class mha(Module):
     def __init__(self, config):
         super().__init__()
@@ -36,7 +52,7 @@ class mha(Module):
         q = apply_rotary_emb(q, self.cos, self.sin)
         k = apply_rotary_emb(k, self.cos, self.sin)
         b = x.shape[0]
-        
+
         shape = (b, -1, self.head_dim, self.num_heads)
         q = rearrange(q.view(*shape), 'b l d h -> b h l d')
         k = rearrange(k.view(*shape), 'b l d h -> b h l d')
@@ -62,7 +78,7 @@ class decoderLayer(Module):
             self.norm1 = self.norm2 = F.rms_norm
         else:
             raise ValueError(f'Unknown norm: {config.norm}')
-    
+
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         x = x + self.l2(F.silu(self.l1(self.norm2(x))))
@@ -73,7 +89,7 @@ class tm(dummyLightning):
         super().__init__(config)
         self.layers = nn.ModuleList([decoderLayer(config) for _ in range(config.layers)])
         self.optimizers()
-    
+
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)

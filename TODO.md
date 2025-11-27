@@ -1,0 +1,1 @@
+add cross attention to final_pipeline
