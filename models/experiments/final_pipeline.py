@@ -85,7 +85,6 @@ class TransformerBlock(nn.Module):
             nn.Linear(config.intermediate_dim, self.hidden_dim),
         )
 
-    @torch.compile
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         x: (batch, seq_len, hidden_dim)
@@ -576,13 +575,8 @@ class FinalPipeline(dummyLightning):
     def forward(self, x: torch.Tensor, target_type: str = 'mean') -> torch.Tensor:
         """Forward pass through the pipeline"""
 
-        # Encode input
         encoded = self.encoder(x)
-
-        # Apply transformer backbone
         features = self.backbone(encoded)
-
-        # Apply readout
         predictions = self.readout(features, target_type)
 
         return predictions
@@ -598,6 +592,7 @@ class FinalPipeline(dummyLightning):
         pred_quantized = self.forward(x, 'quantized')
         quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device)
         target_quantized = torch.bucketize(y, quantiles_tensor)
+        breakpoint()
         losses['quantized'] = self.ce_loss(pred_quantized.view(-1, self.config.quant_bins), target_quantized.view(-1))
 
         # Mean prediction loss (Huber)
@@ -755,7 +750,7 @@ class FinalPipelineConfig:
     train_ratio: float = 0.9
 
     # Device
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device: str = 'cuda'
     num_workers: int = 4
 
     # Muon optimizer for 2D parameters
@@ -765,16 +760,10 @@ class FinalPipelineConfig:
 
 
 if __name__ == "__main__":
-    # Example usage
     config = FinalPipelineConfig(
-        debug_data = True,
+        debug_data=True,
     )
     pipeline = FinalPipeline(config)
-
-    # Prepare data
     pipeline.prepare_data()
-
-    # Train the model
     pipeline.fit()
-
-    print("Final pipeline training completed!")
+    breakpoint()
