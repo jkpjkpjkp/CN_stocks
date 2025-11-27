@@ -449,15 +449,11 @@ class FinalPipeline(dummyLightning):
         return df
 
     def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
-        """Split data by time to avoid leakage"""
-
-        # Compute a single cutoff date from all unique datetimes
         unique_datetimes = df['datetime'].unique().sort().to_numpy()
         cutoff = np.quantile(unique_datetimes, train_frac)
 
         df = df.with_columns((pl.col('datetime') <= cutoff).alias('is_train'))
 
-        # Compute per-stock statistics on training data
         stats = df.filter(pl.col('is_train')).group_by('id').agg([
             pl.col('close').mean().alias('mean_close'),
             pl.col('close').std().alias('std_close'),
@@ -467,7 +463,7 @@ class FinalPipeline(dummyLightning):
 
         df = df.join(stats, on='id')
 
-        # Add normalized features
+        # normalized features
         df = df.with_columns([
             ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-6)).alias('close_norm'),
             ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-6)).alias('volume_norm')
@@ -488,7 +484,13 @@ class FinalPipeline(dummyLightning):
         return quantiles
 
     def _build_sequences(self, df: pl.DataFrame, seq_len: int) -> Tuple[Dataset, Dataset]:
-        """Build sequences for training and validation with multiple prediction horizons"""
+        """
+        Build sequences for training and validation with sequence prediction.
+
+        For a sequence of length seq_len:
+        - Positions 0 to seq_len//2-1: context only, no prediction
+        - Positions seq_len//2 to seq_len-1: each predicts the next timestep
+        """
 
         train_sequences = []
         val_sequences = []
@@ -503,7 +505,6 @@ class FinalPipeline(dummyLightning):
         ]
 
         # Compute time-normalized values (cross-stock normalized per timestep)
-        # Group by minute and compute mean/std across all stocks
         time_stats = df.group_by('datetime').agg([
             pl.col('close').mean().alias('time_mean_close'),
             pl.col('close').std().alias('time_std_close')
@@ -514,57 +515,68 @@ class FinalPipeline(dummyLightning):
             ((pl.col('close') - pl.col('time_mean_close')) / (pl.col('time_std_close') + 1e-6)).alias('close_time_norm')
         ])
 
+        pred_len = seq_len // 2  # Latter half of sequence
+
+        # TODO: align for cross attention
         for stock_id in df['id'].unique():
             stock_df = df.filter(pl.col('id') == stock_id).sort('datetime')
 
-            # Need enough data for longest prediction horizon (2 days = 780 minutes)
-            if len(stock_df) <= seq_len + 780:
+            # Need enough data for sequence + 1 (for the final prediction target)
+            if len(stock_df) <= seq_len + 1:
                 continue
 
             features = stock_df.select(feature_cols).to_numpy()
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close'].to_numpy()
-            close_time_norm = stock_df['close_time_norm'].to_numpy()
-            open = stock_df['open'].to_numpy()
-            high = stock_df['high'].to_numpy()
-            low = stock_df['low'].to_numpy()
 
-            # Create sliding windows with multiple target horizons
-            for i in range(len(features) - seq_len - 780):
-                seq = features[i:i+seq_len]
+            # Use vectorized sliding window approach for efficiency
+            # We'll create all possible windows at once
+            num_windows = len(features) - seq_len
 
-                # Multiple target types:
-                # 1. Next close (1min ahead)
-                # 2. 30min ahead close
-                # 3. 1day ahead close
-                # 4. Next day OHLC (390 minutes ahead)
-                # 5. Time-normalized next close
-                target_dict = {
-                    'close_1min': close[i+seq_len],
-                    'close_30min': close[i+seq_len+30] if i+seq_len+30 < len(close) else close[-1],
-                    'close_1day': close[i+seq_len+390] if i+seq_len+390 < len(close) else close[-1],
-                    'close_2day': close[i+seq_len+780] if i+seq_len+780 < len(close) else close[-1],
-                    'open_next': open[i+seq_len+390] if i+seq_len+390 < len(open) else open[-1],
-                    'high_next': high[i+seq_len+390] if i+seq_len+390 < len(high) else high[-1],
-                    'low_next': low[i+seq_len+390] if i+seq_len+390 < len(low) else low[-1],
-                    'close_time_norm': close_time_norm[i+seq_len]
-                }
+            if num_windows <= 0:
+                continue
 
-                # For now, use close_1min as primary target (we'll use others in ensemble)
-                target = target_dict['close_1min']
+            # Create sliding window indices efficiently using numpy
+            indices = np.arange(seq_len)[None, :] + np.arange(num_windows)[:, None]
 
-                if is_train[i+seq_len]:
-                    train_sequences.append(seq)
-                    train_targets.append(target)
-                else:
-                    val_sequences.append(seq)
-                    val_targets.append(target)
+            # Extract all sequences at once (more efficient than loop + append)
+            sequences = features[indices]  # Shape: (num_windows, seq_len, num_features)
 
-        # Convert to numpy arrays
-        X_train = np.stack(train_sequences) if train_sequences else np.empty((0, seq_len, len(feature_cols)))
-        y_train = np.array(train_targets) if train_targets else np.empty(0)
-        X_val = np.stack(val_sequences) if val_sequences else np.empty((0, seq_len, len(feature_cols)))
-        y_val = np.array(val_targets) if val_targets else np.empty(0)
+            # For each sequence, create targets for the latter half positions
+            # Each position i (where i >= seq_len//2) predicts close[i+1]
+            target_indices = indices[:, seq_len//2:] + 1  # Shape: (num_windows, pred_len)
+            targets = close[target_indices]  # Shape: (num_windows, pred_len)
+
+            # Determine train/val split based on the last position in each sequence
+            # (Using the end of sequence to determine if it's train or val)
+            is_train_seq = is_train[indices[:, -1]]
+
+            # Split into train and val
+            train_mask = is_train_seq
+            val_mask = ~is_train_seq
+
+            if train_mask.any():
+                train_sequences.append(sequences[train_mask])
+                train_targets.append(targets[train_mask])
+
+            if val_mask.any():
+                val_sequences.append(sequences[val_mask])
+                val_targets.append(targets[val_mask])
+
+        # Concatenate all sequences from different stocks
+        if train_sequences:
+            X_train = np.concatenate(train_sequences, axis=0)
+            y_train = np.concatenate(train_targets, axis=0)
+        else:
+            X_train = np.empty((0, seq_len, len(feature_cols)))
+            y_train = np.empty((0, pred_len))
+
+        if val_sequences:
+            X_val = np.concatenate(val_sequences, axis=0)
+            y_val = np.concatenate(val_targets, axis=0)
+        else:
+            X_val = np.empty((0, seq_len, len(feature_cols)))
+            y_val = np.empty((0, pred_len))
 
         # Create datasets
         train_dataset = TimeSeriesDataset(X_train, y_train) if len(X_train) > 0 else None
@@ -582,31 +594,51 @@ class FinalPipeline(dummyLightning):
         return predictions
 
     def step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Training step with multiple loss components"""
+        """
+        Training step with multiple loss components.
+
+        Now handles sequence prediction where each position in the latter half
+        predicts its next value (like language modeling).
+        """
         x, y = batch
+        # x: (batch, seq_len, features)
+        # y: (batch, pred_len) where pred_len = seq_len // 2
+
+        batch_size, seq_len, _ = x.shape
+        pred_len = seq_len // 2
 
         # Generate predictions with different readout types
         losses = {}
 
+        # Get predictions for all sequence positions
+        # But we only care about predictions from positions seq_len//2 onwards
+        pred_quantized = self.forward(x, 'quantized')  # (batch, seq_len, quant_bins)
+        pred_quantized = pred_quantized[:, seq_len//2:, :]  # (batch, pred_len, quant_bins)
+
         # Quantized prediction loss
-        pred_quantized = self.forward(x, 'quantized')
         quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device)
-        target_quantized = torch.bucketize(y, quantiles_tensor)
-        breakpoint()
-        losses['quantized'] = self.ce_loss(pred_quantized.view(-1, self.config.quant_bins), target_quantized.view(-1))
+        target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len)
+        losses['quantized'] = self.ce_loss(
+            pred_quantized.reshape(-1, self.config.quant_bins),
+            target_quantized.reshape(-1)
+        )
 
         # Mean prediction loss (Huber)
-        pred_mean = self.forward(x, 'mean')
-        losses['mean'] = self.huber_loss(pred_mean.squeeze(), y)
+        pred_mean = self.forward(x, 'mean')  # (batch, seq_len, 1)
+        pred_mean = pred_mean[:, seq_len//2:, :]  # (batch, pred_len, 1)
+        losses['mean'] = self.huber_loss(pred_mean.squeeze(-1), y)
 
         # Mean + Variance prediction loss (NLL)
-        pred_mean_var = self.forward(x, 'mean_var')
-        pred_mean, pred_var = pred_mean_var[..., 0], pred_mean_var[..., 1]
-        losses['nll'] = 0.5 * (torch.log(pred_var) + (y - pred_mean) ** 2 / pred_var).mean()
+        pred_mean_var = self.forward(x, 'mean_var')  # (batch, seq_len, 2)
+        pred_mean_var = pred_mean_var[:, seq_len//2:, :]  # (batch, pred_len, 2)
+        pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len)
+        pred_var = pred_mean_var[..., 1]  # (batch, pred_len)
+        losses['nll'] = 0.5 * (torch.log(pred_var) + (y - pred_mean_nll) ** 2 / pred_var).mean()
 
         # Quantile prediction loss
-        pred_quantiles = self.forward(x, 'quantile')
-        quantile_targets = self._compute_quantile_targets(y)
+        pred_quantiles = self.forward(x, 'quantile')  # (batch, seq_len, 5)
+        pred_quantiles = pred_quantiles[:, seq_len//2:, :]  # (batch, pred_len, 5)
+        quantile_targets = self._compute_quantile_targets(y)  # (batch, pred_len, 5)
         losses['quantile'] = self._quantile_loss(pred_quantiles, quantile_targets)
 
         # Combine losses
@@ -626,18 +658,24 @@ class FinalPipeline(dummyLightning):
         }
 
     def _compute_quantile_targets(self, y: torch.Tensor) -> torch.Tensor:
-        """Compute quantile targets for training"""
+        """
+        Compute quantile targets for training.
 
-        # Compute empirical quantiles from training data
-        y_np = y.detach().cpu().numpy()
+        y: (batch, pred_len) - targets for multiple positions
+        returns: (batch, pred_len, 5) - quantile targets
+        """
+        # Compute empirical quantiles from training data (flatten all values)
+        y_np = y.detach().cpu().numpy().flatten()
         quantiles = np.quantile(y_np, [0.1, 0.25, 0.5, 0.75, 0.9])
 
-        # Create targets
-        targets = torch.zeros_like(y).unsqueeze(-1).repeat(1, 5)
-        for i, q in enumerate(quantiles):
-            targets[:, i] = torch.where(y >= q, torch.ones_like(y), torch.zeros_like(y))
+        # Create targets - expand to (batch, pred_len, 5)
+        batch_size, pred_len = y.shape
+        targets = torch.zeros(batch_size, pred_len, 5, device=y.device)
 
-        return targets.to(y.device)
+        for i, q in enumerate(quantiles):
+            targets[..., i] = torch.where(y >= q, torch.ones_like(y), torch.zeros_like(y))
+
+        return targets
 
     def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Quantile loss with sided weighting"""
@@ -746,7 +784,7 @@ class FinalPipelineConfig:
     grad_clip: float = 1.0
 
     # Data
-    seq_len: int = 64
+    seq_len: int = 256  # Increased for longer sequences
     train_ratio: float = 0.9
 
     # Device

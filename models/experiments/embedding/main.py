@@ -13,9 +13,15 @@ from models.prelude.model import dummyLightning
 class TimeSeriesDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
         # X: (N, seq_len, feat)
-        # y: (N,)
+        # y: (N,) or (N, pred_len) for sequence prediction
         self.X = torch.from_numpy(X).float()
-        self.y = torch.from_numpy(y).float().unsqueeze(-1)
+        y_tensor = torch.from_numpy(y).float()
+
+        # Handle both single target and multi-target cases
+        if y_tensor.ndim == 1:
+            y_tensor = y_tensor.unsqueeze(-1)  # (N,) -> (N, 1)
+
+        self.y = y_tensor
 
     def __len__(self):
         return len(self.X)
