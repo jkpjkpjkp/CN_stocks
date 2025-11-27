@@ -481,7 +481,7 @@ class FinalPipeline(dummyLightning):
 
         if self.config.debug_data:
             df = pl.scan_parquet(str(path))
-            ids = df.select('id').unique().collect().sample(5)['id']
+            ids = df.select('id').unique().collect().sample(5)['id'].to_list()
             df = df.filter(pl.col('id').is_in(ids)).collect()
         else:
             df = pl.read_parquet(str(path))
@@ -523,12 +523,10 @@ class FinalPipeline(dummyLightning):
         df = df.with_columns([
             pl.col('ret_1min').fill_null(0.),
             pl.col('ret_30min').fill_null(0.),
-            pl.col('ret_6hr').fill_null(0.),
-            pl.col('ret_1day').fill_null(0.),
-            pl.col('ret_2day').fill_null(0.),
             pl.col('ret_1min_ratio').fill_null(0.),
             pl.col('ret_30min_ratio').fill_null(0.),
             pl.col('ret_1day_ratio').fill_null(0.),
+            pl.col('ret_2day_ratio').fill_null(0.),
             pl.col('close_open_ratio').fill_null(1.),
             pl.col('high_open_ratio').fill_null(1.),
             pl.col('low_open_ratio').fill_null(1.),
@@ -624,9 +622,9 @@ class FinalPipeline(dummyLightning):
         """
 
         feature_cols = [
-            'close', 'close_norm', 'ret_1min', 'ret_30min', 'ret_6hr', 'ret_1day', 'ret_2day',
-            'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio', 'close_open_ratio',
-            'high_open_ratio', 'low_open_ratio', 'high_low_ratio',
+            'close', 'close_norm', 'ret_1min', 'ret_30min',
+            'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio', 'ret_2day_ratio',
+            'close_open_ratio', 'high_open_ratio', 'low_open_ratio', 'high_low_ratio',
             'volume', 'volume_norm'
         ]
 
