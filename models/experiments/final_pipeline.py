@@ -159,7 +159,7 @@ class CentQuantizeEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Convert cent differences to tokens"""
-        # x: (batch, seq_len) - should be price differences in cents
+        x = x.squeeze(-1)
         tokens = torch.clamp(x.round().long(), -self.max_cents, self.max_cents) + self.max_cents + 1
         # Handle infinities
         tokens = torch.where(torch.isinf(x), torch.sign(x).long() * (self.max_cents + 1) + self.max_cents + 1, tokens)
@@ -235,7 +235,7 @@ class MultiEncoder(nn.Module):
         self.sin_encoder = SinEncoder(config.hidden_dim)
 
         # Combine different encodings
-        total_dim = config.hidden_dim * 4  # 4 encoding types
+        total_dim = config.hidden_dim * 3  # 4 encoding types
         self.combiner = nn.Linear(total_dim, config.hidden_dim)
 
     def forward(self, x: torch.Tensor, image_data: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -386,8 +386,6 @@ class FinalPipeline(dummyLightning):
         if path is None:
             path = Path.home() / 'h' / 'data' / 'a_1min.pq'
         path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"parquet file not found: {path}")
 
         if self.config.debug_data:
             df = pl.scan_parquet(str(path)).head(1000000).collect()
@@ -413,26 +411,17 @@ class FinalPipeline(dummyLightning):
     def _compute_features(self, df: pl.DataFrame) -> pl.DataFrame:
         """Compute all feature types"""
 
-        # Raw values
-        df = df.with_columns([
-            pl.col('close').alias('close_raw'),
-            pl.col('volume').alias('volume_raw'),
-            pl.col('open').alias('open_raw'),
-            pl.col('high').alias('high_raw'),
-            pl.col('low').alias('low_raw')
-        ])
-
         # Returns at different time scales (1min, 30min, 6hr, 24hr, 2days)
         # Note: Assuming 390 minutes per trading day (6.5 hours)
         df = df.with_columns([
-            (pl.col('close') - pl.col('close').shift(1)).alias('ret_1min'),
-            (pl.col('close') - pl.col('close').shift(30)).alias('ret_30min'),
-            (pl.col('close') - pl.col('close').shift(360)).alias('ret_6hr'),  # 6 hours
-            (pl.col('close') - pl.col('close').shift(390)).alias('ret_1day'),  # 1 day
-            (pl.col('close') - pl.col('close').shift(780)).alias('ret_2day'),  # 2 days
-            (pl.col('close') / pl.col('close').shift(1) - 1).alias('ret_1min_ratio'),
-            (pl.col('close') / pl.col('close').shift(30) - 1).alias('ret_30min_ratio'),
-            (pl.col('close') / pl.col('close').shift(390) - 1).alias('ret_1day_ratio'),
+            (pl.col('close') - pl.col('close').shift(1).over('id')).alias('ret_1min'),
+            (pl.col('close') - pl.col('close').shift(30).over('id')).alias('ret_30min'),
+            (pl.col('close') - pl.col('close').shift(360).over('id')).alias('ret_6hr'),  # 6 hours
+            (pl.col('close') - pl.col('close').shift(390).over('id')).alias('ret_1day'),  # 1 day
+            (pl.col('close') - pl.col('close').shift(780).over('id')).alias('ret_2day'),  # 2 days
+            (pl.col('close') / pl.col('close').shift(1).over('id') - 1).alias('ret_1min_ratio'),
+            (pl.col('close') / pl.col('close').shift(30).over('id') - 1).alias('ret_30min_ratio'),
+            (pl.col('close') / pl.col('close').shift(390).over('id') - 1).alias('ret_1day_ratio'),
         ])
 
         # Intra-minute relative features
@@ -440,23 +429,23 @@ class FinalPipeline(dummyLightning):
             (pl.col('close') / pl.col('open')).alias('close_open_ratio'),
             (pl.col('high') / pl.col('open')).alias('high_open_ratio'),
             (pl.col('low') / pl.col('open')).alias('low_open_ratio'),
-            (pl.col('high') / pl.col('low') - 1).alias('high_low_ratio')
+            (pl.col('high') / pl.col('low')).alias('high_low_ratio')
         ])
 
         # Fill NaN values
         df = df.with_columns([
-            pl.col('ret_1min').fill_null(0.0),
-            pl.col('ret_30min').fill_null(0.0),
-            pl.col('ret_6hr').fill_null(0.0),
-            pl.col('ret_1day').fill_null(0.0),
-            pl.col('ret_2day').fill_null(0.0),
-            pl.col('ret_1min_ratio').fill_null(0.0),
-            pl.col('ret_30min_ratio').fill_null(0.0),
-            pl.col('ret_1day_ratio').fill_null(0.0),
-            pl.col('close_open_ratio').fill_null(1.0),
-            pl.col('high_open_ratio').fill_null(1.0),
-            pl.col('low_open_ratio').fill_null(1.0),
-            pl.col('high_low_ratio').fill_null(0.0)
+            pl.col('ret_1min').fill_null(0.),
+            pl.col('ret_30min').fill_null(0.),
+            pl.col('ret_6hr').fill_null(0.),
+            pl.col('ret_1day').fill_null(0.),
+            pl.col('ret_2day').fill_null(0.),
+            pl.col('ret_1min_ratio').fill_null(0.),
+            pl.col('ret_30min_ratio').fill_null(0.),
+            pl.col('ret_1day_ratio').fill_null(0.),
+            pl.col('close_open_ratio').fill_null(1.),
+            pl.col('high_open_ratio').fill_null(1.),
+            pl.col('low_open_ratio').fill_null(1.),
+            pl.col('high_low_ratio').fill_null(1.)
         ])
 
         return df
@@ -778,28 +767,12 @@ class FinalPipelineConfig:
     debug_data: bool = False
 
 
-def create_final_pipeline(config: Optional[FinalPipelineConfig] = None) -> FinalPipeline:
-    """Factory function to create the final pipeline"""
-
-    if config is None:
-        config = FinalPipelineConfig()
-
-    pipeline = FinalPipeline(config)
-
-    # Note: Muon optimizer for 2D parameters can be enabled via config.use_muon
-    # To use Muon, override the optimizers() method in FinalPipeline to return
-    # a Muon optimizer for 2D parameters (matrices) and AdamW for others
-    # For now, the default dummyLightning.optimizers() uses AdamW for all params
-
-    return pipeline
-
-
 if __name__ == "__main__":
     # Example usage
     config = FinalPipelineConfig(
         debug_data = True,
     )
-    pipeline = create_final_pipeline(config)
+    pipeline = FinalPipeline(config)
 
     # Prepare data
     pipeline.prepare_data()
