@@ -31,11 +31,6 @@ This pipeline implements:
    - 1min, 30min, 1day, 2day ahead
    - Next day OHLC predictions
 
-6. Portfolio optimization:
-   - 2-sided softmax for stock weights (can be positive or negative)
-   - Trading costs: 0.5% on long, 30% on short
-   - GRPO (Group Relative Policy Optimization) rollouts for portfolio training
-
 Usage:
     config = FinalPipelineConfig()
     pipeline = create_final_pipeline(config)
@@ -49,11 +44,11 @@ import torch.nn.functional as F
 import numpy as np
 import polars as pl
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 from torch.utils.data import Dataset
 
-from ..prelude.model import dummyLightning, transformerConfig
+from ..prelude.model import dummyLightning
 from .embedding.draw import create_kline_pixel_graph
 from ..prelude.model import Rope
 
@@ -61,11 +56,6 @@ torch.autograd.set_detect_anomaly(True)
 
 
 class EfficientTimeSeriesDataset(Dataset):
-    """
-    Memory-efficient dataset that stores entire sequences per ID
-    and only slices in __getitem__ to avoid duplicated storage.
-    """
-
     def __init__(self, stock_data: Dict[str, np.ndarray],
                  stock_targets: Dict[str, np.ndarray],
                  stock_events: Dict[str, np.ndarray],
@@ -100,16 +90,16 @@ class EfficientTimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         stock_id, start_idx = self.index[idx]
 
-        # Slice only what we need
+        # Slice
         end_idx = start_idx + self.seq_len
         features = self.stock_data[stock_id][start_idx:end_idx]
 
-        # Get targets for prediction positions (latter half)
+        # Get prediction positions' targets (latter half)
         target_start = start_idx + self.seq_len // 2
         target_end = target_start + self.pred_len
         targets = self.stock_targets[stock_id][target_start + 1:target_end + 1]
 
-        # Get event markers for the sequence
+        # Get event markers
         events = self.stock_events[stock_id][start_idx:end_idx]
 
         return (
@@ -193,8 +183,8 @@ class TransformerBlock(dummyLightning):
 class PercentileEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        # Add 3 special tokens: lunch, dinner, skipped_day
         self.embedding = nn.Embedding(config.quant_bins + 3, config.embed_dim)
+        # Add 3 special tokens: lunch, dinner, skipped_day
         self.lunch_token = config.quant_bins
         self.dinner_token = config.quant_bins + 1
         self.skipped_token = config.quant_bins + 2
@@ -237,8 +227,8 @@ class CentQuantizeEncoder(dummyLightning):
 
     def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Convert cent differences to tokens"""
-        x = x.squeeze(-1) * 100  # cents
-        tokens = torch.clamp((x).round().long(), -self.max_cents-1,
+        x = x.squeeze(-1)
+        tokens = torch.clamp(x, -self.max_cents-1,
                              self.max_cents+1
                              ) + self.max_cents + 1
         tokens = torch.where(torch.isnan(x), torch.zeros_like(tokens), tokens)
@@ -370,11 +360,14 @@ class MultiEncoder(dummyLightning):
         embeddings = []
 
         # Quantize encoding (use first feature)
-        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles, events_flat)
+        # TODO: use more features
+        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles,
+                                          events_flat)
         embeddings.append(quant_emb)
 
         # Cent quantization (use return features)
-        cent_emb = self.cent_encoder(x_flat[:, 2:3] * 100, events_flat)  # Convert to cents
+        cent_emb = self.cent_encoder((x_flat[:, 2:3] * 100).long(),  # to cents
+                                     events_flat)
         embeddings.append(cent_emb)
 
         # Sin encoding (use all features)
@@ -388,7 +381,8 @@ class MultiEncoder(dummyLightning):
         #     cnn_emb = cnn_emb.unsqueeze(1).repeat(1, seq_len, 1)
         #     embeddings.append(cnn_emb.view(-1, self.config.hidden_dim))
 
-        # Combine embeddings - all should have shape (batch_size * seq_len, hidden_dim)
+        # Combine embeddings - all should have shape (batch_size * seq_len,
+        #                                             hidden_dim)
         combined = torch.cat(embeddings, dim=-1)
         output = self.combiner(combined)
 
@@ -810,7 +804,7 @@ class FinalPipelineConfig:
     max_freq: float = 10000.
 
     # Training
-    batch_size: int = 32
+    batch_size: int = 512
     lr: float = 1e-3
     epochs: int = 100
     warmup_steps: int = 1000
