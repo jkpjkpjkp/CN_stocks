@@ -247,25 +247,23 @@ class MultiEncoder(dummyLightning):
         embeddings = []
 
         # Quantize encoding (use first feature)
-        if self.quantiles is not None:
-            quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles)
-            embeddings.append(quant_emb)
+        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles)
+        embeddings.append(quant_emb)
 
         # Cent quantization (use return features)
-        if feat_dim > 2:
-            cent_emb = self.cent_encoder(x_flat[:, 2:3] * 100)  # Convert to cents
-            embeddings.append(cent_emb)
+        cent_emb = self.cent_encoder(x_flat[:, 2:3] * 100)  # Convert to cents
+        embeddings.append(cent_emb)
 
         # Sin encoding (use all features)
         sin_emb = self.sin_encoder(x_flat)
         embeddings.append(sin_emb)
 
         # CNN encoding (if image data provided)
-        if image_data is not None:
-            cnn_emb = self.cnn_encoder(image_data)
-            # Repeat CNN embedding across sequence length
-            cnn_emb = cnn_emb.unsqueeze(1).repeat(1, seq_len, 1)
-            embeddings.append(cnn_emb.view(-1, self.config.hidden_dim))
+        # if image_data is not None:
+        #     cnn_emb = self.cnn_encoder(image_data)
+        #     # Repeat CNN embedding across sequence length
+        #     cnn_emb = cnn_emb.unsqueeze(1).repeat(1, seq_len, 1)
+        #     embeddings.append(cnn_emb.view(-1, self.config.hidden_dim))
 
         # Combine embeddings - all should have shape (batch_size * seq_len, hidden_dim)
         combined = torch.cat(embeddings, dim=-1)
@@ -780,7 +778,7 @@ class FinalPipelineConfig:
     seq_len: int = 256
     train_ratio: float = 0.9
     max_cents: int = 64
-    embed_dim: int = 128
+    embed_dim: int = 256
 
     # Device
     device: str = 'cuda'
