@@ -16,14 +16,15 @@ import psutil
 import os
 import runpy
 
+
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <script.py|module.path>", file=sys.stderr)
         sys.exit(1)
-    
+
     target = sys.argv[1]
     is_module = not target.endswith('.py') and ('/' not in target or target.startswith('.'))
-    
+
     if is_module:
         # Module path: find the actual file
         try:
@@ -41,39 +42,39 @@ def main():
         if not os.path.exists(target_file):
             print(f"Error: File not found: {target_file}", file=sys.stderr)
             sys.exit(1)
-    
+
     # Setup state
     seen_lines = set()
     process = psutil.Process()
     start_time = time.perf_counter()
     target_file_abs = os.path.abspath(target_file)
-    
+
     def trace_func(frame, event, arg):
         if event != 'line':
             return trace_func
-        
+
         filename = os.path.abspath(frame.f_code.co_filename)
         lineno = frame.f_lineno
-        
+
         # Track only the target file
         if filename != target_file_abs:
             return trace_func
-        
+
         key = (filename, lineno)
         if key in seen_lines:
             return trace_func
-        
+
         seen_lines.add(key)
-        
+
         # Report
         mem_mb = process.memory_info().rss / (1024 * 1024)
         elapsed = time.perf_counter() - start_time
-        
+
         print(f"[OOM_DBG] {os.path.basename(filename)}:{lineno:4d} | "
               f"RAM: {mem_mb:8.1f} MB | Time: {elapsed:8.3f}s")
-        
+
         return trace_func
-    
+
     # Execute with tracing
     sys.settrace(trace_func)
     try:

@@ -738,7 +738,9 @@ class FinalPipeline(dummyLightning):
         pred_mean_var = pred_mean_var[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, 2)
         pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len, num_horizons)
         pred_var = pred_mean_var[..., 1] + 1e-6  # (batch, pred_len, num_horizons)
-        losses['nll'] = 0.5 * (torch.log(pred_var) + (y - pred_mean_nll) ** 2 / pred_var).mean()
+        # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
+        nll = (torch.log(2 * torch.pi * pred_var) + (y - pred_mean_nll) ** 2 / pred_var) / 2
+        losses['nll'] = nll.mean()
 
         # Quantile prediction loss
         pred_quantiles = self.readout(features, 'quantile')  # (batch, seq_len, num_horizons, 5)
@@ -749,7 +751,6 @@ class FinalPipeline(dummyLightning):
         assert (
             losses['quantized'] >= 0 and
             losses['mean'] >= 0 and
-            losses['nll'] >= 0 and
             losses['quantile'] >= 0
         ), losses
         # Combine losses
