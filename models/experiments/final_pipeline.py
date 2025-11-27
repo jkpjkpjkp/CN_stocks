@@ -55,10 +55,68 @@ from torch.utils.data import Dataset
 
 from ..prelude.model import dummyLightning, transformerConfig
 from .embedding.draw import create_kline_pixel_graph
-from .embedding.main import TimeSeriesDataset
 from ..prelude.model import Rope
 
 torch.autograd.set_detect_anomaly(True)
+
+
+class EfficientTimeSeriesDataset(Dataset):
+    """
+    Memory-efficient dataset that stores entire sequences per ID
+    and only slices in __getitem__ to avoid duplicated storage.
+    """
+
+    def __init__(self, stock_data: Dict[str, np.ndarray],
+                 stock_targets: Dict[str, np.ndarray],
+                 stock_events: Dict[str, np.ndarray],
+                 seq_len: int,
+                 pred_len: int):
+        """
+        Args:
+            stock_data: Dict mapping stock_id to full feature array (T, F)
+            stock_targets: Dict mapping stock_id to full target array (T,)
+            stock_events: Dict mapping stock_id to event markers (T, 3)
+                         [lunch, dinner, skipped_day]
+            seq_len: Sequence length for context
+            pred_len: Prediction length
+        """
+        self.stock_data = stock_data
+        self.stock_targets = stock_targets
+        self.stock_events = stock_events
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+
+        # Build index: list of (stock_id, start_idx) tuples
+        self.index = []
+        for stock_id, data in stock_data.items():
+            num_windows = len(data) - seq_len
+            if num_windows > 0:
+                for start_idx in range(num_windows):
+                    self.index.append((stock_id, start_idx))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        stock_id, start_idx = self.index[idx]
+
+        # Slice only what we need
+        end_idx = start_idx + self.seq_len
+        features = self.stock_data[stock_id][start_idx:end_idx]
+
+        # Get targets for prediction positions (latter half)
+        target_start = start_idx + self.seq_len // 2
+        target_end = target_start + self.pred_len
+        targets = self.stock_targets[stock_id][target_start + 1:target_end + 1]
+
+        # Get event markers for the sequence
+        events = self.stock_events[stock_id][start_idx:end_idx]
+
+        return (
+            torch.from_numpy(features).float(),
+            torch.from_numpy(targets).float(),
+            torch.from_numpy(events).float()
+        )
 
 
 class TransformerBlock(dummyLightning):
@@ -135,14 +193,34 @@ class TransformerBlock(dummyLightning):
 class PercentileEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.quant_bins, config.embed_dim)
+        # Add 3 special tokens: lunch, dinner, skipped_day
+        self.embedding = nn.Embedding(config.quant_bins + 3, config.embed_dim)
+        self.lunch_token = config.quant_bins
+        self.dinner_token = config.quant_bins + 1
+        self.skipped_token = config.quant_bins + 2
 
-    def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, quantiles: np.ndarray, events: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (batch, 1) - single feature values
+        # events: (batch, 3) - binary flags for [lunch, dinner, skipped_day]
         tokens = torch.from_numpy(np.digitize(x.cpu().numpy(), quantiles[1:-1],
                                               right=True)).to(x.device)
         # tokens shape: (batch, 1), squeeze to (batch,) for embedding
         tokens = tokens.squeeze(-1)
+
+        # Override with special tokens if events present
+        if events is not None:
+            lunch_mask = events[:, 0].bool()
+            dinner_mask = events[:, 1].bool()
+            skipped_mask = events[:, 2].bool()
+
+            # Priority: skipped_day > lunch > dinner (no dinner when day skipped)
+            tokens = torch.where(dinner_mask & ~skipped_mask,
+                                torch.full_like(tokens, self.dinner_token), tokens)
+            tokens = torch.where(lunch_mask & ~skipped_mask,
+                                torch.full_like(tokens, self.lunch_token), tokens)
+            tokens = torch.where(skipped_mask,
+                                torch.full_like(tokens, self.skipped_token), tokens)
+
         result = self.embedding(tokens)
         return result
 
@@ -151,16 +229,34 @@ class CentQuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.max_cents = config.max_cents
-        # -max_cents to +max_cents plus special tokens for inf/-inf
-        self.embedding = nn.Embedding(2 * config.max_cents + 2, config.embed_dim)
+        # -max_cents to +max_cents plus special tokens for inf/-inf and 3 event tokens
+        self.embedding = nn.Embedding(2 * config.max_cents + 5, config.embed_dim)
+        self.lunch_token = 2 * config.max_cents + 2
+        self.dinner_token = 2 * config.max_cents + 3
+        self.skipped_token = 2 * config.max_cents + 4
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Convert cent differences to tokens"""
         x = x.squeeze(-1) * 100  # cents
         tokens = torch.clamp((x).round().long(), -self.max_cents-1,
                              self.max_cents+1
                              ) + self.max_cents + 1
         tokens = torch.where(torch.isnan(x), torch.zeros_like(tokens), tokens)
+
+        # Override with special tokens if events present
+        if events is not None:
+            lunch_mask = events[:, 0].bool()
+            dinner_mask = events[:, 1].bool()
+            skipped_mask = events[:, 2].bool()
+
+            # Priority: skipped_day > lunch > dinner (no dinner when day skipped)
+            tokens = torch.where(dinner_mask & ~skipped_mask,
+                                torch.full_like(tokens, self.dinner_token), tokens)
+            tokens = torch.where(lunch_mask & ~skipped_mask,
+                                torch.full_like(tokens, self.lunch_token), tokens)
+            tokens = torch.where(skipped_mask,
+                                torch.full_like(tokens, self.skipped_token), tokens)
+
         return self.embedding(tokens)
 
 
@@ -204,8 +300,11 @@ class SinEncoder(nn.Module):
         freqs = torch.exp(torch.linspace(0, np.log(self.max_freq), self.embed_dim // 2))
         self.register_buffer('freqs', freqs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, features)"""
+        # Special token embeddings
+        self.special_embeddings = nn.Embedding(3, config.embed_dim)  # lunch, dinner, skipped_day
+
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: (batch, features), events: (batch, 3)"""
         # Take the mean across feature dimension for sinusoidal encoding
         x_mean = x.mean(dim=-1, keepdim=True)  # (batch, 1)
 
@@ -215,7 +314,27 @@ class SinEncoder(nn.Module):
 
         # Interleave sin and cos
         emb = torch.stack([sin_emb, cos_emb], dim=-1).flatten(start_dim=-2)
-        return emb[..., :self.embed_dim]
+        emb = emb[..., :self.embed_dim]
+
+        # Override with special tokens if events present
+        if events is not None:
+            lunch_mask = events[:, 0].bool()
+            dinner_mask = events[:, 1].bool()
+            skipped_mask = events[:, 2].bool()
+
+            # Create token indices (0=lunch, 1=dinner, 2=skipped_day)
+            has_event = lunch_mask | dinner_mask | skipped_mask
+            token_idx = torch.zeros(events.shape[0], dtype=torch.long, device=events.device)
+
+            # Priority: skipped_day > lunch > dinner (no dinner when day skipped)
+            token_idx = torch.where(dinner_mask & ~skipped_mask, torch.ones_like(token_idx), token_idx)
+            token_idx = torch.where(lunch_mask & ~skipped_mask, torch.zeros_like(token_idx), token_idx)
+            token_idx = torch.where(skipped_mask, torch.full_like(token_idx, 2), token_idx)
+
+            special_emb = self.special_embeddings(token_idx)
+            emb = torch.where(has_event.unsqueeze(-1), special_emb, emb)
+
+        return emb
 
 
 class MultiEncoder(dummyLightning):
@@ -236,26 +355,30 @@ class MultiEncoder(dummyLightning):
         total_dim = config.hidden_dim * 3  # 4 encoding types
         self.combiner = nn.Linear(total_dim, config.hidden_dim)
 
-    def forward(self, x: torch.Tensor, image_data: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """x: (batch, seq_len, features)"""
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None, image_data: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: (batch, seq_len, features)
+        events: (batch, seq_len, 3) - binary flags for [lunch, dinner, skipped_day]
+        """
         batch_size, seq_len, feat_dim = x.shape
 
         # Flatten for processing
         x_flat = x.view(-1, feat_dim)
+        events_flat = events.view(-1, 3) if events is not None else None
 
         # Apply different encodings to different features
         embeddings = []
 
         # Quantize encoding (use first feature)
-        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles)
+        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles, events_flat)
         embeddings.append(quant_emb)
 
         # Cent quantization (use return features)
-        cent_emb = self.cent_encoder(x_flat[:, 2:3] * 100)  # Convert to cents
+        cent_emb = self.cent_encoder(x_flat[:, 2:3] * 100, events_flat)  # Convert to cents
         embeddings.append(cent_emb)
 
         # Sin encoding (use all features)
-        sin_emb = self.sin_encoder(x_flat)
+        sin_emb = self.sin_encoder(x_flat, events_flat)
         embeddings.append(sin_emb)
 
         # CNN encoding (if image data provided)
@@ -388,6 +511,7 @@ class FinalPipeline(dummyLightning):
         df = df.sort(['id', 'datetime'])
 
         df = self._compute_features(df)
+        df = self._detect_trading_gaps(df)  # Add gap detection
         df = self._split_data(df, train_frac)
         self.quantiles = self._compute_quantiles(df, quant_bins)
 
@@ -473,19 +597,56 @@ class FinalPipeline(dummyLightning):
 
         return quantiles
 
+    def _detect_trading_gaps(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Detect trading gaps and mark with special tokens:
+        - lunch: short intraday gaps (~1 hour)
+        - dinner: overnight gaps between trading days (~15-18 hours)
+        - skipped_day: weekend/holiday gaps (24+ hours, can have multiple)
+        """
+        # Calculate time gaps in seconds between consecutive rows per stock
+        df = df.with_columns([
+            pl.col('datetime').diff().over('id').dt.total_seconds().alias('time_gap_seconds')
+        ])
+
+        # Initialize event columns
+        df = df.with_columns([
+            pl.lit(0).cast(pl.Int8).alias('is_lunch'),
+            pl.lit(0).cast(pl.Int8).alias('is_dinner'),
+            pl.lit(0).cast(pl.Int8).alias('is_skipped_day')
+        ])
+
+        # Classify gaps:
+        # Lunch: 30 min - 2 hours (1800 - 7200 seconds)
+        # Dinner: 12 - 20 hours (43200 - 72000 seconds) - overnight between trading days
+        # Skipped day: > 20 hours (72000 seconds) - weekends, holidays
+        df = df.with_columns([
+            ((pl.col('time_gap_seconds') >= 1800) &
+             (pl.col('time_gap_seconds') < 7200)).cast(pl.Int8).alias('is_lunch'),
+
+            ((pl.col('time_gap_seconds') >= 43200) &
+             (pl.col('time_gap_seconds') < 72000)).cast(pl.Int8).alias('is_dinner'),
+
+            (pl.col('time_gap_seconds') >= 72000).cast(pl.Int8).alias('is_skipped_day')
+        ])
+
+        # Fill nulls (first row of each stock) with 0
+        df = df.with_columns([
+            pl.col('is_lunch').fill_null(0),
+            pl.col('is_dinner').fill_null(0),
+            pl.col('is_skipped_day').fill_null(0)
+        ])
+
+        return df
+
     def _build_sequences(self, df: pl.DataFrame, seq_len: int) -> Tuple[Dataset, Dataset]:
         """
-        Build sequences for training and validation with sequence prediction.
+        Build efficient sequences that store full data per stock and slice in __getitem__.
 
         For a sequence of length seq_len:
         - Positions 0 to seq_len//2-1: context only, no prediction
         - Positions seq_len//2 to seq_len-1: each predicts the next timestep
         """
-
-        train_sequences = []
-        val_sequences = []
-        train_targets = []
-        val_targets = []
 
         feature_cols = [
             'close', 'close_norm', 'ret_1min', 'ret_30min', 'ret_6hr', 'ret_1day', 'ret_2day',
@@ -493,6 +654,8 @@ class FinalPipeline(dummyLightning):
             'high_open_ratio', 'low_open_ratio', 'high_low_ratio',
             'volume', 'volume_norm'
         ]
+
+        event_cols = ['is_lunch', 'is_dinner', 'is_skipped_day']
 
         # Compute time-normalized values (cross-stock normalized per timestep)
         time_stats = df.group_by('datetime').agg([
@@ -507,6 +670,15 @@ class FinalPipeline(dummyLightning):
 
         pred_len = seq_len // 2  # Latter half of sequence
 
+        # Store data per stock to avoid duplication
+        train_stock_data = {}
+        train_stock_targets = {}
+        train_stock_events = {}
+
+        val_stock_data = {}
+        val_stock_targets = {}
+        val_stock_events = {}
+
         # TODO: align for cross attention
         for stock_id in df['id'].unique():
             stock_df = df.filter(pl.col('id') == stock_id).sort('datetime')
@@ -515,86 +687,57 @@ class FinalPipeline(dummyLightning):
             if len(stock_df) <= seq_len + 1:
                 continue
 
-            features = stock_df.select(feature_cols).to_numpy()
+            features = stock_df.select(feature_cols).to_numpy().astype(np.float32)
+            events = stock_df.select(event_cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
-            close = stock_df['close'].to_numpy()
+            close = stock_df['close'].to_numpy().astype(np.float32)
 
-            # Use vectorized sliding window approach for efficiency
-            # We'll create all possible windows at once
-            num_windows = len(features) - seq_len
+            # Split based on the majority of each stock's data
+            # (simpler than splitting windows)
+            if is_train.mean() > 0.5:
+                train_stock_data[stock_id] = features
+                train_stock_targets[stock_id] = close
+                train_stock_events[stock_id] = events
+            else:
+                val_stock_data[stock_id] = features
+                val_stock_targets[stock_id] = close
+                val_stock_events[stock_id] = events
 
-            if num_windows <= 0:
-                continue
+        # Create efficient datasets
+        train_dataset = EfficientTimeSeriesDataset(
+            train_stock_data, train_stock_targets, train_stock_events,
+            seq_len, pred_len
+        ) if len(train_stock_data) > 0 else None
 
-            # Create sliding window indices efficiently using numpy
-            indices = np.arange(seq_len)[None, :] + np.arange(num_windows)[:, None]
-
-            # Extract all sequences at once (more efficient than loop + append)
-            sequences = features[indices]  # Shape: (num_windows, seq_len, num_features)
-
-            # For each sequence, create targets for the latter half positions
-            # Each position i (where i >= seq_len//2) predicts close[i+1]
-            target_indices = indices[:, seq_len//2:] + 1  # Shape: (num_windows, pred_len)
-            targets = close[target_indices]  # Shape: (num_windows, pred_len)
-
-            # Determine train/val split based on the last position in each sequence
-            # (Using the end of sequence to determine if it's train or val)
-            is_train_seq = is_train[indices[:, -1]]
-
-            # Split into train and val
-            train_mask = is_train_seq
-            val_mask = ~is_train_seq
-
-            if train_mask.any():
-                train_sequences.append(sequences[train_mask])
-                train_targets.append(targets[train_mask])
-
-            if val_mask.any():
-                val_sequences.append(sequences[val_mask])
-                val_targets.append(targets[val_mask])
-
-        # Concatenate all sequences from different stocks
-        if train_sequences:
-            X_train = np.concatenate(train_sequences, axis=0)
-            y_train = np.concatenate(train_targets, axis=0)
-        else:
-            X_train = np.empty((0, seq_len, len(feature_cols)))
-            y_train = np.empty((0, pred_len))
-
-        if val_sequences:
-            X_val = np.concatenate(val_sequences, axis=0)
-            y_val = np.concatenate(val_targets, axis=0)
-        else:
-            X_val = np.empty((0, seq_len, len(feature_cols)))
-            y_val = np.empty((0, pred_len))
-
-        # Create datasets
-        train_dataset = TimeSeriesDataset(X_train, y_train) if len(X_train) > 0 else None
-        val_dataset = TimeSeriesDataset(X_val, y_val) if len(X_val) > 0 else None
+        val_dataset = EfficientTimeSeriesDataset(
+            val_stock_data, val_stock_targets, val_stock_events,
+            seq_len, pred_len
+        ) if len(val_stock_data) > 0 else None
 
         return train_dataset, val_dataset
 
-    def forward(self, x: torch.Tensor, target_type: str = 'mean') -> torch.Tensor:
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None, target_type: str = 'mean') -> torch.Tensor:
         """Forward pass through the pipeline"""
 
-        encoded = self.encoder(x)
+        encoded = self.encoder(x, events)
         features = self.backbone(encoded)
         predictions = self.readout(features, target_type)
 
         return predictions
 
-    def step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
         """
         Training step with multiple loss components.
 
         Now handles sequence prediction where each position in the latter half
         predicts its next value (like language modeling).
         """
-        x, y = batch
+        x, y, events = batch
         # x: (batch, seq_len, features)
         # y: (batch, pred_len) where pred_len = seq_len // 2
+        # events: (batch, seq_len, 3)
 
-        batch_size, seq_len, _ = x.shape
+        seq_len = x.shape[1]
         pred_len = seq_len // 2
 
         # Generate predictions with different readout types
@@ -602,31 +745,36 @@ class FinalPipeline(dummyLightning):
 
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
-        pred_quantized = self.forward(x, 'quantized')  # (batch, seq_len, quant_bins)
+        pred_quantized = self.forward(x, events, 'quantized')  # (batch, seq_len, quant_bins)
         pred_quantized = pred_quantized[:, seq_len//2:, :]  # (batch, pred_len, quant_bins)
 
+        # Convert y to same dtype as predictions
+        y = y.to(pred_quantized.dtype)
+
         # Quantized prediction loss
-        quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=torch.bfloat16)
+        quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=y.dtype)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len)
+        # Clamp to valid range [0, quant_bins-1] since bucketize can return quant_bins
+        target_quantized = torch.clamp(target_quantized, 0, self.config.quant_bins - 1)
         losses['quantized'] = self.ce_loss(
             pred_quantized.reshape(-1, self.config.quant_bins),
             target_quantized.reshape(-1)
         )
 
         # Mean prediction loss (Huber)
-        pred_mean = self.forward(x, 'mean')  # (batch, seq_len, 1)
+        pred_mean = self.forward(x, events, 'mean')  # (batch, seq_len, 1)
         pred_mean = pred_mean[:, seq_len//2:, :]  # (batch, pred_len, 1)
         losses['mean'] = self.huber_loss(pred_mean.squeeze(-1), y)
 
         # Mean + Variance prediction loss (NLL)
-        pred_mean_var = self.forward(x, 'mean_var')  # (batch, seq_len, 2)
+        pred_mean_var = self.forward(x, events, 'mean_var')  # (batch, seq_len, 2)
         pred_mean_var = pred_mean_var[:, seq_len//2:, :]  # (batch, pred_len, 2)
         pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len)
         pred_var = pred_mean_var[..., 1]  # (batch, pred_len)
         losses['nll'] = 0.5 * (torch.log(pred_var) + (y - pred_mean_nll) ** 2 / pred_var).mean()
 
         # Quantile prediction loss
-        pred_quantiles = self.forward(x, 'quantile')  # (batch, seq_len, 5)
+        pred_quantiles = self.forward(x, events, 'quantile')  # (batch, seq_len, 5)
         pred_quantiles = pred_quantiles[:, seq_len//2:, :]  # (batch, pred_len, 5)
         quantile_targets = self._compute_quantile_targets(y)  # (batch, pred_len, 5)
         losses['quantile'] = self._quantile_loss(pred_quantiles, quantile_targets)
@@ -655,12 +803,13 @@ class FinalPipeline(dummyLightning):
         returns: (batch, pred_len, 5) - quantile targets
         """
         # Compute empirical quantiles from training data (flatten all values)
-        y_np = y.detach().cpu().numpy().flatten()
+        # Convert to float32 for numpy compatibility
+        y_np = y.detach().cpu().float().numpy().flatten()
         quantiles = np.quantile(y_np, [0.1, 0.25, 0.5, 0.75, 0.9])
 
         # Create targets - expand to (batch, pred_len, 5)
         batch_size, pred_len = y.shape
-        targets = torch.zeros(batch_size, pred_len, 5, device=y.device)
+        targets = torch.zeros(batch_size, pred_len, 5, device=y.device, dtype=y.dtype)
 
         for i, q in enumerate(quantiles):
             targets[..., i] = torch.where(y >= q, torch.ones_like(y), torch.zeros_like(y))
@@ -696,14 +845,14 @@ class FinalPipeline(dummyLightning):
 
         return portfolio_return, new_weights
 
-    def grpo_step(self, batch: Tuple[torch.Tensor, torch.Tensor], num_rollouts: int = 4) -> Dict[str, torch.Tensor]:
+    def grpo_step(self, batch: Tuple[torch.Tensor, ...], num_rollouts: int = 4) -> Dict[str, torch.Tensor]:
         """GRPO training step with multiple rollouts"""
 
-        x, y = batch
+        x, y, events = batch
         batch_size = x.size(0)
 
         # Generate predictions for stock returns
-        features = self.encoder(x)
+        features = self.encoder(x, events)
         features = self.backbone(features)
 
         # Generate multiple rollouts
