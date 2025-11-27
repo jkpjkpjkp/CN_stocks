@@ -69,10 +69,17 @@ class EfficientTimeSeriesDataset(Dataset):
         self.seq_len = seq_len
         self.pred_len = pred_len
 
+        # Prediction horizons in minutes: 1min, 30min, 1day (390min), 2day (780min)
+        self.horizons = [1, 30, 240, 480]
+        self.num_horizons = len(self.horizons)
+
         # Build index: list of (stock_id, start_idx) tuples
+        # Ensure we have enough future data for the longest horizon (480 min)
         self.index = []
         for stock_id, data in stock_data.items():
-            num_windows = len(data) - seq_len
+            max_horizon = max(self.horizons)
+            # Need seq_len + max_horizon to ensure we can get targets for all horizons
+            num_windows = len(data) - seq_len - max_horizon
             if num_windows > 0:
                 for start_idx in range(num_windows):
                     self.index.append((stock_id, start_idx))
@@ -88,9 +95,21 @@ class EfficientTimeSeriesDataset(Dataset):
         features = self.stock_data[stock_id][start_idx:end_idx]
 
         # Get prediction positions' targets (latter half)
+        # For each position in the latter half, get targets at all horizons
         target_start = start_idx + self.seq_len // 2
-        target_end = target_start + self.pred_len
-        targets = self.stock_targets[stock_id][target_start + 1:target_end + 1]
+
+        # targets shape: (pred_len, num_horizons)
+        targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
+
+        for pos_idx in range(self.pred_len):
+            current_pos = target_start + pos_idx
+            for h_idx, horizon in enumerate(self.horizons):
+                target_pos = current_pos + horizon
+                # Bounds check
+                if target_pos < len(self.stock_targets[stock_id]):
+                    targets[pos_idx, h_idx] = self.stock_targets[stock_id][target_pos]
+                else:
+                    targets[pos_idx, h_idx] = np.nan
 
         # Get event markers
         events = self.stock_events[stock_id][start_idx:end_idx]
@@ -384,32 +403,43 @@ class MultiEncoder(dummyLightning):
 
 
 class MultiReadout(dummyLightning):
-    """Multiple readout strategies for different prediction types"""
+    """Multiple readout strategies for different prediction types with multi-horizon support"""
 
     def __init__(self, config):
         super().__init__(config)
 
-        # Different readout heads
-        self.quantized_head = nn.Linear(config.hidden_dim, config.quant_bins)
-        self.cent_head = nn.Linear(config.hidden_dim, 129)  # -64 to +64 plus special tokens
-        self.mean_head = nn.Linear(config.hidden_dim, 1)
-        self.variance_head = nn.Linear(config.hidden_dim, 1)
-        self.quantile_head = nn.Linear(config.hidden_dim, 5)  # 10th, 25th, 50th, 75th, 90th
+        # Prediction horizons: 1min, 30min, 1day (390min), 2day (780min)
+        self.num_horizons = 4
+
+        # Different readout heads - each predicts for all horizons
+        self.quantized_head = nn.Linear(config.hidden_dim, config.quant_bins * self.num_horizons)
+        self.cent_head = nn.Linear(config.hidden_dim, 129 * self.num_horizons)  # -64 to +64 plus special tokens
+        self.mean_head = nn.Linear(config.hidden_dim, self.num_horizons)
+        self.variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
+        self.quantile_head = nn.Linear(config.hidden_dim, 5 * self.num_horizons)  # 10th, 25th, 50th, 75th, 90th
 
     def forward(self, x: torch.Tensor, target_type: str = 'mean') -> torch.Tensor:
-        """x: (batch, seq_len, hidden_dim)"""
+        """
+        x: (batch, seq_len, hidden_dim)
+        returns: (batch, seq_len, num_horizons, ...) - predictions for each horizon
+        """
+        batch_size, seq_len, _ = x.shape
+
         if target_type == 'quantized':
-            return self.quantized_head(x)
+            out = self.quantized_head(x)  # (batch, seq_len, quant_bins * num_horizons)
+            return out.view(batch_size, seq_len, self.num_horizons, -1)  # (batch, seq_len, num_horizons, quant_bins)
         elif target_type == 'cent':
-            return self.cent_head(x)
+            out = self.cent_head(x)
+            return out.view(batch_size, seq_len, self.num_horizons, -1)
         elif target_type == 'mean':
-            return self.mean_head(x)
+            return self.mean_head(x).unsqueeze(-1)  # (batch, seq_len, num_horizons, 1)
         elif target_type == 'mean_var':
-            mean = self.mean_head(x)
-            var = F.softplus(self.variance_head(x))
-            return torch.cat([mean, var], dim=-1)
+            mean = self.mean_head(x)  # (batch, seq_len, num_horizons)
+            var = F.softplus(self.variance_head(x))  # (batch, seq_len, num_horizons)
+            return torch.stack([mean, var], dim=-1)  # (batch, seq_len, num_horizons, 2)
         elif target_type == 'quantile':
-            return self.quantile_head(x)
+            out = self.quantile_head(x)  # (batch, seq_len, 5 * num_horizons)
+            return out.view(batch_size, seq_len, self.num_horizons, 5)  # (batch, seq_len, num_horizons, 5)
         else:
             raise ValueError(f"Unknown target_type: {target_type}")
 
@@ -471,17 +501,15 @@ class FinalPipeline(dummyLightning):
         """Compute all feature types"""
 
         # Returns at different time scales (1min, 30min, 6hr, 24hr, 2days)
-        # Note: Assuming 390 minutes per trading day (6.5 hours)
-        df = df.with_columns([
-            (pl.col('close') - pl.col('close').shift(1).over('id')).alias('ret_1min'),
-            (pl.col('close') - pl.col('close').shift(30).over('id')).alias('ret_30min'),
-            (pl.col('close') - pl.col('close').shift(360).over('id')).alias('ret_6hr'),  # 6 hours
-            (pl.col('close') - pl.col('close').shift(390).over('id')).alias('ret_1day'),  # 1 day
-            (pl.col('close') - pl.col('close').shift(780).over('id')).alias('ret_2day'),  # 2 days
-            (pl.col('close') / pl.col('close').shift(1).over('id') - 1).alias('ret_1min_ratio'),
-            (pl.col('close') / pl.col('close').shift(30).over('id') - 1).alias('ret_30min_ratio'),
-            (pl.col('close') / pl.col('close').shift(390).over('id') - 1).alias('ret_1day_ratio'),
-        ])
+        # Note: Assuming 240 minutes per trading day (6.5 hours)
+        df = df.with_columns(
+            ret_1min=pl.col('close') - pl.col('close').shift(1).over('id'),
+            ret_30min=pl.col('close') - pl.col('close').shift(30).over('id'),
+            ret_1min_ratio=(pl.col('close') / pl.col('close').shift(1).over('id') - 1),
+            ret_30min_ratio=(pl.col('close') / pl.col('close').shift(30).over('id') - 1),
+            ret_1day_ratio=(pl.col('close') / pl.col('close').shift(240).over('id') - 1),
+            ret_2day_ratio=(pl.col('close') / pl.col('close').shift(480).over('id') - 1),  # 2 days
+        )
 
         # Intra-minute relative features
         df = df.with_columns([
