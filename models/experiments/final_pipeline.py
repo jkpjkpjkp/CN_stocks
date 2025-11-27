@@ -703,20 +703,19 @@ class FinalPipeline(dummyLightning):
                 val_stock_targets[stock_id] = close
                 val_stock_events[stock_id] = events
 
-        # Create efficient datasets
         train_dataset = EfficientTimeSeriesDataset(
             train_stock_data, train_stock_targets, train_stock_events,
             seq_len, pred_len
-        ) if len(train_stock_data) > 0 else None
-
+        )
         val_dataset = EfficientTimeSeriesDataset(
             val_stock_data, val_stock_targets, val_stock_events,
             seq_len, pred_len
-        ) if len(val_stock_data) > 0 else None
+        )
 
         return train_dataset, val_dataset
 
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None, target_type: str = 'mean') -> torch.Tensor:
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None,
+                target_type: str = 'mean') -> torch.Tensor:
         """Forward pass through the pipeline"""
 
         encoded = self.encoder(x, events)
@@ -735,12 +734,9 @@ class FinalPipeline(dummyLightning):
         x, y, events = batch
         # x: (batch, seq_len, features)
         # y: (batch, pred_len) where pred_len = seq_len // 2
-        # events: (batch, seq_len, 3)
+        # events: (batch, seq_len, 3) for gaps
 
         seq_len = x.shape[1]
-        pred_len = seq_len // 2
-
-        # Generate predictions with different readout types
         losses = {}
 
         # Get predictions for all sequence positions
@@ -748,13 +744,11 @@ class FinalPipeline(dummyLightning):
         pred_quantized = self.forward(x, events, 'quantized')  # (batch, seq_len, quant_bins)
         pred_quantized = pred_quantized[:, seq_len//2:, :]  # (batch, pred_len, quant_bins)
 
-        # Convert y to same dtype as predictions
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
         quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=y.dtype)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len)
-        # Clamp to valid range [0, quant_bins-1] since bucketize can return quant_bins
         target_quantized = torch.clamp(target_quantized, 0, self.config.quant_bins - 1)
         losses['quantized'] = self.ce_loss(
             pred_quantized.reshape(-1, self.config.quant_bins),
@@ -770,7 +764,7 @@ class FinalPipeline(dummyLightning):
         pred_mean_var = self.forward(x, events, 'mean_var')  # (batch, seq_len, 2)
         pred_mean_var = pred_mean_var[:, seq_len//2:, :]  # (batch, pred_len, 2)
         pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len)
-        pred_var = pred_mean_var[..., 1]  # (batch, pred_len)
+        pred_var = pred_mean_var[..., 1] + 1e-6  # (batch, pred_len)
         losses['nll'] = 0.5 * (torch.log(pred_var) + (y - pred_mean_nll) ** 2 / pred_var).mean()
 
         # Quantile prediction loss
@@ -786,6 +780,13 @@ class FinalPipeline(dummyLightning):
             0.25 * losses['nll'] +
             0.25 * losses['quantile']
         )
+
+        # Check for NaN values and report which component is problematic
+        if torch.isnan(total_loss):
+            for name, loss_val in losses.items():
+                if torch.isnan(loss_val):
+                    raise ValueError(f"NaN detected in {name} loss: {loss_val.item()}")
+            raise ValueError(f"NaN in total loss but not in components: {total_loss.item()}")
 
         return {
             'loss': total_loss,
@@ -823,19 +824,21 @@ class FinalPipeline(dummyLightning):
 
         losses = []
         for i, q in enumerate(quantiles):
-            error = target[:, i] - pred[:, i]
+            # Fix indexing: pred and target are (batch, pred_len, 5)
+            # We want the i-th quantile dimension, not the i-th sequence position
+            error = target[:, :, i] - pred[:, :, i]
 
             # Sided weighting
             weight = torch.where(error > 0,
-                               torch.full_like(error, q),
-                               torch.full_like(error, 1 - q))
+                                 torch.full_like(error, q),
+                                 torch.full_like(error, 1 - q))
 
             losses.append((weight * torch.abs(error)).mean())
 
         return torch.stack(losses).mean()
 
     def optimize_portfolio(self, predictions: torch.Tensor,
-                          current_weights: torch.Tensor) -> torch.Tensor:
+                           current_weights: torch.Tensor) -> torch.Tensor:
         """Optimize portfolio weights using learned policy"""
 
         new_weights, trading_costs = self.portfolio_optimizer(predictions, current_weights)
