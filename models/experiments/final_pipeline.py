@@ -671,9 +671,7 @@ class FinalPipeline(dummyLightning):
 
         encoded = self.encoder(x, events)
         features = self.backbone(encoded)
-        predictions = self.readout(features, target_type)
-
-        return predictions
+        return features
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
         x, y, events = batch
@@ -684,9 +682,10 @@ class FinalPipeline(dummyLightning):
         seq_len = x.shape[1]
         losses = {}
 
+        features = self.forward(x, events)
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
-        pred_quantized = self.forward(x, events, 'quantized')  # (batch, seq_len, quant_bins)
+        pred_quantized = self.readout(features, 'quantized')  # (batch, seq_len, quant_bins)
         pred_quantized = pred_quantized[:, seq_len//2:, :]  # (batch, pred_len, quant_bins)
 
         y = y.to(pred_quantized.dtype)
@@ -701,23 +700,29 @@ class FinalPipeline(dummyLightning):
         )
 
         # Mean prediction loss (Huber)
-        pred_mean = self.forward(x, events, 'mean')  # (batch, seq_len, 1)
+        pred_mean = self.readout(features, 'mean')  # (batch, seq_len, 1)
         pred_mean = pred_mean[:, seq_len//2:, :]  # (batch, pred_len, 1)
         losses['mean'] = self.huber_loss(pred_mean.squeeze(-1), y)
 
         # Mean + Variance prediction loss (NLL)
-        pred_mean_var = self.forward(x, events, 'mean_var')  # (batch, seq_len, 2)
+        pred_mean_var = self.readout(features, 'mean_var')  # (batch, seq_len, 2)
         pred_mean_var = pred_mean_var[:, seq_len//2:, :]  # (batch, pred_len, 2)
         pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len)
         pred_var = pred_mean_var[..., 1] + 1e-6  # (batch, pred_len)
         losses['nll'] = 0.5 * (torch.log(pred_var) + (y - pred_mean_nll) ** 2 / pred_var).mean()
 
         # Quantile prediction loss
-        pred_quantiles = self.forward(x, events, 'quantile')  # (batch, seq_len, 5)
+        pred_quantiles = self.readout(features, 'quantile')  # (batch, seq_len, 5)
         pred_quantiles = pred_quantiles[:, seq_len//2:, :]  # (batch, pred_len, 5)
         quantile_targets = self._compute_quantile_targets(y)  # (batch, pred_len, 5)
         losses['quantile'] = self._quantile_loss(pred_quantiles, quantile_targets)
 
+        assert (
+            losses['quantized'] >= 0 and
+            losses['mean'] >= 0 and
+            losses['nll'] >= 0 and
+            losses['quantile'] >= 0
+        ), losses
         # Combine losses
         total_loss = (
             0.25 * losses['quantized'] +
