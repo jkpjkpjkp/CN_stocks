@@ -393,17 +393,14 @@ class FinalPipeline(dummyLightning):
             df = pl.read_parquet(str(path))
         df = df.sort(['id', 'datetime'])
 
-        # Compute various features
         df = self._compute_features(df)
-
-        # Split train/val
         df = self._split_data(df, train_frac)
 
         # Compute quantiles for quantization
         self.quantiles = self._compute_quantiles(df, quant_bins)
 
         # Update encoder with quantiles
-        self.encoder.quantiles = self.quantiles['close_raw']
+        self.encoder.quantiles = self.quantiles['close']
 
         # Build sequences
         self.train_dataset, self.val_dataset = self._build_sequences(df, seq_len)
@@ -453,27 +450,26 @@ class FinalPipeline(dummyLightning):
     def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
         """Split data by time to avoid leakage"""
 
-        cutoffs = df.group_by('id').agg(
-            pl.col('datetime').quantile(train_frac).alias('cut')
-        )
+        # Compute a single cutoff date from all unique datetimes
+        unique_datetimes = df['datetime'].unique().sort().to_numpy()
+        cutoff = np.quantile(unique_datetimes, train_frac)
 
-        df = df.join(cutoffs, on='id')
-        df = df.with_columns((pl.col('datetime') <= pl.col('cut')).alias('is_train'))
+        df = df.with_columns((pl.col('datetime') <= cutoff).alias('is_train'))
 
         # Compute per-stock statistics on training data
         stats = df.filter(pl.col('is_train')).group_by('id').agg([
-            pl.col('close_raw').mean().alias('mean_close'),
-            pl.col('close_raw').std().alias('std_close'),
-            pl.col('volume_raw').mean().alias('mean_volume'),
-            pl.col('volume_raw').std().alias('std_volume')
+            pl.col('close').mean().alias('mean_close'),
+            pl.col('close').std().alias('std_close'),
+            pl.col('volume').mean().alias('mean_volume'),
+            pl.col('volume').std().alias('std_volume')
         ])
 
         df = df.join(stats, on='id')
 
         # Add normalized features
         df = df.with_columns([
-            ((pl.col('close_raw') - pl.col('mean_close')) / (pl.col('std_close') + 1e-6)).alias('close_norm'),
-            ((pl.col('volume_raw') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-6)).alias('volume_norm')
+            ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-6)).alias('close_norm'),
+            ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-6)).alias('volume_norm')
         ])
 
         return df
@@ -484,7 +480,7 @@ class FinalPipeline(dummyLightning):
         train_df = df.filter(pl.col('is_train'))
 
         quantiles = {}
-        for col in ['close_raw', 'ret_1min', 'ret_30min', 'volume_raw']:
+        for col in ['close', 'ret_1min', 'ret_30min', 'volume']:
             data = train_df[col].to_numpy()
             quantiles[col] = np.quantile(data, np.linspace(0, 1, quant_bins + 1))
 
@@ -499,22 +495,22 @@ class FinalPipeline(dummyLightning):
         val_targets = []
 
         feature_cols = [
-            'close_raw', 'close_norm', 'ret_1min', 'ret_30min', 'ret_6hr', 'ret_1day', 'ret_2day',
+            'close', 'close_norm', 'ret_1min', 'ret_30min', 'ret_6hr', 'ret_1day', 'ret_2day',
             'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio', 'close_open_ratio',
             'high_open_ratio', 'low_open_ratio', 'high_low_ratio',
-            'volume_raw', 'volume_norm'
+            'volume', 'volume_norm'
         ]
 
         # Compute time-normalized values (cross-stock normalized per timestep)
         # Group by minute and compute mean/std across all stocks
         time_stats = df.group_by('datetime').agg([
-            pl.col('close_raw').mean().alias('time_mean_close'),
-            pl.col('close_raw').std().alias('time_std_close')
+            pl.col('close').mean().alias('time_mean_close'),
+            pl.col('close').std().alias('time_std_close')
         ])
 
         df = df.join(time_stats, on='datetime')
         df = df.with_columns([
-            ((pl.col('close_raw') - pl.col('time_mean_close')) / (pl.col('time_std_close') + 1e-6)).alias('close_time_norm')
+            ((pl.col('close') - pl.col('time_mean_close')) / (pl.col('time_std_close') + 1e-6)).alias('close_time_norm')
         ])
 
         for stock_id in df['id'].unique():
@@ -526,11 +522,11 @@ class FinalPipeline(dummyLightning):
 
             features = stock_df.select(feature_cols).to_numpy()
             is_train = stock_df['is_train'].to_numpy()
-            close_raw = stock_df['close_raw'].to_numpy()
+            close = stock_df['close'].to_numpy()
             close_time_norm = stock_df['close_time_norm'].to_numpy()
-            open_raw = stock_df['open_raw'].to_numpy()
-            high_raw = stock_df['high_raw'].to_numpy()
-            low_raw = stock_df['low_raw'].to_numpy()
+            open = stock_df['open'].to_numpy()
+            high = stock_df['high'].to_numpy()
+            low = stock_df['low'].to_numpy()
 
             # Create sliding windows with multiple target horizons
             for i in range(len(features) - seq_len - 780):
@@ -543,13 +539,13 @@ class FinalPipeline(dummyLightning):
                 # 4. Next day OHLC (390 minutes ahead)
                 # 5. Time-normalized next close
                 target_dict = {
-                    'close_1min': close_raw[i+seq_len],
-                    'close_30min': close_raw[i+seq_len+30] if i+seq_len+30 < len(close_raw) else close_raw[-1],
-                    'close_1day': close_raw[i+seq_len+390] if i+seq_len+390 < len(close_raw) else close_raw[-1],
-                    'close_2day': close_raw[i+seq_len+780] if i+seq_len+780 < len(close_raw) else close_raw[-1],
-                    'open_next': open_raw[i+seq_len+390] if i+seq_len+390 < len(open_raw) else open_raw[-1],
-                    'high_next': high_raw[i+seq_len+390] if i+seq_len+390 < len(high_raw) else high_raw[-1],
-                    'low_next': low_raw[i+seq_len+390] if i+seq_len+390 < len(low_raw) else low_raw[-1],
+                    'close_1min': close[i+seq_len],
+                    'close_30min': close[i+seq_len+30] if i+seq_len+30 < len(close) else close[-1],
+                    'close_1day': close[i+seq_len+390] if i+seq_len+390 < len(close) else close[-1],
+                    'close_2day': close[i+seq_len+780] if i+seq_len+780 < len(close) else close[-1],
+                    'open_next': open[i+seq_len+390] if i+seq_len+390 < len(open) else open[-1],
+                    'high_next': high[i+seq_len+390] if i+seq_len+390 < len(high) else high[-1],
+                    'low_next': low[i+seq_len+390] if i+seq_len+390 < len(low) else low[-1],
                     'close_time_norm': close_time_norm[i+seq_len]
                 }
 
@@ -599,7 +595,7 @@ class FinalPipeline(dummyLightning):
 
         # Quantized prediction loss
         pred_quantized = self.forward(x, 'quantized')
-        quantiles_tensor = torch.from_numpy(self.quantiles['close_raw']).to(y.device)
+        quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device)
         target_quantized = torch.bucketize(y, quantiles_tensor)
         losses['quantized'] = self.ce_loss(pred_quantized.view(-1, self.config.quant_bins), target_quantized.view(-1))
 
