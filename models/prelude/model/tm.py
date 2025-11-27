@@ -7,10 +7,10 @@ from .main import dummyLightning
 def apply_rotary_emb(x, cos, sin):
     l = x.shape[-2]
     d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
-    y1 = x1 * cos[:l] + x2 * sin[:l] # rotate pairs of dims
+    x1, x2 = x[..., :d], x[..., d:]  # split up last time into two halves
+    y1 = x1 * cos[:l] + x2 * sin[:l]  # rotate pairs of dims
     y2 = x1 * (-sin[:l]) + x2 * cos[:l]
-    out = torch.cat([y1, y2], -1) # re-assemble
+    out = torch.cat([y1, y2], -1)  # re-assemble
     out = out.to(x.dtype)
     return out
 
@@ -20,7 +20,10 @@ class Rope(nn.Module):
         self.config = config
 
         device = config.device
-        attn_dim = config.head_dim * config.num_heads
+        if hasattr(config, 'use_normal_rope') and config.use_normal_rope:
+            attn_dim = config.hidden_dim
+        else:
+            attn_dim = config.head_dim * config.num_heads
         channel_range = torch.arange(0, attn_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (10000 ** (channel_range / attn_dim))
         t = torch.arange(config.seq_len, dtype=torch.float32, device=device)

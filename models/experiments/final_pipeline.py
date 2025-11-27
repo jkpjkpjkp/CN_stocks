@@ -96,17 +96,22 @@ class TransformerBlock(nn.Module):
         residual = x
         x = self.norm1(x)
 
-        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        if not (hasattr(config, 'use_normal_rope') and config.use_normal_rope):
+            q = self.rope(q)
+            k = self.rope(k)
 
         # Rearrange for attention: (batch, num_heads, seq_len, head_dim)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        q = self.rope(q)
-        k = self.rope(k)
+        if hasattr(config, 'use_normal_rope') and config.use_normal_rope:
+            q = self.rope(q)
+            k = self.rope(k)
 
         # Apply scaled dot-product attention
         attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0 if not self.training else 0.1)
@@ -395,11 +400,8 @@ class FinalPipeline(dummyLightning):
 
         df = self._compute_features(df)
         df = self._split_data(df, train_frac)
-
-        # Compute quantiles for quantization
         self.quantiles = self._compute_quantiles(df, quant_bins)
 
-        # Update encoder with quantiles
         self.encoder.quantiles = self.quantiles['close']
 
         # Build sequences
