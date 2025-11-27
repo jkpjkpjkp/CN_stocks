@@ -58,13 +58,14 @@ from .embedding.draw import create_kline_pixel_graph
 from .embedding.main import TimeSeriesDataset
 from ..prelude.model import Rope
 
+torch.autograd.set_detect_anomaly(True)
 
-class TransformerBlock(nn.Module):
+
+class TransformerBlock(dummyLightning):
     """Transformer block with self-attention using F.scaled_dot_product_attention"""
 
     def __init__(self, config):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.hidden_dim = config.hidden_dim
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
@@ -131,51 +132,43 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class PercentileEncoder(nn.Module):
-    def __init__(self, quant_bins: int = 256, embed_dim: int = 128):
-        super().__init__()
-        self.quant_bins = quant_bins
-        self.embedding = nn.Embedding(quant_bins, embed_dim)
+class PercentileEncoder(dummyLightning):
+    def __init__(self, config):
+        super().__init__(config)
+        self.embedding = nn.Embedding(config.quant_bins, config.embed_dim)
 
     def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
-        """Convert continuous values to quantized tokens"""
         # x: (batch, 1) - single feature values
-        print(f"PercentileEncoder input shape: {x.shape}")
         tokens = torch.from_numpy(np.digitize(x.cpu().numpy(), quantiles[1:-1],
                                               right=True)).to(x.device)
-        print(f"PercentileEncoder tokens shape before squeeze: {tokens.shape}")
         # tokens shape: (batch, 1), squeeze to (batch,) for embedding
         tokens = tokens.squeeze(-1)
-        print(f"PercentileEncoder tokens shape after squeeze: {tokens.shape}")
         result = self.embedding(tokens)
-        print(f"PercentileEncoder output shape: {result.shape}")
         return result
 
 
-class CentQuantizeEncoder(nn.Module):
-    """Cent-based quantization for small price differences"""
-
-    def __init__(self, embed_dim: int = 128, max_cents: int = 64):
-        super().__init__()
-        self.max_cents = max_cents
+class CentQuantizeEncoder(dummyLightning):
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_cents = config.max_cents
         # -max_cents to +max_cents plus special tokens for inf/-inf
-        self.embedding = nn.Embedding(2 * max_cents + 3, embed_dim)  # +3 for -inf, +inf, and 0
+        self.embedding = nn.Embedding(2 * config.max_cents + 2, config.embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Convert cent differences to tokens"""
-        x = x.squeeze(-1)
-        tokens = torch.clamp(x.round().long(), -self.max_cents, self.max_cents) + self.max_cents + 1
-        # Handle infinities
-        tokens = torch.where(torch.isinf(x), torch.sign(x).long() * (self.max_cents + 1) + self.max_cents + 1, tokens)
+        x = x.squeeze(-1) * 100  # cents
+        tokens = torch.clamp((x).round().long(), -self.max_cents-1,
+                             self.max_cents+1
+                             ) + self.max_cents + 1
         tokens = torch.where(torch.isnan(x), torch.zeros_like(tokens), tokens)
         return self.embedding(tokens)
 
 
-class CNNEncoder(nn.Module):
+class CNNEncoder(dummyLightning):
     """CNN encoder for K-line graph images"""
 
-    def __init__(self, embed_dim: int = 128):
-        super().__init__()
+    def __init__(self, config, embed_dim: int = 128):
+        super().__init__(config)
         # Input: 180x96 RGB images
         self.conv_layers = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),  # 90x48
@@ -201,13 +194,14 @@ class CNNEncoder(nn.Module):
 class SinEncoder(nn.Module):
     """Sinusoidal encoding for continuous values"""
 
-    def __init__(self, embed_dim: int = 128, max_freq: float = 10000.0):
+    def __init__(self, config):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.max_freq = max_freq
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.max_freq = config.max_freq
 
         # Create frequency embeddings
-        freqs = torch.exp(torch.linspace(0, np.log(max_freq), embed_dim // 2))
+        freqs = torch.exp(torch.linspace(0, np.log(self.max_freq), self.embed_dim // 2))
         self.register_buffer('freqs', freqs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -224,19 +218,19 @@ class SinEncoder(nn.Module):
         return emb[..., :self.embed_dim]
 
 
-class MultiEncoder(nn.Module):
+class MultiEncoder(dummyLightning):
     """Combines multiple encoding strategies"""
 
     def __init__(self, config, quantiles: Optional[np.ndarray] = None):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.quantiles = quantiles
 
         # Individual encoders
-        self.quantize_encoder = PercentileEncoder(config.quant_bins, config.hidden_dim)
-        self.cent_encoder = CentQuantizeEncoder(config.hidden_dim, max_cents=64)
-        self.cnn_encoder = CNNEncoder(config.hidden_dim)
-        self.sin_encoder = SinEncoder(config.hidden_dim)
+        self.quantize_encoder = PercentileEncoder(config)
+        self.cent_encoder = CentQuantizeEncoder(config)
+        self.cnn_encoder = CNNEncoder(config)
+        self.sin_encoder = SinEncoder(config)
 
         # Combine different encodings
         total_dim = config.hidden_dim * 3  # 4 encoding types
@@ -281,12 +275,11 @@ class MultiEncoder(nn.Module):
         return output.view(batch_size, seq_len, -1)
 
 
-class MultiReadout(nn.Module):
+class MultiReadout(dummyLightning):
     """Multiple readout strategies for different prediction types"""
 
     def __init__(self, config):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
 
         # Different readout heads
         self.quantized_head = nn.Linear(config.hidden_dim, config.quant_bins)
@@ -313,13 +306,12 @@ class MultiReadout(nn.Module):
             raise ValueError(f"Unknown target_type: {target_type}")
 
 
-class PortfolioOptimizer(nn.Module):
+class PortfolioOptimizer(dummyLightning):
     """TODO: take into account last holding and only cost delta"""
     """Portfolio optimization with GRPO rollouts"""
 
     def __init__(self, config):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.trading_cost_long = 0.005  # 0.5%
         self.trading_cost_short = 0.30  # 30%
 
@@ -375,7 +367,7 @@ class FinalPipeline(dummyLightning):
         self.huber_loss = nn.HuberLoss()
         self.mse_loss = nn.MSELoss()
 
-    def _build_backbone(self) -> nn.Module:
+    def _build_backbone(self) -> dummyLightning:
         layers = []
 
         for _ in range(self.config.num_layers):
@@ -616,7 +608,7 @@ class FinalPipeline(dummyLightning):
         pred_quantized = pred_quantized[:, seq_len//2:, :]  # (batch, pred_len, quant_bins)
 
         # Quantized prediction loss
-        quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device)
+        quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=torch.bfloat16)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len)
         losses['quantized'] = self.ce_loss(
             pred_quantized.reshape(-1, self.config.quant_bins),
@@ -775,6 +767,7 @@ class FinalPipelineConfig:
     num_heads: int = 8
     head_dim: int = 32
     quant_bins: int = 256
+    max_freq: float = 10000.
 
     # Training
     batch_size: int = 32
@@ -784,8 +777,10 @@ class FinalPipelineConfig:
     grad_clip: float = 1.0
 
     # Data
-    seq_len: int = 256  # Increased for longer sequences
+    seq_len: int = 256
     train_ratio: float = 0.9
+    max_cents: int = 64
+    embed_dim: int = 128
 
     # Device
     device: str = 'cuda'
