@@ -30,13 +30,6 @@ This pipeline implements:
 5. Multiple prediction horizons:
    - 1min, 30min, 1day, 2day ahead
    - Next day OHLC predictions
-
-Usage:
-    config = FinalPipelineConfig()
-    pipeline = create_final_pipeline(config)
-    pipeline.prepare_data()
-    pipeline.fit()  # Standard training
-    # or use pipeline.grpo_step() for GRPO training
 """
 import torch
 import torch.nn as nn
@@ -637,7 +630,6 @@ class FinalPipeline(dummyLightning):
         for stock_id in df['id'].unique():
             stock_df = df.filter(pl.col('id') == stock_id).sort('datetime')
 
-            # Need enough data for sequence + 1 (for the final prediction target)
             if len(stock_df) <= seq_len + 1:
                 continue
 
@@ -684,16 +676,10 @@ class FinalPipeline(dummyLightning):
         return predictions
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
-        """
-        Training step with multiple loss components.
-
-        Now handles sequence prediction where each position in the latter half
-        predicts its next value (like language modeling).
-        """
         x, y, events = batch
         # x: (batch, seq_len, features)
         # y: (batch, pred_len) where pred_len = seq_len // 2
-        # events: (batch, seq_len, 3) for gaps
+        # events: (batch, seq_len, 3)
 
         seq_len = x.shape[1]
         losses = {}
