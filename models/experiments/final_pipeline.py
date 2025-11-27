@@ -457,7 +457,9 @@ class FinalPipeline(dummyLightning):
         path = Path(path)
 
         if self.config.debug_data:
-            df = pl.scan_parquet(str(path)).head(1000000).collect()
+            df = pl.scan_parquet(str(path))
+            ids = df.select('id').unique().collect().sample(5)['id']
+            df = df.filter(pl.col('id').is_in(ids)).collect()
         else:
             df = pl.read_parquet(str(path))
         df = df.sort(['id', 'datetime'])
@@ -644,16 +646,21 @@ class FinalPipeline(dummyLightning):
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close'].to_numpy().astype(np.float32)
 
-            # Split based on the majority of each stock's data
-            # (simpler than splitting windows)
-            if is_train.mean() > 0.5:
-                train_stock_data[stock_id] = features
-                train_stock_targets[stock_id] = close
-                train_stock_events[stock_id] = events
-            else:
-                val_stock_data[stock_id] = features
-                val_stock_targets[stock_id] = close
-                val_stock_events[stock_id] = events
+            # Split each stock's data by time - train data and val data
+            train_mask = is_train.astype(bool)
+            val_mask = ~train_mask
+
+            # Only add to train set if we have enough train data
+            if train_mask.sum() > seq_len + 1:
+                train_stock_data[stock_id] = features[train_mask]
+                train_stock_targets[stock_id] = close[train_mask]
+                train_stock_events[stock_id] = events[train_mask]
+
+            # Only add to val set if we have enough val data
+            if val_mask.sum() > seq_len + 1:
+                val_stock_data[stock_id] = features[val_mask]
+                val_stock_targets[stock_id] = close[val_mask]
+                val_stock_events[stock_id] = events[val_mask]
 
         train_dataset = EfficientTimeSeriesDataset(
             train_stock_data, train_stock_targets, train_stock_events,
