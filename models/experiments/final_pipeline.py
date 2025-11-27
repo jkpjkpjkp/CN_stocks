@@ -427,45 +427,6 @@ class MultiReadout(dummyLightning):
             raise ValueError(f"Unknown target_type: {target_type}")
 
 
-class PortfolioOptimizer(dummyLightning):
-    """TODO: take into account last holding and only cost delta"""
-    """Portfolio optimization with GRPO rollouts"""
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.trading_cost_long = 0.005  # 0.5%
-        self.trading_cost_short = 0.30  # 30%
-
-        # Predict stock weights using 2-sided softmax
-        self.weight_predictor = nn.Sequential(
-            nn.Linear(config.hidden_dim, 64),
-            nn.SiLU(),
-            nn.Linear(64, 2)  # Positive and negative weights
-        )
-
-    def forward(self, predictions: torch.Tensor, current_weights: torch.Tensor) -> torch.Tensor:
-        """
-        predictions: (batch, num_stocks, hidden_dim)
-        current_weights: (batch, num_stocks)
-        """
-        # Predict raw weights
-        raw_weights = self.weight_predictor(predictions)  # (batch, num_stocks, 2)
-
-        # Apply 2-sided softmax
-        pos_weights = F.softmax(raw_weights[..., 0], dim=-1)
-        neg_weights = -F.softmax(raw_weights[..., 1], dim=-1)
-        new_weights = pos_weights + neg_weights
-
-        # Calculate trading costs
-        weight_changes = torch.abs(new_weights - current_weights)
-        long_trades = torch.clamp(weight_changes, min=0)
-        short_trades = torch.clamp(-weight_changes, max=0)
-
-        trading_costs = self.trading_cost_long * long_trades.sum() + self.trading_cost_short * torch.abs(short_trades).sum()
-
-        return new_weights, trading_costs
-
-
 class FinalPipeline(dummyLightning):
     """Complete pipeline combining all components"""
 
@@ -479,9 +440,6 @@ class FinalPipeline(dummyLightning):
 
         # Multi-readout for different prediction types
         self.readout = MultiReadout(config)
-
-        # Portfolio optimizer
-        self.portfolio_optimizer = PortfolioOptimizer(config)
 
         # Loss functions
         self.ce_loss = nn.CrossEntropyLoss()
@@ -836,74 +794,6 @@ class FinalPipeline(dummyLightning):
             losses.append((weight * torch.abs(error)).mean())
 
         return torch.stack(losses).mean()
-
-    def optimize_portfolio(self, predictions: torch.Tensor,
-                           current_weights: torch.Tensor) -> torch.Tensor:
-        """Optimize portfolio weights using learned policy"""
-
-        new_weights, trading_costs = self.portfolio_optimizer(predictions, current_weights)
-
-        # Portfolio return (simplified - would need actual returns)
-        portfolio_return = (new_weights * predictions.squeeze()).sum() - trading_costs
-
-        return portfolio_return, new_weights
-
-    def grpo_step(self, batch: Tuple[torch.Tensor, ...], num_rollouts: int = 4) -> Dict[str, torch.Tensor]:
-        """GRPO training step with multiple rollouts"""
-
-        x, y, events = batch
-        batch_size = x.size(0)
-
-        # Generate predictions for stock returns
-        features = self.encoder(x, events)
-        features = self.backbone(features)
-
-        # Generate multiple rollouts
-        rollout_returns = []
-        rollout_weights = []
-
-        # Initialize portfolio with equal weights
-        current_weights = torch.zeros(batch_size, device=x.device)
-
-        for _ in range(num_rollouts):
-            # Add noise to create diverse rollouts
-            noisy_features = features + torch.randn_like(features) * 0.1
-
-            # Predict returns
-            predicted_returns = self.readout(noisy_features, 'mean').squeeze(-1)
-
-            # Optimize portfolio
-            portfolio_return, new_weights = self.optimize_portfolio(
-                predicted_returns[:, -1:],  # Use last timestep
-                current_weights
-            )
-
-            rollout_returns.append(portfolio_return)
-            rollout_weights.append(new_weights)
-
-        # Stack rollouts
-        rollout_returns = torch.stack(rollout_returns)  # (num_rollouts, batch)
-        rollout_weights = torch.stack(rollout_weights)  # (num_rollouts, batch)
-
-        # Compute advantages (relative to mean)
-        mean_return = rollout_returns.mean(dim=0, keepdim=True)
-        advantages = rollout_returns - mean_return
-
-        # GRPO loss: weight rollouts by their advantage
-        grpo_loss = -(advantages * rollout_returns).mean()
-
-        # Also include standard prediction loss
-        standard_loss = self.step(batch)['loss']
-
-        # Combine losses
-        total_loss = 0.7 * standard_loss + 0.3 * grpo_loss
-
-        return {
-            'loss': total_loss,
-            'grpo_loss': grpo_loss,
-            'standard_loss': standard_loss,
-            'mean_portfolio_return': rollout_returns.mean()
-        }
 
 
 @dataclass
