@@ -100,7 +100,7 @@ class TransformerBlock(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        if not (hasattr(config, 'use_normal_rope') and config.use_normal_rope):
+        if not (hasattr(self.config, 'use_normal_rope') and self.config.use_normal_rope):
             q = self.rope(q)
             k = self.rope(k)
 
@@ -109,7 +109,7 @@ class TransformerBlock(nn.Module):
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if hasattr(config, 'use_normal_rope') and config.use_normal_rope:
+        if hasattr(self.config, 'use_normal_rope') and self.config.use_normal_rope:
             q = self.rope(q)
             k = self.rope(k)
 
@@ -589,7 +589,6 @@ class FinalPipeline(dummyLightning):
 
     def step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Training step with multiple loss components"""
-
         x, y = batch
 
         # Generate predictions with different readout types
