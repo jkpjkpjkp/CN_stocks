@@ -1014,10 +1014,10 @@ class FinalPipelineConfig:
     debug_ddp: bool = False
     debug_model: bool = False
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __post_init__(self):
         if self.debug_model:
             self.hidden_dim //= 4
+            self.num_heads //= 2
             self.num_layers //= 2
             self.embed_dim //= 2
 
