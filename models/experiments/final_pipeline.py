@@ -67,12 +67,12 @@ class EfficientTimeSeriesDataset(Dataset):
             pred_len: Prediction length
         """
         self.stock_data = stock_data
-        self.stock_targets = stock_targets
+        self.targets = stock_targets
         self.stock_events = stock_events
         self.seq_len = seq_len
         self.pred_len = pred_len
 
-        # Prediction horizons in minutes: 1min, 30min, 1day (390min), 2day (780min)
+        # Prediction horizons in minutes: 1min, 30min, 1day, 2days
         self.horizons = [1, 30, 240, 480]
         self.num_horizons = len(self.horizons)
 
@@ -81,8 +81,7 @@ class EfficientTimeSeriesDataset(Dataset):
         self.index = []
         for stock_id, data in stock_data.items():
             max_horizon = max(self.horizons)
-            # Need seq_len + max_horizon to ensure we can get targets for all horizons
-            num_windows = len(data) - seq_len - max_horizon
+            num_windows = len(data) - seq_len - max_horizon  # for all horizons
             if num_windows > 0:
                 for start_idx in range(num_windows):
                     self.index.append((stock_id, start_idx))
@@ -102,15 +101,16 @@ class EfficientTimeSeriesDataset(Dataset):
         target_start = start_idx + self.seq_len // 2
 
         # targets shape: (pred_len, num_horizons)
-        targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
+        targets = np.zeros((self.pred_len, self.num_horizons),
+                           dtype=np.float32)
 
         for pos_idx in range(self.pred_len):
             current_pos = target_start + pos_idx
             for h_idx, horizon in enumerate(self.horizons):
-                target_pos = current_pos + horizon
+                pos = current_pos + horizon
                 # Bounds check
-                if target_pos < len(self.stock_targets[stock_id]):
-                    targets[pos_idx, h_idx] = self.stock_targets[stock_id][target_pos]
+                if pos < len(self.targets[stock_id]):
+                    targets[pos_idx, h_idx] = self.targets[stock_id][pos]
                 else:
                     targets[pos_idx, h_idx] = np.nan
 
@@ -125,18 +125,18 @@ class EfficientTimeSeriesDataset(Dataset):
 
 
 class TransformerBlock(dummyLightning):
-    """Transformer block with self-attention using F.scaled_dot_product_attention"""
-
     def __init__(self, config):
         super().__init__(config)
         self.hidden_dim = config.hidden_dim
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
 
-        self.q_proj = nn.Linear(self.hidden_dim, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_dim, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_dim, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_dim, bias=False)
+        attn_dim = self.num_heads * self.head_dim
+        self.q_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
+        self.o_proj = nn.Linear(attn_dim, self.hidden_dim, bias=False)
+        self.attn_dim = attn_dim
 
         self.rope = Rope(config)
 
@@ -149,7 +149,7 @@ class TransformerBlock(dummyLightning):
             nn.Linear(config.intermediate_dim, self.hidden_dim),
         )
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
         x: (batch, seq_len, hidden_dim)
         mask: (batch, seq_len) or (batch, seq_len, seq_len)
@@ -163,25 +163,29 @@ class TransformerBlock(dummyLightning):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        if not (hasattr(self.config, 'use_normal_rope') and self.config.use_normal_rope):
+        if not (hasattr(self.config, 'use_normal_rope') and
+                self.config.use_normal_rope):
             q = self.rope(q)
             k = self.rope(k)
 
         # Rearrange for attention: (batch, num_heads, seq_len, head_dim)
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
-        if hasattr(self.config, 'use_normal_rope') and self.config.use_normal_rope:
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        if (hasattr(self.config, 'use_normal_rope') and
+                self.config.use_normal_rope):
             q = self.rope(q)
             k = self.rope(k)
 
         # Apply scaled dot-product attention
-        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0 if not self.training else 0.1)
+        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
         # Rearrange back: (batch, seq_len, num_heads, head_dim)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.view(batch_size, seq_len, self.attn_dim)
 
         # Output projection
         attn_output = self.o_proj(attn_output)
@@ -204,7 +208,8 @@ class PercentileEncoder(dummyLightning):
         self.dinner_token = config.quant_bins + 1
         self.skipped_token = config.quant_bins + 2
 
-    def forward(self, x: torch.Tensor, quantiles: np.ndarray, events: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, quantiles: np.ndarray,
+                events: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (batch, 1) - single feature values
         # events: (batch, 3) - binary flags for [lunch, dinner, skipped_day]
         tokens = torch.from_numpy(np.digitize(x.cpu().numpy(), quantiles[1:-1],
@@ -218,13 +223,16 @@ class PercentileEncoder(dummyLightning):
             dinner_mask = events[:, 1].bool()
             skipped_mask = events[:, 2].bool()
 
-            # Priority: skipped_day > lunch > dinner (no dinner when day skipped)
+            # Priority: skipped_day > lunch > dinner
             tokens = torch.where(dinner_mask & ~skipped_mask,
-                                torch.full_like(tokens, self.dinner_token), tokens)
+                                 torch.full_like(tokens, self.dinner_token),
+                                 tokens)
             tokens = torch.where(lunch_mask & ~skipped_mask,
-                                torch.full_like(tokens, self.lunch_token), tokens)
+                                 torch.full_like(tokens, self.lunch_token),
+                                 tokens)
             tokens = torch.where(skipped_mask,
-                                torch.full_like(tokens, self.skipped_token), tokens)
+                                 torch.full_like(tokens, self.skipped_token),
+                                 tokens)
 
         result = self.embedding(tokens)
         return result
@@ -234,13 +242,14 @@ class CentQuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.max_cents = config.max_cents
-        # -max_cents to +max_cents plus special tokens for inf/-inf and 3 event tokens
-        self.embedding = nn.Embedding(2 * config.max_cents + 5, config.embed_dim)
+        # -max_cents to +max_cents, +-inf, and 3 event tokens
+        self.embedding = nn.Embedding(2 * config.max_cents + 5,
+                                      config.embed_dim)
         self.lunch_token = 2 * config.max_cents + 2
         self.dinner_token = 2 * config.max_cents + 3
         self.skipped_token = 2 * config.max_cents + 4
 
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None):
         """Convert cent differences to tokens"""
         x = x.squeeze(-1)
         tokens = torch.clamp(x, -self.max_cents-1,
