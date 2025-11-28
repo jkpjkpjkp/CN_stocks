@@ -357,7 +357,7 @@ class MultiEncoder(dummyLightning):
         self.sin_encoder = SinEncoder(config)
 
         # Combine different encodings
-        total_dim = config.hidden_dim * 3  # 4 encoding types
+        total_dim = config.embed_dim * 3  # 3 encoding types (quant, cent, sin)
         self.combiner = nn.Linear(total_dim, config.hidden_dim)
 
     def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None, image_data: Optional[torch.Tensor] = None) -> torch.Tensor:
