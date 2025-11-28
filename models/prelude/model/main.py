@@ -72,6 +72,7 @@ class dummyLightning(Module):
         super().__init__()
         self.config = config
 
+    @property
     def training_dataloader(self):
         return DataLoader(
             self.train_dataset,
@@ -80,6 +81,7 @@ class dummyLightning(Module):
             shuffle=True,
         )
 
+    @property
     def validation_dataloader(self):
         return DataLoader(
             self.val_dataset,
@@ -175,8 +177,8 @@ class dummyLightning(Module):
         self.activate()
         torch.set_float32_matmul_precision('medium')
 
-        train_dataloader = self.training_dataloader()
-        val_dataloader = self.validation_dataloader()
+        train_dataloader = self.train_dataloader
+        val_dataloader = self.val_dataloader
 
         best_val_loss = float('inf')
 

@@ -39,7 +39,10 @@ import polars as pl
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os
 
 from ..prelude.model import dummyLightning
 from .embedding.draw import create_kline_pixel_graph
@@ -454,17 +457,119 @@ class FinalPipeline(dummyLightning):
         super().__init__(config)
         self.config = config
 
+        # DDP setup
+        self.is_distributed = config.use_ddp
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+        self._ddp_model = None
+
         self.encoder = MultiEncoder(config)
-
         self.backbone = self._build_backbone()
-
-        # Multi-readout for different prediction types
         self.readout = MultiReadout(config)
 
         # Loss functions
         self.ce_loss = nn.CrossEntropyLoss()
         self.huber_loss = nn.HuberLoss()
         self.mse_loss = nn.MSELoss()
+
+    def setup_ddp(self, rank: Optional[int] = None, world_size: Optional[int] = None):
+        """Initialize DDP from environment or provided rank/world_size"""
+        if not self.config.use_ddp:
+            return
+
+        # Get rank and world_size from environment if not provided
+        if rank is None:
+            rank = int(os.environ.get('RANK', 0))
+        if world_size is None:
+            world_size = int(os.environ.get('WORLD_SIZE', 1))
+
+        self.rank = rank
+        self.world_size = world_size
+        self.local_rank = int(os.environ.get('LOCAL_RANK', rank))
+
+        # Set device
+        if torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank if not self.config.debug_ddp else 0)
+            self.config.device = f'cuda:{self.local_rank}'
+
+        # Initialize process group
+        if not dist.is_initialized():
+            os.environ['MASTER_ADDR'] = self.config.master_addr
+            os.environ['MASTER_PORT'] = self.config.master_port
+            dist.init_process_group(
+                backend=self.config.ddp_backend,
+                rank=self.rank,
+                world_size=self.world_size
+            )
+
+        self.is_distributed = True
+
+        # Move model to device before wrapping with DDP
+        self.to(self.config.device)
+
+        # Wrap model with DDP
+        self._ddp_model = DDP(
+            self,
+            device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+            output_device=self.local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=self.config.ddp_find_unused_parameters,
+            static_graph=self.config.ddp_static_graph
+        )
+
+    def get_model(self):
+        """Return the underlying model (unwrapped from DDP if necessary)"""
+        return self._ddp_model.module if self._ddp_model is not None else self
+
+    def barrier(self):
+        """Synchronization barrier across all processes"""
+        if self.is_distributed:
+            dist.barrier()
+
+    def is_main_process(self) -> bool:
+        """Check if this is the main process (rank 0)"""
+        return self.rank == 0
+
+    def cleanup_ddp(self):
+        """Cleanup DDP process group"""
+        if self.is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
+            self.is_distributed = False
+
+    def all_reduce(self, tensor: torch.Tensor, op=None) -> torch.Tensor:
+        """All-reduce operation across all processes"""
+        if not self.is_distributed:
+            return tensor
+
+        if op is None:
+            op = dist.ReduceOp.SUM
+
+        tensor = tensor.clone()
+        dist.all_reduce(tensor, op=op)
+        return tensor
+
+    def all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather tensors from all processes"""
+        if not self.is_distributed:
+            return tensor
+
+        tensor_list = [torch.zeros_like(tensor) for _ in range(self.world_size)]
+        dist.all_gather(tensor_list, tensor)
+        return torch.cat(tensor_list, dim=0)
+
+    def reduce_dict(self, metrics: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Reduce a dictionary of metrics across all processes"""
+        if not self.is_distributed:
+            return metrics
+
+        reduced = {}
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                reduced[key] = self.all_reduce(value) / self.world_size
+            else:
+                reduced[key] = value
+
+        return reduced
 
     def _build_backbone(self) -> dummyLightning:
         layers = []
@@ -499,6 +604,49 @@ class FinalPipeline(dummyLightning):
 
         # Build sequences
         self.train_dataset, self.val_dataset = self._build_sequences(df, seq_len)
+
+    def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
+        """Create dataloader with DDP support via DistributedSampler"""
+        from torch.utils.data import DataLoader
+
+        if self.is_distributed:
+            # Use DistributedSampler for DDP
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=shuffle,
+                drop_last=drop_last
+            )
+            # When using DistributedSampler, shuffle must be False in DataLoader
+            dataloader = DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                sampler=sampler,
+                num_workers=self.config.num_workers,
+                pin_memory=True,
+                drop_last=drop_last
+            )
+        else:
+            # Standard DataLoader for non-distributed training
+            dataloader = DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=shuffle,
+                num_workers=self.config.num_workers,
+                pin_memory=True,
+                drop_last=drop_last
+            )
+
+        return dataloader
+
+    @property
+    def train_dataloader(self):
+        return self.get_dataloader(self.train_dataset, shuffle=True)
+
+    @property
+    def val_dataloader(self):
+        return self.get_dataloader(self.val_dataset, shuffle=False)
 
     def _compute_features(self, df: pl.DataFrame) -> pl.DataFrame:
         """Compute all feature types"""
@@ -797,10 +945,11 @@ class FinalPipeline(dummyLightning):
 
         return targets
 
-    def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor):
         """Quantile loss with sided weighting"""
 
-        quantiles = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=pred.device)
+        quantiles = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9],
+                                 device=pred.device)
 
         losses = []
         for i, q in enumerate(quantiles):
@@ -824,11 +973,11 @@ class FinalPipelineConfig:
 
     # Model architecture
     hidden_dim: int = 256
-    intermediate_dim: int = 512
+    intermediate_ratio: float = 2.
     num_layers: int = 6
     num_heads: int = 8
-    head_dim: int = 32
-    quant_bins: int = 256
+    attn_ratio: float = 1.
+    
     max_freq: float = 10000.
 
     # Training
@@ -841,6 +990,7 @@ class FinalPipelineConfig:
     # Data
     seq_len: int = 256
     train_ratio: float = 0.9
+    quant_bins: int = 256
     max_cents: int = 64
     embed_dim: int = 256
 
@@ -853,12 +1003,65 @@ class FinalPipelineConfig:
 
     debug_data: bool = False
 
+    # DDP settings
+    use_ddp: bool = False
+    ddp_backend: str = 'nccl'
+    ddp_find_unused_parameters: bool = False
+    ddp_static_graph: bool = False
+    master_addr: str = 'localhost'
+    master_port: str = '12355'
+
+    debug_ddp: bool = False
+    debug_model: bool = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.debug_model:
+            self.hidden_dim //= 4
+            self.num_layers //= 2
+            self.embed_dim //= 2
+
+        self.intermediate_dim = int(self.hidden_dim * self.intermediate_ratio)
+        self.head_dim = int(self.hidden_dim * self.attn_ratio / self.num_heads)
+
 
 if __name__ == "__main__":
+    import sys
+
+    # Check if running with torchrun
+    use_ddp = 'RANK' in os.environ or '--use_ddp' in sys.argv
+
     config = FinalPipelineConfig(
         debug_data=True,
+        use_ddp=use_ddp,
+        debug_ddp=True,
+        debug_model=True,
     )
     pipeline = FinalPipeline(config)
+
+    if config.use_ddp:
+        pipeline.setup_ddp()
+        if pipeline.is_main_process():
+            print(f"Running DDP training on {pipeline.world_size} GPUs")
+            print(f"Rank: {pipeline.rank}, Local Rank: {pipeline.local_rank}")
+
+    # Prepare data (only log from main process)
+    if not config.use_ddp or pipeline.is_main_process():
+        print("Preparing data...")
     pipeline.prepare_data()
+
+    # Synchronize after data preparation
+    if config.use_ddp:
+        pipeline.barrier()
+
+    # Train
+    if not config.use_ddp or pipeline.is_main_process():
+        print("Starting training...")
     pipeline.fit()
-    breakpoint()
+
+    # Cleanup
+    if config.use_ddp:
+        pipeline.cleanup_ddp()
+
+    if not config.use_ddp or pipeline.is_main_process():
+        breakpoint()

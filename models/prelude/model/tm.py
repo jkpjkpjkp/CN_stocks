@@ -4,6 +4,7 @@ from torch.nn import functional as F, Module
 from einops import rearrange
 from .main import dummyLightning
 
+
 def apply_rotary_emb(x, cos, sin):
     l = x.shape[-2]
     d = x.shape[-1] // 2
@@ -13,6 +14,7 @@ def apply_rotary_emb(x, cos, sin):
     out = torch.cat([y1, y2], -1)  # re-assemble
     out = out.to(x.dtype)
     return out
+
 
 class Rope(nn.Module):
     def __init__(self, config):
@@ -32,6 +34,7 @@ class Rope(nn.Module):
 
     def forward(self, x):
         return apply_rotary_emb(x, self.cos, self.sin)
+
 
 class mha(Module):
     def __init__(self, config):
@@ -68,6 +71,7 @@ class mha(Module):
         y = F.silu(y)
         return y
 
+
 class decoderLayer(Module):
     def __init__(self, config):
         super().__init__()
@@ -86,6 +90,7 @@ class decoderLayer(Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.l2(F.silu(self.l1(self.norm2(x))))
         return x
+
 
 class tm(dummyLightning):
     def __init__(self, config):
