@@ -274,33 +274,6 @@ class CentQuantizeEncoder(dummyLightning):
         return self.embedding(tokens)
 
 
-class CNNEncoder(dummyLightning):
-    """CNN encoder for K-line graph images"""
-
-    def __init__(self, config, embed_dim: int = 128):
-        super().__init__(config)
-        # Input: 180x96 RGB images
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),  # 90x48
-            nn.BatchNorm2d(32),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 45x24
-            nn.BatchNorm2d(64),
-            nn.SiLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 22x12
-            nn.BatchNorm2d(128),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),  # 4x4x128
-        )
-        self.fc = nn.Linear(4 * 4 * 128, embed_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, 3, 96, 180) - RGB images"""
-        features = self.conv_layers(x)
-        features = features.view(features.size(0), -1)
-        return self.fc(features)
-
-
 class SinEncoder(nn.Module):
     """Sinusoidal encoding for continuous values"""
 
