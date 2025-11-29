@@ -288,30 +288,26 @@ class MultiEncoder(dummyLightning):
 
         # Flatten for processing
         x_flat = x.view(-1, feat_dim)
-        events_flat = events.view(-1, 3) if events is not None else None
-
         # Apply different encodings to different features
         embeddings = []
 
         # Quantize encoding (use first feature)
         # TODO: use more features
-        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles,
-                                          events_flat)
+        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles)
         embeddings.append(quant_emb)
 
         # Cent quantization (use return features)
-        cent_emb = self.cent_encoder((x_flat[:, 2:3] * 100).long(),  # to cents
-                                     events_flat)
+        cent_emb = self.cent_encoder((x_flat[:, 2:3] * 100).long())
         embeddings.append(cent_emb)
 
         # Sin encoding (use all features)
-        sin_emb = self.sin_encoder(x_flat, events_flat)
+        sin_emb = self.sin_encoder(x_flat)
         embeddings.append(sin_emb)
 
         # Combine embeddings - all should have shape (batch_size * seq_len,
         #                                             hidden_dim)
 
-        ## TODO: event tokens should be inserted here and here only.
+        # TODO: event tokens should be inserted here and here only.
 
 
 
@@ -509,7 +505,8 @@ class FinalPipeline(dummyLightning):
             df = pl.scan_parquet(str(path))
             n = self.config.debug_data if isinstance(self.config.debug_data,
                                                      int) else 5
-            ids = df.select('id').unique().collect().sample(n)['id']
+            df = df.head(n * 300 * 20 * 240)
+            ids = df.select('id').unique().head(n).collect()['id']
             df = df.filter(pl.col('id').is_in(ids)).collect()
         else:
             df = pl.read_parquet(str(path))
