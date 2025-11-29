@@ -1,10 +1,11 @@
 import torch
 from torch.nn import Module
 from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
 import mlflow
 import random
 from datetime import timedelta
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, ProgressColumn, Task, TimeRemainingColumn
+from rich.progress import Progress, TextColumn, BarColumn, ProgressColumn, Task
 from rich.text import Text
 
 
@@ -82,8 +83,8 @@ class dummyLightning(Module):
     def training_dataloader(self):
         return DataLoader(
             self.train_dataset,
-            batch_size=self.config.batch_size,
-            num_workers=self.config.num_workers,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
             shuffle=True,
         )
 
@@ -91,13 +92,13 @@ class dummyLightning(Module):
     def validation_dataloader(self):
         return DataLoader(
             self.val_dataset,
-            batch_size=self.config.batch_size,
-            num_workers=self.config.num_workers,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
         )
 
     def optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, step / (1e-10 + self.config.warmup_steps)))
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, step / (1e-10 + self.warmup_steps)))
         return {'optimizer': optimizer, 'scheduler': scheduler}
 
     def optimizer_step(self):
@@ -127,9 +128,11 @@ class dummyLightning(Module):
         for name, param in self.named_parameters():
             if name[-5:] == '.bias':
                 param.data.zero_()
-        self.forward = torch.autocast(device_type=self.config.device, dtype=torch.bfloat16)(torch.compile(self.forward))
+        self.forward = torch.autocast(device_type=self.device, dtype=torch.bfloat16)(torch.compile(self.forward))
 
-    def _iteration(self, dataloader, progress, epoch, num_epochs, train=True):
+    def _iteration(self, dataloader, progress, epoch):
+        train = self.is_train
+        num_epochs = self.epochs
         if train:
             self.train()
         else:
@@ -146,11 +149,11 @@ class dummyLightning(Module):
 
         for batch_idx, batch in enumerate(dataloader):
             if isinstance(batch, (list, tuple)):
-                batch = [item.to(self.config.device) for item in batch]
+                batch = [item.to(self.device) for item in batch]
             elif isinstance(batch, dict):
-                batch = {k: v.to(self.config.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device) for k, v in batch.items()}
             else:
-                batch = batch.to(self.config.device)
+                batch = batch.to(self.device)
 
             self.optimizer.zero_grad()
             outputs = self.step(batch)
@@ -158,7 +161,7 @@ class dummyLightning(Module):
 
             if train:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.parameters(), self.config.grad_clip)
+                clip_grad_norm_(self.parameters(), self.grad_clip)
                 self.optimizer_step()
 
             # Track loss for epoch average
@@ -179,38 +182,38 @@ class dummyLightning(Module):
 
     def fit(self):
         mlflow.set_experiment(self.__class__.__name__)
-        self.to(self.config.device)
+        self.to(self.device)
         self.activate()
         torch.set_float32_matmul_precision('medium')
 
-        train_dataloader = self.train_dataloader
-        val_dataloader = self.val_dataloader
+        td = self.train_dataloader
+        vd = self.val_dataloader
 
         best_val_loss = float('inf')
 
         self.global_step = 0
         progress = create_progress_bar()
         with progress:
-            for epoch in range(self.config.epochs):
+            for epoch in range(self.epochs):
                 self.prog_bar_metrics = {}
-                train_epoch_loss = self._iteration(train_dataloader, progress, epoch, self.config.epochs, train=True)
+                self.is_train = True
+                train_epoch_loss = self._iteration(td, progress, epoch)
+                self.log('epoch_loss', train_epoch_loss)
                 self.prog_bar_metrics = {}
-                val_epoch_loss = self._iteration(val_dataloader, progress, epoch, self.config.epochs, train=False)
-
-                self.log('train/epoch_loss', train_epoch_loss, prog_bar=False)
-                self.log('val/epoch_loss', val_epoch_loss, prog_bar=False)
+                self.is_train = False
+                val_epoch_loss = self._iteration(vd, progress, epoch)
+                self.log('epoch_loss', val_epoch_loss)
 
                 if val_epoch_loss < best_val_loss:
                     best_val_loss = val_epoch_loss
                     self.save_checkpoint(f'./.checkpoints/{self.__class__.__name__}/_epoch={epoch}_step={self.global_step}_loss={val_epoch_loss:.4f}.pt', epoch, val_epoch_loss, train_epoch_loss)
 
-                progress.console.print(f"Epoch {epoch + 1}/{self.config.epochs} completed - Train Loss: {train_epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}")
+                progress.console.print(f"Epoch {epoch + 1}/{self.epochs} completed - Train Loss: {train_epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}")
 
-    def log(self, name, value, prog_bar=True, logger=True):
-        if logger:
-            mlflow.log_metric(name, value, step=self.global_step)
-        if prog_bar:
-            self.prog_bar_metrics[name] = value
+    def log(self, name, value):
+        name = 'train' if self.is_train else 'val' + '/' + name
+        mlflow.log_metric(name, value, step=self.global_step)
+        self.prog_bar_metrics[name] = value
 
     def save_checkpoint(self, path, epoch, val_epoch_loss, train_epoch_loss):
         import os

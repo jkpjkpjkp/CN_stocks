@@ -507,7 +507,7 @@ class FinalPipeline(dummyLightning):
                                                      int) else 5
             df = df.head(n * 300 * 20 * 240)
             ids = df.select('id').unique().head(n).collect()['id']
-            df = df.filter(pl.col('id').is_in(ids)).collect()
+            df = df.filter(pl.col('id').is_in(ids.implode())).collect()
         else:
             df = pl.read_parquet(str(path))
         df = df.sort(['id', 'datetime'])
@@ -709,13 +709,6 @@ class FinalPipeline(dummyLightning):
         - Positions seq_len//2 to seq_len: each predicts all horizons
         """
 
-        feature_cols = [
-            'close', 'close_norm', 'close_baseline_norm', 'ret_1min', 'ret_30min',
-            'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio', 'ret_2day_ratio',
-            'close_open_ratio', 'high_open_ratio', 'low_open_ratio', 'high_low_ratio',
-            'volume', 'volume_norm'
-        ]
-
         event_cols = ['is_lunch', 'is_dinner', 'is_skipped_day']
 
         # Compute time-normalized values (cross-stock normalized per timestep)
@@ -740,6 +733,13 @@ class FinalPipeline(dummyLightning):
         val_stock_targets = {}
         val_stock_events = {}
 
+        cols = [
+            'close', 'close_norm', 'close_baseline_norm', 'ret_1min',
+            'ret_30min', 'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio',
+            'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
+            'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
+        ]
+
         # TODO: align for cross attention
         for stock_id in df['id'].unique():
             stock_df = df.filter(pl.col('id') == stock_id).sort('datetime')
@@ -747,7 +747,7 @@ class FinalPipeline(dummyLightning):
             if len(stock_df) <= seq_len + 1:
                 continue
 
-            features = stock_df.select(feature_cols).to_numpy().astype(np.float32)
+            features = stock_df.select(cols).to_numpy().astype(np.float32)
             events = stock_df.select(event_cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close'].to_numpy().astype(np.float32)
@@ -836,6 +836,11 @@ class FinalPipeline(dummyLightning):
             0.25 * losses['nll'] +
             0.25 * losses['quantile']
         )
+
+        self.log('quantized_loss', losses['quantized'])
+        self.log('mean_loss', losses['mean'])
+        self.log('nll_loss', losses['nll'])
+        self.log('quantile_loss', losses['quantile'])
 
         return {
             'loss': total_loss,
