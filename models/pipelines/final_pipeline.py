@@ -632,14 +632,14 @@ class FinalPipeline(dummyLightning):
 
         df = df.lazy()\
                .filter(pl.col('id').is_in(baseline_stats['id'].implode()))\
-               .join(baseline_stats, on='id', how='left')
+               .join(baseline_stats.lazy(), on='id', how='left')
 
         # normalized features
-        df = df.with_columns([
+        df = df.with_columns(
             ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-8)).alias('close_norm'),
             ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
             (pl.col('close') / (pl.col('per_stock_mean_close') + 1e-8)).alias('close_baseline_norm')
-        ])
+        ).collect()
 
         return df
 

@@ -173,12 +173,6 @@ class dummyLightning(Module):
                 self.log('loss', loss.item())
 
             self.global_step += 1
-
-            # Update progress bar with current metrics
-            # dirty code
-            if batch_idx + 1 == len(dataloader):
-                epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
-                self.log('loss', epoch_avg_loss)
             progress.update(task, advance=1, metrics=self.prog_bar_metrics)
         epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
         return epoch_avg_loss
@@ -229,13 +223,15 @@ class dummyLightning(Module):
             'optimizer_state_dict': self.optimizer.state_dict(),
             'val_epoch_loss': val_epoch_loss,
             'train_epoch_loss': train_epoch_loss,
+            'config': self.config,
         }, path)
 
     @classmethod
     def load_checkpoint(cls, path):
         checkpoint = torch.load(path)
-        model = cls.load_state_dict(checkpoint['model_state_dict'])
-        model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        config = checkpoint['config']
+        model = cls(config)
+        model.load_state_dict(checkpoint['model_state_dict'])
         model.global_step = checkpoint['global_step']
         return model
 
