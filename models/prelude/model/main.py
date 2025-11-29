@@ -74,9 +74,9 @@ class dummyLightning(Module):
 
     def __getattr__(self, name):
         try:
-            return self.__getattr__(name)
+            return super().__getattr__(name)
         except AttributeError:
-            return self.config.__getattr__(name)
+            return getattr(self.config, name)
 
     @property
     def training_dataloader(self):

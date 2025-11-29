@@ -200,11 +200,7 @@ class TransformerBlock(dummyLightning):
 class PercentileEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.num_bins + 3, config.embed_dim)
-        # Add 3 special tokens: lunch, dinner, skipped_day
-        self.lunch_token = config.num_bins
-        self.dinner_token = config.num_bins + 1
-        self.skipped_token = config.num_bins + 2
+        self.embedding = nn.Embedding(config.num_bins, config.embed_dim)
 
     def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
         # x: (batch, 1) - single feature values
@@ -228,28 +224,13 @@ class CentQuantizeEncoder(dummyLightning):
         self.dinner_token = 2 * config.max_cents + 3
         self.skipped_token = 2 * config.max_cents + 4
 
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None):
+    def forward(self, x):
         """Convert cent differences to tokens"""
         x = x.squeeze(-1)
         tokens = torch.clamp(x, -self.max_cents-1,
                              self.max_cents+1
                              ) + self.max_cents + 1
         tokens = torch.where(torch.isnan(x), torch.zeros_like(tokens), tokens)
-
-        # Override with special tokens if events present
-        if events is not None:
-            lunch_mask = events[:, 0].bool()
-            dinner_mask = events[:, 1].bool()
-            skipped_mask = events[:, 2].bool()
-
-            # Priority: skipped_day > lunch > dinner (no dinner when day skipped)
-            tokens = torch.where(dinner_mask & ~skipped_mask,
-                                torch.full_like(tokens, self.dinner_token), tokens)
-            tokens = torch.where(lunch_mask & ~skipped_mask,
-                                torch.full_like(tokens, self.lunch_token), tokens)
-            tokens = torch.where(skipped_mask,
-                                torch.full_like(tokens, self.skipped_token), tokens)
-
         return self.embedding(tokens)
 
 
@@ -262,14 +243,11 @@ class SinEncoder(nn.Module):
         self.embed_dim = config.embed_dim
         self.max_freq = config.max_freq
 
-        # Create frequency embeddings
-        freqs = torch.exp(torch.linspace(0, np.log(self.max_freq), self.embed_dim // 2))
+        freqs = torch.exp(torch.linspace(0, np.log(self.max_freq),
+                                         self.embed_dim // 2))
         self.register_buffer('freqs', freqs)
 
-        # Special token embeddings
-        self.special_embeddings = nn.Embedding(3, config.embed_dim)  # lunch, dinner, skipped_day
-
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, features), events: (batch, 3)"""
         # Take the mean across feature dimension for sinusoidal encoding
         x_mean = x.mean(dim=-1, keepdim=True)  # (batch, 1)
@@ -281,25 +259,6 @@ class SinEncoder(nn.Module):
         # Interleave sin and cos
         emb = torch.stack([sin_emb, cos_emb], dim=-1).flatten(start_dim=-2)
         emb = emb[..., :self.embed_dim]
-
-        # Override with special tokens if events present
-        if events is not None:
-            lunch_mask = events[:, 0].bool()
-            dinner_mask = events[:, 1].bool()
-            skipped_mask = events[:, 2].bool()
-
-            # Create token indices (0=lunch, 1=dinner, 2=skipped_day)
-            has_event = lunch_mask | dinner_mask | skipped_mask
-            token_idx = torch.zeros(events.shape[0], dtype=torch.long, device=events.device)
-
-            # Priority: skipped_day > lunch > dinner (no dinner when day skipped)
-            token_idx = torch.where(dinner_mask & ~skipped_mask, torch.ones_like(token_idx), token_idx)
-            token_idx = torch.where(lunch_mask & ~skipped_mask, torch.zeros_like(token_idx), token_idx)
-            token_idx = torch.where(skipped_mask, torch.full_like(token_idx, 2), token_idx)
-
-            special_emb = self.special_embeddings(token_idx)
-            emb = torch.where(has_event.unsqueeze(-1), special_emb, emb)
-
         return emb
 
 
@@ -314,7 +273,6 @@ class MultiEncoder(dummyLightning):
         # Individual encoders
         self.quantize_encoder = PercentileEncoder(config)
         self.cent_encoder = CentQuantizeEncoder(config)
-        self.cnn_encoder = CNNEncoder(config)
         self.sin_encoder = SinEncoder(config)
 
         # Combine different encodings
@@ -353,7 +311,6 @@ class MultiEncoder(dummyLightning):
         # Combine embeddings - all should have shape (batch_size * seq_len,
         #                                             hidden_dim)
 
-
         ## TODO: event tokens should be inserted here and here only.
 
 
@@ -383,10 +340,10 @@ class MultiReadout(dummyLightning):
         self.quantile_head = nn.Linear(config.hidden_dim,
                                        config.num_quantiles*self.num_horizons)
 
-    def forward(self, x: torch.Tensor, target_type='mean') -> torch.Tensor:
+    def forward(self, x: torch.Tensor, target_type='mean'):
         """
         x: (batch, seq_len, hidden_dim)
-        returns: (batch, seq_len, num_horizons, -1)
+        returns: (batch, seq_len, num_horizons, ...)
                  predictions for each horizon
         """
         batch_size, seq_len, _ = x.shape
@@ -401,16 +358,13 @@ class MultiReadout(dummyLightning):
             return out.view(batch_size, seq_len, self.num_horizons,
                             self.num_cents)
         elif target_type == 'mean':
-            return self.mean_head(x).unsqueeze(-1)
-        elif target_type == 'mean_var':
-            mean = self.mean_head(x).unsqueeze(-1)
-            var = F.softplus(self.variance_head(x)).unsqueeze(-1)
-            return torch.stack((mean, var), dim=-1)
+            return self.mean_head(x)
+        elif target_type == 'var':
+            return F.softplus(self.variance_head(x))
         elif target_type == 'quantile':
             out = self.quantile_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
                             self.num_quantiles)
-        raise ValueError(f"Unknown target_type: {target_type}")
 
 
 class FinalPipeline(dummyLightning):
@@ -436,7 +390,8 @@ class FinalPipeline(dummyLightning):
         self.huber_loss = nn.HuberLoss()
         self.mse_loss = nn.MSELoss()
 
-    def setup_ddp(self, rank: Optional[int] = None, world_size: Optional[int] = None):
+    def setup_ddp(self, rank: Optional[int] = None,
+                  world_size: Optional[int] = None):
         """Initialize DDP from environment or provided rank/world_size"""
         if not self.config.use_ddp:
             return
@@ -552,7 +507,9 @@ class FinalPipeline(dummyLightning):
 
         if self.config.debug_data:
             df = pl.scan_parquet(str(path))
-            ids = df.select('id').unique().collect().sample(5)['id'].to_list()
+            n = self.config.debug_data if isinstance(self.config.debug_data,
+                                                     int) else 5
+            ids = df.select('id').unique().collect().sample(n)['id']
             df = df.filter(pl.col('id').is_in(ids)).collect()
         else:
             df = pl.read_parquet(str(path))
@@ -664,10 +621,31 @@ class FinalPipeline(dummyLightning):
 
         df = df.join(stats, on='id')
 
+        # Compute 2010-2020 average price per stock for normalization
+        # Filter for dates in 2010-2020 range
+        year_2010 = pl.datetime(2010, 1, 1)
+        year_2021 = pl.datetime(2021, 1, 1)
+
+        baseline_stats = df.filter(
+            (pl.col('datetime') >= year_2010) &
+            (pl.col('datetime') < year_2021)
+        ).group_by('id').agg([
+            pl.col('close').mean().alias('baseline_mean_close')
+        ])
+
+        df = df.join(baseline_stats, on='id', how='left')
+
+        # Fill null baseline_mean_close (for stocks without data in 2010-2020) with overall mean
+        df = df.with_columns([
+            pl.col('baseline_mean_close').fill_null(pl.col('mean_close'))
+        ])
+
         # normalized features
         df = df.with_columns([
             ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-6)).alias('close_norm'),
-            ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-6)).alias('volume_norm')
+            ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-6)).alias('volume_norm'),
+            # Baseline normalization: divide by 2010-2020 average (no subtraction)
+            (pl.col('close') / (pl.col('baseline_mean_close') + 1e-6)).alias('close_baseline_norm')
         ])
 
         return df
@@ -736,7 +714,7 @@ class FinalPipeline(dummyLightning):
         """
 
         feature_cols = [
-            'close', 'close_norm', 'ret_1min', 'ret_30min',
+            'close', 'close_norm', 'close_baseline_norm', 'ret_1min', 'ret_30min',
             'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio', 'ret_2day_ratio',
             'close_open_ratio', 'high_open_ratio', 'low_open_ratio', 'high_low_ratio',
             'volume', 'volume_norm'
@@ -805,10 +783,7 @@ class FinalPipeline(dummyLightning):
 
         return train_dataset, val_dataset
 
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None,
-                target_type: str = 'mean') -> torch.Tensor:
-        """Forward pass through the pipeline"""
-
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None):
         encoded = self.encoder(x, events)
         features = self.backbone(encoded)
         return features
@@ -822,12 +797,10 @@ class FinalPipeline(dummyLightning):
         seq_len = x.shape[1]
         losses = {}
 
-        features = self.forward(x, events)
+        features = self.forward(x, events)[:, seq_len//2:, :]
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
         pred_quantized = self.readout(features, 'quantized')  # (batch, seq_len, num_horizons, num_bins)
-        pred_quantized = pred_quantized[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, num_bins)
-
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
@@ -841,23 +814,19 @@ class FinalPipeline(dummyLightning):
 
         # Mean prediction loss (Huber)
         pred_mean = self.readout(features, 'mean')  # (batch, seq_len, num_horizons, 1)
-        pred_mean = pred_mean[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, 1)
-        losses['mean'] = self.huber_loss(pred_mean.squeeze(-1), y)
+        losses['mean'] = self.huber_loss(pred_mean, y)
 
         # Mean + Variance prediction loss (NLL)
-        pred_mean_var = self.readout(features, 'mean_var')  # (batch, seq_len, num_horizons, 2)
-        pred_mean_var = pred_mean_var[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, 2)
-        pred_mean_nll = pred_mean_var[..., 0]  # (batch, pred_len, num_horizons)
-        pred_var = pred_mean_var[..., 1] + 1e-6  # (batch, pred_len, num_horizons)
+        pred_var = self.readout(features, 'var')  # (batch, seq_len, num_horizons, 2)
+        pred_var += 1e-8  # (batch, pred_len, num_horizons)
         # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
-        nll = (torch.log(2 * torch.pi * pred_var) + (y - pred_mean_nll) ** 2 / pred_var) / 2
+        nll = 1/2 * (torch.log(2 * torch.pi * pred_var) +
+                     (y - pred_mean) ** 2 / pred_var)
         losses['nll'] = nll.mean()
 
         # Quantile prediction loss
-        pred_quantiles = self.readout(features, 'quantile')  # (batch, seq_len, num_horizons, 5)
-        pred_quantiles = pred_quantiles[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, 5)
-        quantile_targets = self._compute_quantile_targets(y)  # (batch, pred_len, num_horizons, 5)
-        losses['quantile'] = self._quantile_loss(pred_quantiles, quantile_targets)
+        pred_quantiles = self.readout(features, 'quantile')
+        losses['quantile'] = self._quantile_loss(pred_quantiles, y)
 
         assert (
             losses['quantized'] >= 0 and
@@ -872,13 +841,6 @@ class FinalPipeline(dummyLightning):
             0.25 * losses['quantile']
         )
 
-        # Check for NaN values and report which component is problematic
-        if torch.isnan(total_loss):
-            for name, loss_val in losses.items():
-                if torch.isnan(loss_val):
-                    raise ValueError(f"NaN detected in {name} loss: {loss_val.item()}")
-            raise ValueError(f"NaN in total loss but not in components: {total_loss.item()}")
-
         return {
             'loss': total_loss,
             'quantized_loss': losses['quantized'],
@@ -887,47 +849,28 @@ class FinalPipeline(dummyLightning):
             'quantile_loss': losses['quantile']
         }
 
-    def _compute_quantile_targets(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Compute quantile targets for training.
-
-        y: (batch, pred_len, num_horizons) - targets for multiple positions and horizons
-        returns: (batch, pred_len, num_horizons, 5) - quantile targets
-        """
-        # Compute empirical quantiles from training data (flatten all values)
-        # Convert to float32 for numpy compatibility
-        y_np = y.detach().cpu().float().numpy().flatten()
-        quantiles = np.quantile(y_np, [0.1, 0.25, 0.5, 0.75, 0.9])
-
-        # Create targets - expand to (batch, pred_len, num_horizons, 5)
-        batch_size, pred_len, num_horizons = y.shape
-        targets = torch.zeros(batch_size, pred_len, num_horizons, 5, device=y.device, dtype=y.dtype)
-
-        for i, q in enumerate(quantiles):
-            targets[..., i] = torch.where(y >= q, torch.ones_like(y), torch.zeros_like(y))
-
-        return targets
-
     def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor):
         """Quantile loss with sided weighting"""
 
         quantiles = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9],
                                  device=pred.device)
+        quantiles = quantiles.view(1, 1, 1, -1)
+        quantiles = quantiles.expand(pred.shape)
 
-        losses = []
-        for i, q in enumerate(quantiles):
-            # pred and target are (batch, pred_len, num_horizons, 5)
-            # We want the i-th quantile dimension (last dimension)
-            error = target[..., i] - pred[..., i]
+        weight = torch.where(
+            pred > target,
+            quantiles,
+            1 - quantiles
+        )
 
-            # Sided weighting
-            weight = torch.where(error > 0,
-                                 torch.full_like(error, q),
-                                 torch.full_like(error, 1 - q))
+        delta = torch.abs(pred - target)
+        huber = torch.where(
+            delta <= 1,
+            0.5 * delta ** 2,
+            delta - 0.5
+        )
 
-            losses.append((weight * torch.abs(error)).mean())
-
-        return torch.stack(losses).mean()
+        return torch.mean(huber * weight)
 
 
 @dataclass
@@ -957,6 +900,9 @@ class FinalPipelineConfig:
     max_cents: int = 64
     embed_dim: int = 256
 
+    num_horizons: int = 4
+    num_quantiles: int = 5
+
     # Device
     device: str = 'cuda'
     num_workers: int = 4
@@ -964,7 +910,7 @@ class FinalPipelineConfig:
     # Muon optimizer for 2D parameters
     use_muon: bool = True
 
-    debug_data: bool = False
+    debug_data: bool | int = False
 
     # DDP settings
     use_ddp: bool = False
