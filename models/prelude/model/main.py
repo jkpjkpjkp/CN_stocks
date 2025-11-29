@@ -211,7 +211,7 @@ class dummyLightning(Module):
                 progress.console.print(f"Epoch {epoch + 1}/{self.epochs} completed - Train Loss: {train_epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}")
 
     def log(self, name, value):
-        name = 'train' if self.is_train else 'val' + '/' + name
+        name = ('train' if self.is_train else 'val') + '/' + name
         mlflow.log_metric(name, value, step=self.global_step)
         self.prog_bar_metrics[name] = value
 
