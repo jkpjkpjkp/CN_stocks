@@ -238,3 +238,8 @@ class dummyLightning(Module):
         model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         model.global_step = checkpoint['global_step']
         return model
+
+    def inspect_weight(self):
+        """Print the mean and std of each tensor"""
+        for name, param in self.named_parameters():
+            print(f"{name}: mean={param.mean().item():.4f}, std={param.std().item():.4f}")
