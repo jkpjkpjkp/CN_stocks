@@ -11,6 +11,7 @@ dependencies = [
     "matplotlib>=3.10.7",
     "maturin>=1.10.1",
     "mlflow>=3.5.1",
+    "muon-optimizer",
     "numba>=0.62.1",
     "optuna>=4.6.0",
     "polars-u64-idx>=1.33.1",
@@ -24,3 +25,6 @@ dependencies = [
     "transformers>=4.57.1",
     "wandb>=0.22.2",
 ]
+
+[tool.uv.sources]
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }

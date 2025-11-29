@@ -5,7 +5,7 @@ This pipeline implements:
 1. Multiple encoding strategies:
    - Quantize: 1/256 percentile-based token encoding
    - Cent quantize: cent-level delta encoding for small values
-   - CNN: Image encoding over K-line graphs (from draw.py)
+   - CNN: Image encoding over K-line graphs (from draw.py) (TODO)
    - Sin encoding: Sinusoidal encoding for continuous values
 
 2. Multiple preprocessing approaches:
@@ -14,11 +14,6 @@ This pipeline implements:
    - Returns at varied time scales (1min, 30min, 6hr, 1day, 2day)
    - Intra-minute relative features (close/open, high/open, etc.)
    - Time-normalized values (cross-stock normalized per timestep)
-
-3. Transformer architecture:
-   - Uses F.scaled_dot_product_attention (modern best practice)
-   - SiLU activation throughout all layers
-   - Multi-head self-attention with residual connections
 
 4. Multiple prediction types and encodings:
    - Quantized predictions (cross-entropy loss)
@@ -34,24 +29,23 @@ This pipeline implements:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import polars as pl
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
-from torch.utils.data import Dataset, DistributedSampler
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 
 from ..prelude.model import dummyLightning
-from .embedding.draw import create_kline_pixel_graph
 from ..prelude.model import Rope
 
 torch.autograd.set_detect_anomaly(True)
 
 
-class EfficientTimeSeriesDataset(Dataset):
+class PriceHistoryDataset(Dataset):
     def __init__(self, stock_data: Dict[str, np.ndarray],
                  stock_targets: Dict[str, np.ndarray],
                  stock_events: Dict[str, np.ndarray],
@@ -91,9 +85,8 @@ class EfficientTimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         stock_id, start_idx = self.index[idx]
-
-        # Slice
         end_idx = start_idx + self.seq_len
+
         features = self.stock_data[stock_id][start_idx:end_idx]
 
         # Get prediction positions' targets (latter half)
@@ -132,13 +125,15 @@ class TransformerBlock(dummyLightning):
         self.head_dim = config.head_dim
 
         attn_dim = self.num_heads * self.head_dim
+        self.attn_dim = attn_dim
         self.q_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
         self.o_proj = nn.Linear(attn_dim, self.hidden_dim, bias=False)
-        self.attn_dim = attn_dim
-
         self.rope = Rope(config)
+        if config.qk_norm:
+            self.q_norm = nn.LayerNorm(attn_dim)
+            self.k_norm = nn.LayerNorm(attn_dim)
 
         self.norm1 = nn.LayerNorm(self.hidden_dim)
         self.norm2 = nn.LayerNorm(self.hidden_dim)
@@ -162,6 +157,9 @@ class TransformerBlock(dummyLightning):
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
+        if config.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         if not (hasattr(self.config, 'use_normal_rope') and
                 self.config.use_normal_rope):
@@ -813,11 +811,11 @@ class FinalPipeline(dummyLightning):
                 val_stock_targets[stock_id] = close[val_mask]
                 val_stock_events[stock_id] = events[val_mask]
 
-        train_dataset = EfficientTimeSeriesDataset(
+        train_dataset = PriceHistoryDataset(
             train_stock_data, train_stock_targets, train_stock_events,
             seq_len, pred_len
         )
-        val_dataset = EfficientTimeSeriesDataset(
+        val_dataset = PriceHistoryDataset(
             val_stock_data, val_stock_targets, val_stock_events,
             seq_len, pred_len
         )
@@ -959,8 +957,8 @@ class FinalPipelineConfig:
     num_layers: int = 6
     num_heads: int = 8
     attn_ratio: float = 1.
-    
     max_freq: float = 10000.
+    qk_norm: bool = False
 
     # Training
     batch_size: int = 512
