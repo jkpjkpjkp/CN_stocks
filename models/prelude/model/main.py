@@ -72,6 +72,12 @@ class dummyLightning(Module):
         super().__init__()
         self.config = config
 
+    def __getattr__(self, name):
+        try:
+            return self.__getattr__(name)
+        except AttributeError:
+            return self.config.__getattr__(name)
+
     @property
     def training_dataloader(self):
         return DataLoader(

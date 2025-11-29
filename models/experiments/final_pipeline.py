@@ -200,38 +200,19 @@ class TransformerBlock(dummyLightning):
 class PercentileEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.quant_bins + 3, config.embed_dim)
+        self.embedding = nn.Embedding(config.num_bins + 3, config.embed_dim)
         # Add 3 special tokens: lunch, dinner, skipped_day
-        self.lunch_token = config.quant_bins
-        self.dinner_token = config.quant_bins + 1
-        self.skipped_token = config.quant_bins + 2
+        self.lunch_token = config.num_bins
+        self.dinner_token = config.num_bins + 1
+        self.skipped_token = config.num_bins + 2
 
-    def forward(self, x: torch.Tensor, quantiles: np.ndarray,
-                events: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
         # x: (batch, 1) - single feature values
         # events: (batch, 3) - binary flags for [lunch, dinner, skipped_day]
         tokens = torch.from_numpy(np.digitize(x.cpu().numpy(), quantiles[1:-1],
                                               right=True)).to(x.device)
         # tokens shape: (batch, 1), squeeze to (batch,) for embedding
         tokens = tokens.squeeze(-1)
-
-        # Override with special tokens if events present
-        if events is not None:
-            lunch_mask = events[:, 0].bool()
-            dinner_mask = events[:, 1].bool()
-            skipped_mask = events[:, 2].bool()
-
-            # Priority: skipped_day > lunch > dinner
-            tokens = torch.where(dinner_mask & ~skipped_mask,
-                                 torch.full_like(tokens, self.dinner_token),
-                                 tokens)
-            tokens = torch.where(lunch_mask & ~skipped_mask,
-                                 torch.full_like(tokens, self.lunch_token),
-                                 tokens)
-            tokens = torch.where(skipped_mask,
-                                 torch.full_like(tokens, self.skipped_token),
-                                 tokens)
-
         result = self.embedding(tokens)
         return result
 
@@ -369,15 +350,17 @@ class MultiEncoder(dummyLightning):
         sin_emb = self.sin_encoder(x_flat, events_flat)
         embeddings.append(sin_emb)
 
-        # CNN encoding (if image data provided)
-        # if image_data is not None:
-        #     cnn_emb = self.cnn_encoder(image_data)
-        #     # Repeat CNN embedding across sequence length
-        #     cnn_emb = cnn_emb.unsqueeze(1).repeat(1, seq_len, 1)
-        #     embeddings.append(cnn_emb.view(-1, self.config.hidden_dim))
-
         # Combine embeddings - all should have shape (batch_size * seq_len,
         #                                             hidden_dim)
+
+
+        ## TODO: event tokens should be inserted here and here only.
+
+
+
+
+
+
         combined = torch.cat(embeddings, dim=-1)
         output = self.combiner(combined)
 
@@ -386,48 +369,48 @@ class MultiEncoder(dummyLightning):
 
 
 class MultiReadout(dummyLightning):
-    """Multiple readout strategies for different prediction types with multi-horizon support"""
+    """Multiple readout strategies and multi-horizons"""
 
     def __init__(self, config):
         super().__init__(config)
 
-        # Prediction horizons: 1min, 30min, 1day (390min), 2day (780min)
-        self.num_horizons = 4
-
-        # Different readout heads - each predicts for all horizons
-        self.quantized_head = nn.Linear(config.hidden_dim, config.quant_bins * self.num_horizons)
-        self.cent_head = nn.Linear(config.hidden_dim, 129 * self.num_horizons)  # -64 to +64 plus special tokens
+        self.quantized_head = nn.Linear(config.hidden_dim,
+                                        config.num_bins * self.num_horizons)
+        self.cent_head = nn.Linear(config.hidden_dim,
+                                   config.num_cents * self.num_horizons)
         self.mean_head = nn.Linear(config.hidden_dim, self.num_horizons)
         self.variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
-        self.quantile_head = nn.Linear(config.hidden_dim, 5 * self.num_horizons)  # 10th, 25th, 50th, 75th, 90th
+        self.quantile_head = nn.Linear(config.hidden_dim,
+                                       config.num_quantiles*self.num_horizons)
 
-    def forward(self, x: torch.Tensor, target_type: str = 'mean') -> torch.Tensor:
+    def forward(self, x: torch.Tensor, target_type='mean') -> torch.Tensor:
         """
         x: (batch, seq_len, hidden_dim)
-        returns: (batch, seq_len, num_horizons, ...) - predictions for each horizon
+        returns: (batch, seq_len, num_horizons, -1)
+                 predictions for each horizon
         """
         batch_size, seq_len, _ = x.shape
-
-        # Convert to float32 to match linear layer weights
         x = x.float()
 
         if target_type == 'quantized':
-            out = self.quantized_head(x)  # (batch, seq_len, quant_bins * num_horizons)
-            return out.view(batch_size, seq_len, self.num_horizons, -1)  # (batch, seq_len, num_horizons, quant_bins)
+            out = self.quantized_head(x)
+            return out.view(batch_size, seq_len, self.num_horizons,
+                            self.num_bins)
         elif target_type == 'cent':
             out = self.cent_head(x)
-            return out.view(batch_size, seq_len, self.num_horizons, -1)
+            return out.view(batch_size, seq_len, self.num_horizons,
+                            self.num_cents)
         elif target_type == 'mean':
-            return self.mean_head(x).unsqueeze(-1)  # (batch, seq_len, num_horizons, 1)
+            return self.mean_head(x).unsqueeze(-1)
         elif target_type == 'mean_var':
-            mean = self.mean_head(x)  # (batch, seq_len, num_horizons)
-            var = F.softplus(self.variance_head(x))  # (batch, seq_len, num_horizons)
-            return torch.stack([mean, var], dim=-1)  # (batch, seq_len, num_horizons, 2)
+            mean = self.mean_head(x).unsqueeze(-1)
+            var = F.softplus(self.variance_head(x)).unsqueeze(-1)
+            return torch.stack((mean, var), dim=-1)
         elif target_type == 'quantile':
-            out = self.quantile_head(x)  # (batch, seq_len, 5 * num_horizons)
-            return out.view(batch_size, seq_len, self.num_horizons, 5)  # (batch, seq_len, num_horizons, 5)
-        else:
-            raise ValueError(f"Unknown target_type: {target_type}")
+            out = self.quantile_head(x)
+            return out.view(batch_size, seq_len, self.num_horizons,
+                            self.num_quantiles)
+        raise ValueError(f"Unknown target_type: {target_type}")
 
 
 class FinalPipeline(dummyLightning):
@@ -560,7 +543,7 @@ class FinalPipeline(dummyLightning):
         return nn.Sequential(*layers)
 
     def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
-                     quant_bins: int = 256, train_frac: float = 0.9):
+                     num_bins: int = 256, train_frac: float = 0.9):
         """Prepare data with all preprocessing strategies"""
 
         if path is None:
@@ -578,7 +561,7 @@ class FinalPipeline(dummyLightning):
         df = self._compute_features(df)
         df = self._detect_trading_gaps(df)  # Add gap detection
         df = self._split_data(df, train_frac)
-        self.quantiles = self._compute_quantiles(df, quant_bins)
+        self.quantiles = self._compute_quantiles(df, num_bins)
 
         self.encoder.quantiles = self.quantiles['close']
 
@@ -689,7 +672,7 @@ class FinalPipeline(dummyLightning):
 
         return df
 
-    def _compute_quantiles(self, df: pl.DataFrame, quant_bins: int) -> Dict[str, np.ndarray]:
+    def _compute_quantiles(self, df: pl.DataFrame, num_bins: int) -> Dict[str, np.ndarray]:
         """Compute quantiles for different features"""
 
         train_df = df.filter(pl.col('is_train'))
@@ -697,7 +680,7 @@ class FinalPipeline(dummyLightning):
         quantiles = {}
         for col in ['close', 'ret_1min', 'ret_30min', 'volume']:
             data = train_df[col].to_numpy()
-            quantiles[col] = np.quantile(data, np.linspace(0, 1, quant_bins + 1))
+            quantiles[col] = np.quantile(data, np.linspace(0, 1, num_bins + 1))
 
         return quantiles
 
@@ -842,17 +825,17 @@ class FinalPipeline(dummyLightning):
         features = self.forward(x, events)
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
-        pred_quantized = self.readout(features, 'quantized')  # (batch, seq_len, num_horizons, quant_bins)
-        pred_quantized = pred_quantized[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, quant_bins)
+        pred_quantized = self.readout(features, 'quantized')  # (batch, seq_len, num_horizons, num_bins)
+        pred_quantized = pred_quantized[:, seq_len//2:, :, :]  # (batch, pred_len, num_horizons, num_bins)
 
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
         quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=y.dtype)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
-        target_quantized = torch.clamp(target_quantized, 0, self.config.quant_bins - 1)
+        target_quantized = torch.clamp(target_quantized, 0, self.config.num_bins - 1)
         losses['quantized'] = self.ce_loss(
-            pred_quantized.reshape(-1, self.config.quant_bins),
+            pred_quantized.reshape(-1, self.config.num_bins),
             target_quantized.reshape(-1)
         )
 
@@ -970,7 +953,7 @@ class FinalPipelineConfig:
     # Data
     seq_len: int = 256
     train_ratio: float = 0.9
-    quant_bins: int = 256
+    num_bins: int = 256
     max_cents: int = 64
     embed_dim: int = 256
 
@@ -1001,8 +984,12 @@ class FinalPipelineConfig:
             self.num_layers //= 2
             self.embed_dim //= 2
 
+        # Model
         self.intermediate_dim = int(self.hidden_dim * self.intermediate_ratio)
         self.head_dim = int(self.hidden_dim * self.attn_ratio / self.num_heads)
+
+        # Data
+        self.num_cents = self.max_cents * 2 + 1
 
 
 if __name__ == "__main__":
