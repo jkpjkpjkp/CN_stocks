@@ -7,6 +7,7 @@ import random
 from datetime import timedelta
 from rich.progress import Progress, TextColumn, BarColumn, ProgressColumn, Task
 from rich.text import Text
+import time
 
 
 class BatchesProcessedColumn(ProgressColumn):
@@ -142,7 +143,7 @@ class dummyLightning(Module):
         epoch_losses = []
 
         task = progress.add_task(
-            f"{'Training' if train else 'Validation'} Epoch {epoch + 1}/{num_epochs}",
+            f"{'Train' if train else 'Val'} {epoch + 1}/{num_epochs}",
             total=len(dataloader),
             metrics={}
         )
