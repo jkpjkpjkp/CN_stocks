@@ -279,7 +279,7 @@ class MultiEncoder(dummyLightning):
         total_dim = config.embed_dim * 3  # 3 encoding types (quant, cent, sin)
         self.combiner = nn.Linear(total_dim, config.hidden_dim)
 
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None, image_data: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         x: (batch, seq_len, features)
         events: (batch, seq_len, 3) - binary flags for [lunch, dinner, skipped_day]
@@ -520,7 +520,7 @@ class FinalPipeline(dummyLightning):
         self.encoder.quantiles = self.quantiles['close']
 
         # Build sequences
-        self.train_dataset, self.val_dataset = self._build_sequences(df, seq_len)
+        self.train_dataset, self.val_dataset = self._bs(df, seq_len)
 
     def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
         """Create dataloader with DDP support via DistributedSampler"""
@@ -626,23 +626,19 @@ class FinalPipeline(dummyLightning):
         baseline_stats = df.filter(
             (pl.col('datetime') >= year_2010) &
             (pl.col('datetime') < year_2021)
-        ).group_by('id').agg([
-            pl.col('close').mean().alias('baseline_mean_close')
-        ])
+        ).group_by('id').agg(
+            per_stock_mean_close=pl.col('close').mean(),
+        )
 
-        df = df.join(baseline_stats, on='id', how='left')
-
-        # Fill null baseline_mean_close (for stocks without data in 2010-2020) with overall mean
-        df = df.with_columns([
-            pl.col('baseline_mean_close').fill_null(pl.col('mean_close'))
-        ])
+        df = df.lazy()\
+               .filter(pl.col('id').is_in(baseline_stats['id'].implode()))\
+               .join(baseline_stats, on='id', how='left')
 
         # normalized features
         df = df.with_columns([
-            ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-6)).alias('close_norm'),
-            ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-6)).alias('volume_norm'),
-            # Baseline normalization: divide by 2010-2020 average (no subtraction)
-            (pl.col('close') / (pl.col('baseline_mean_close') + 1e-6)).alias('close_baseline_norm')
+            ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-8)).alias('close_norm'),
+            ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
+            (pl.col('close') / (pl.col('per_stock_mean_close') + 1e-8)).alias('close_baseline_norm')
         ])
 
         return df
@@ -701,30 +697,27 @@ class FinalPipeline(dummyLightning):
 
         return df
 
-    def _build_sequences(self, df, seq_len) -> Tuple[Dataset, Dataset]:
+    def _bs(self, df, seq_len) -> Tuple[Dataset, Dataset]:
         """
-        Build full sequences of per-stock data.
+        Build sequences.
 
         - Positions 0 to seq_len//2: no prediction
         - Positions seq_len//2 to seq_len: each predicts all horizons
+
+        TODO: events
         """
 
-        event_cols = ['is_lunch', 'is_dinner', 'is_skipped_day']
-
-        # Compute time-normalized values (cross-stock normalized per timestep)
-        time_stats = df.group_by('datetime').agg([
-            pl.col('close').mean().alias('time_mean_close'),
-            pl.col('close').std().alias('time_std_close')
-        ])
+        time_stats = df.group_by('datetime').agg(
+            time_mean_close=pl.col('close').mean(),
+            time_std_close=pl.col('close').std(),
+        )
 
         df = df.join(time_stats, on='datetime')
-        df = df.with_columns([
-            ((pl.col('close') - pl.col('time_mean_close')) / (pl.col('time_std_close') + 1e-6)).alias('close_time_norm')
-        ])
+        df = df.with_columns(
+            close_time_norm=((pl.col('close') - pl.col('time_mean_close'))
+                             / (pl.col('time_std_close') + 1e-8))
+        )
 
-        pred_len = seq_len // 2  # Latter half of sequence
-
-        # Store data per stock to avoid duplication
         train_stock_data = {}
         train_stock_targets = {}
         train_stock_events = {}
@@ -739,6 +732,7 @@ class FinalPipeline(dummyLightning):
             'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
             'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
         ]
+        event_cols = ['is_lunch', 'is_dinner', 'is_skipped_day']
 
         # TODO: align for cross attention
         for stock_id in df['id'].unique():
@@ -768,6 +762,7 @@ class FinalPipeline(dummyLightning):
                 val_stock_targets[stock_id] = close[val_mask]
                 val_stock_events[stock_id] = events[val_mask]
 
+        pred_len = seq_len // 2
         train_dataset = PriceHistoryDataset(
             train_stock_data, train_stock_targets, train_stock_events,
             seq_len, pred_len

@@ -169,13 +169,15 @@ class dummyLightning(Module):
 
             # Log step loss periodically
             if random.randint(0, 9) == 0 or batch_idx == len(dataloader) - 1:
-                self.log(f'{"train" if train else "val"}/loss', loss.item())
+                self.log('loss', loss.item())
 
             self.global_step += 1
+
             # Update progress bar with current metrics
+            # dirty code
             if batch_idx + 1 == len(dataloader):
                 epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
-                self.prog_bar_metrics['train/loss'] = epoch_avg_loss
+                self.log('loss', epoch_avg_loss)
             progress.update(task, advance=1, metrics=self.prog_bar_metrics)
         epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
         return epoch_avg_loss
