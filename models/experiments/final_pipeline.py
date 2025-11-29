@@ -701,13 +701,12 @@ class FinalPipeline(dummyLightning):
 
         return df
 
-    def _build_sequences(self, df: pl.DataFrame, seq_len: int) -> Tuple[Dataset, Dataset]:
+    def _build_sequences(self, df, seq_len) -> Tuple[Dataset, Dataset]:
         """
-        Build efficient sequences that store full data per stock and slice in __getitem__.
+        Build full sequences of per-stock data.
 
-        For a sequence of length seq_len:
-        - Positions 0 to seq_len//2-1: context only, no prediction
-        - Positions seq_len//2 to seq_len-1: each predicts the next timestep
+        - Positions 0 to seq_len//2: no prediction
+        - Positions seq_len//2 to seq_len: each predicts all horizons
         """
 
         feature_cols = [
@@ -853,13 +852,13 @@ class FinalPipeline(dummyLightning):
                                  device=pred.device)
         quantiles = quantiles.view(1, 1, 1, -1)
         quantiles = quantiles.expand(pred.shape)
+        target = target.unsqueeze(-1)
 
         weight = torch.where(
             pred > target,
             quantiles,
             1 - quantiles
         )
-
         delta = torch.abs(pred - target)
         huber = torch.where(
             delta <= 1,
