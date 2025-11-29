@@ -197,7 +197,7 @@ class TransformerBlock(dummyLightning):
         return x
 
 
-class PercentileEncoder(dummyLightning):
+class QuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.embedding = nn.Embedding(config.num_bins, config.embed_dim)
@@ -271,7 +271,7 @@ class MultiEncoder(dummyLightning):
         self.quantiles = quantiles
 
         # Individual encoders
-        self.quantize_encoder = PercentileEncoder(config)
+        self.quantize_encoder = QuantizeEncoder(config)
         self.cent_encoder = CentQuantizeEncoder(config)
         self.sin_encoder = SinEncoder(config)
 

@@ -228,7 +228,7 @@ class dummyLightning(Module):
 
     @classmethod
     def load_checkpoint(cls, path):
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, weights_only=False)
         config = checkpoint['config']
         model = cls(config)
         model.load_state_dict(checkpoint['model_state_dict'])
