@@ -20,7 +20,7 @@ This pipeline implements:
    - Cent-based predictions
    - Mean predictions (Huber loss)
    - Mean + Variance predictions (NLL loss)
-   - Quantile predictions (10th, 25th, 50th, 75th, 90th with sided-weighted loss)
+   - Quantile predictions (10th, 25th, 50th, 75th, 90th with sided loss)
 
 5. Multiple prediction horizons:
    - 1min, 30min, 1day, 2day ahead
@@ -48,21 +48,17 @@ torch.autograd.set_detect_anomaly(True)
 class PriceHistoryDataset(Dataset):
     def __init__(self, stock_data: Dict[str, np.ndarray],
                  stock_targets: Dict[str, np.ndarray],
-                 stock_events: Dict[str, np.ndarray],
                  seq_len: int,
                  pred_len: int):
         """
         Args:
             stock_data: Dict mapping stock_id to full feature array (T, F)
             stock_targets: Dict mapping stock_id to full target array (T,)
-            stock_events: Dict mapping stock_id to event markers (T, 3)
-                         [lunch, dinner, skipped_day]
             seq_len: Sequence length for context
             pred_len: Prediction length
         """
         self.stock_data = stock_data
         self.targets = stock_targets
-        self.stock_events = stock_events
         self.seq_len = seq_len
         self.pred_len = pred_len
 
@@ -107,13 +103,9 @@ class PriceHistoryDataset(Dataset):
                 else:
                     targets[pos_idx, h_idx] = np.nan
 
-        # Get event markers
-        events = self.stock_events[stock_id][start_idx:end_idx]
-
         return (
             torch.from_numpy(features).float(),
             torch.from_numpy(targets).float(),
-            torch.from_numpy(events).float()
         )
 
 
@@ -204,7 +196,6 @@ class QuantizeEncoder(dummyLightning):
 
     def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
         # x: (batch, 1) - single feature values
-        # events: (batch, 3) - binary flags for [lunch, dinner, skipped_day]
         tokens = torch.from_numpy(np.digitize(x.cpu().numpy(), quantiles[1:-1],
                                               right=True)).to(x.device)
         # tokens shape: (batch, 1), squeeze to (batch,) for embedding
@@ -217,12 +208,8 @@ class CentQuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.max_cents = config.max_cents
-        # -max_cents to +max_cents, +-inf, and 3 event tokens
-        self.embedding = nn.Embedding(2 * config.max_cents + 5,
+        self.embedding = nn.Embedding(2 * config.max_cents + 3,
                                       config.embed_dim)
-        self.lunch_token = 2 * config.max_cents + 2
-        self.dinner_token = 2 * config.max_cents + 3
-        self.skipped_token = 2 * config.max_cents + 4
 
     def forward(self, x):
         """Convert cent differences to tokens"""
@@ -248,7 +235,7 @@ class SinEncoder(nn.Module):
         self.register_buffer('freqs', freqs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, features), events: (batch, 3)"""
+        """x: (batch, features)"""
         # Take the mean across feature dimension for sinusoidal encoding
         x_mean = x.mean(dim=-1, keepdim=True)  # (batch, 1)
 
@@ -279,11 +266,8 @@ class MultiEncoder(dummyLightning):
         total_dim = config.embed_dim * 3  # 3 encoding types (quant, cent, sin)
         self.combiner = nn.Linear(total_dim, config.hidden_dim)
 
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        x: (batch, seq_len, features)
-        events: (batch, seq_len, 3) - binary flags for [lunch, dinner, skipped_day]
-        """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (batch, seq_len, features)"""
         batch_size, seq_len, feat_dim = x.shape
 
         # Flatten for processing
@@ -306,13 +290,6 @@ class MultiEncoder(dummyLightning):
 
         # Combine embeddings - all should have shape (batch_size * seq_len,
         #                                             hidden_dim)
-
-        # TODO: event tokens should be inserted here and here only.
-
-
-
-
-
 
         combined = torch.cat(embeddings, dim=-1)
         output = self.combiner(combined)
@@ -667,34 +644,6 @@ class FinalPipeline(dummyLightning):
             pl.col('datetime').diff().over('id').dt.total_seconds().alias('time_gap_seconds')
         ])
 
-        # Initialize event columns
-        df = df.with_columns([
-            pl.lit(0).cast(pl.Int8).alias('is_lunch'),
-            pl.lit(0).cast(pl.Int8).alias('is_dinner'),
-            pl.lit(0).cast(pl.Int8).alias('is_skipped_day')
-        ])
-
-        # Classify gaps:
-        # Lunch: 30 min - 2 hours (1800 - 7200 seconds)
-        # Dinner: 12 - 20 hours (43200 - 72000 seconds) - overnight between trading days
-        # Skipped day: > 20 hours (72000 seconds) - weekends, holidays
-        df = df.with_columns([
-            ((pl.col('time_gap_seconds') >= 1800) &
-             (pl.col('time_gap_seconds') < 7200)).cast(pl.Int8).alias('is_lunch'),
-
-            ((pl.col('time_gap_seconds') >= 43200) &
-             (pl.col('time_gap_seconds') < 72000)).cast(pl.Int8).alias('is_dinner'),
-
-            (pl.col('time_gap_seconds') >= 72000).cast(pl.Int8).alias('is_skipped_day')
-        ])
-
-        # Fill nulls (first row of each stock) with 0
-        df = df.with_columns([
-            pl.col('is_lunch').fill_null(0),
-            pl.col('is_dinner').fill_null(0),
-            pl.col('is_skipped_day').fill_null(0)
-        ])
-
         return df
 
     def _bs(self, df, seq_len) -> Tuple[Dataset, Dataset]:
@@ -703,8 +652,6 @@ class FinalPipeline(dummyLightning):
 
         - Positions 0 to seq_len//2: no prediction
         - Positions seq_len//2 to seq_len: each predicts all horizons
-
-        TODO: events
         """
 
         time_stats = df.group_by('datetime').agg(
@@ -720,11 +667,9 @@ class FinalPipeline(dummyLightning):
 
         train_stock_data = {}
         train_stock_targets = {}
-        train_stock_events = {}
 
         val_stock_data = {}
         val_stock_targets = {}
-        val_stock_events = {}
 
         cols = [
             'close', 'close_norm', 'close_baseline_norm', 'ret_1min',
@@ -732,7 +677,6 @@ class FinalPipeline(dummyLightning):
             'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
             'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
         ]
-        event_cols = ['is_lunch', 'is_dinner', 'is_skipped_day']
 
         # TODO: align for cross attention
         for stock_id in df['id'].unique():
@@ -742,7 +686,6 @@ class FinalPipeline(dummyLightning):
                 continue
 
             features = stock_df.select(cols).to_numpy().astype(np.float32)
-            events = stock_df.select(event_cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close'].to_numpy().astype(np.float32)
 
@@ -754,70 +697,110 @@ class FinalPipeline(dummyLightning):
             if train_mask.sum() > seq_len + 1:
                 train_stock_data[stock_id] = features[train_mask]
                 train_stock_targets[stock_id] = close[train_mask]
-                train_stock_events[stock_id] = events[train_mask]
 
             # Only add to val set if we have enough val data
             if val_mask.sum() > seq_len + 1:
                 val_stock_data[stock_id] = features[val_mask]
                 val_stock_targets[stock_id] = close[val_mask]
-                val_stock_events[stock_id] = events[val_mask]
 
         pred_len = seq_len // 2
         train_dataset = PriceHistoryDataset(
-            train_stock_data, train_stock_targets, train_stock_events,
+            train_stock_data, train_stock_targets,
             seq_len, pred_len
         )
         val_dataset = PriceHistoryDataset(
-            val_stock_data, val_stock_targets, val_stock_events,
+            val_stock_data, val_stock_targets,
             seq_len, pred_len
         )
 
         return train_dataset, val_dataset
 
-    def forward(self, x: torch.Tensor, events: Optional[torch.Tensor] = None):
-        encoded = self.encoder(x, events)
+    def forward(self, x: torch.Tensor):
+        encoded = self.encoder(x)
         features = self.backbone(encoded)
         return features
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
-        x, y, events = batch
+        x, y = batch
         # x: (batch, seq_len, features)
         # y: (batch, pred_len, num_horizons) where pred_len = seq_len // 2
-        # events: (batch, seq_len, 3)
 
         seq_len = x.shape[1]
         losses = {}
+        horizon_names = ['1min', '30min', '1day', '2day']
 
-        features = self.forward(x, events)[:, seq_len//2:, :]
+        features = self.forward(x)[:, seq_len//2:, :]
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
-        pred_quantized = self.readout(features, 'quantized')  # (batch, seq_len, num_horizons, num_bins)
+        pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, num_bins)
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
         quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=y.dtype)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
         target_quantized = torch.clamp(target_quantized, 0, self.config.num_bins - 1)
-        losses['quantized'] = self.ce_loss(
-            pred_quantized.reshape(-1, self.config.num_bins),
-            target_quantized.reshape(-1)
-        )
+
+        if self.config.debug_horizons:
+            # Compute per-horizon losses
+            losses['quantized'] = 0.0
+            for h_idx, h_name in enumerate(horizon_names):
+                h_loss = self.ce_loss(
+                    pred_quantized[:, :, h_idx, :].reshape(-1, self.config.num_bins),
+                    target_quantized[:, :, h_idx].reshape(-1)
+                )
+                losses[f'quantized_{h_name}'] = h_loss
+                losses['quantized'] += h_loss / len(horizon_names)
+        else:
+            losses['quantized'] = self.ce_loss(
+                pred_quantized.reshape(-1, self.config.num_bins),
+                target_quantized.reshape(-1)
+            )
 
         # Mean prediction loss (Huber)
-        pred_mean = self.readout(features, 'mean')  # (batch, seq_len, num_horizons, 1)
-        losses['mean'] = self.huber_loss(pred_mean, y)
+        pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
+
+        if self.config.debug_horizons:
+            # Compute per-horizon losses
+            losses['mean'] = 0.0
+            for h_idx, h_name in enumerate(horizon_names):
+                h_loss = self.huber_loss(pred_mean[:, :, h_idx], y[:, :, h_idx])
+                losses[f'mean_{h_name}'] = h_loss
+                losses['mean'] += h_loss / len(horizon_names)
+        else:
+            losses['mean'] = self.huber_loss(pred_mean, y)
 
         # Mean + Variance prediction loss (NLL)
-        pred_var = self.readout(features, 'var')  # (batch, seq_len, num_horizons, 2)
+        pred_var = self.readout(features, 'var')  # (batch, pred_len, num_horizons)
         pred_var += 1e-8  # (batch, pred_len, num_horizons)
-        # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
-        nll = 1/2 * (torch.log(2 * torch.pi * pred_var) +
-                     (y - pred_mean) ** 2 / pred_var)
-        losses['nll'] = nll.mean()
+
+        if self.config.debug_horizons:
+            # Compute per-horizon losses
+            losses['nll'] = 0.0
+            for h_idx, h_name in enumerate(horizon_names):
+                # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
+                nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
+                             (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
+                h_loss = nll.mean()
+                losses[f'nll_{h_name}'] = h_loss
+                losses['nll'] += h_loss / len(horizon_names)
+        else:
+            # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
+            nll = 1/2 * (torch.log(2 * torch.pi * pred_var) +
+                         (y - pred_mean) ** 2 / pred_var)
+            losses['nll'] = nll.mean()
 
         # Quantile prediction loss
         pred_quantiles = self.readout(features, 'quantile')
-        losses['quantile'] = self._quantile_loss(pred_quantiles, y)
+
+        if self.config.debug_horizons:
+            # Compute per-horizon losses
+            losses['quantile'] = 0.0
+            for h_idx, h_name in enumerate(horizon_names):
+                h_loss = self._quantile_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
+                losses[f'quantile_{h_name}'] = h_loss
+                losses['quantile'] += h_loss / len(horizon_names)
+        else:
+            losses['quantile'] = self._quantile_loss(pred_quantiles, y)
 
         assert (
             losses['quantized'] >= 0 and
@@ -832,12 +815,21 @@ class FinalPipeline(dummyLightning):
             0.25 * losses['quantile']
         )
 
+        # Log aggregate losses
         self.log('quantized_loss', losses['quantized'])
         self.log('mean_loss', losses['mean'])
         self.log('nll_loss', losses['nll'])
         self.log('quantile_loss', losses['quantile'])
 
-        return {
+        # Log per-horizon losses
+        if self.config.debug_horizons:
+            for h_name in horizon_names:
+                self.log(f'quantized_{h_name}', losses[f'quantized_{h_name}'])
+                self.log(f'mean_{h_name}', losses[f'mean_{h_name}'])
+                self.log(f'nll_{h_name}', losses[f'nll_{h_name}'])
+                self.log(f'quantile_{h_name}', losses[f'quantile_{h_name}'])
+
+        result = {
             'loss': total_loss,
             'quantized_loss': losses['quantized'],
             'mean_loss': losses['mean'],
@@ -845,12 +837,36 @@ class FinalPipeline(dummyLightning):
             'quantile_loss': losses['quantile']
         }
 
-    def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor):
-        """Quantile loss with sided weighting"""
+        # Add per-horizon losses to result if enabled
+        if self.config.debug_horizons:
+            for h_name in horizon_names:
+                result[f'quantized_{h_name}'] = losses[f'quantized_{h_name}']
+                result[f'mean_{h_name}'] = losses[f'mean_{h_name}']
+                result[f'nll_{h_name}'] = losses[f'nll_{h_name}']
+                result[f'quantile_{h_name}'] = losses[f'quantile_{h_name}']
 
+        return result
+
+    def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor):
+        """Quantile loss with sided weighting
+
+        Args:
+            pred: (batch, pred_len, num_horizons, num_quantiles) or
+                  (batch, pred_len, num_quantiles)
+            target: (batch, pred_len, num_horizons) or
+                    (batch, pred_len)
+        """
         quantiles = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9],
                                  device=pred.device)
-        quantiles = quantiles.view(1, 1, 1, -1)
+
+        # Handle both 3D and 4D tensors
+        if pred.ndim == 3:
+            # Shape: (batch, pred_len, num_quantiles)
+            quantiles = quantiles.view(1, 1, -1)
+        else:
+            # Shape: (batch, pred_len, num_horizons, num_quantiles)
+            quantiles = quantiles.view(1, 1, 1, -1)
+
         quantiles = quantiles.expand(pred.shape)
         target = target.unsqueeze(-1)
 
@@ -907,6 +923,7 @@ class FinalPipelineConfig:
     use_muon: bool = True
 
     debug_data: bool | int = False
+    debug_horizons: bool = False
 
     # DDP settings
     use_ddp: bool = False
@@ -934,18 +951,18 @@ class FinalPipelineConfig:
         self.num_cents = self.max_cents * 2 + 1
 
 
+config = FinalPipelineConfig(
+    debug_data=True,
+    debug_ddp=True,
+    debug_model=True,
+    debug_horizons=True,
+)
 if __name__ == "__main__":
     import sys
 
     # Check if running with torchrun
-    use_ddp = 'RANK' in os.environ or '--use_ddp' in sys.argv
+    config.use_ddp = 'RANK' in os.environ or '--use_ddp' in sys.argv
 
-    config = FinalPipelineConfig(
-        debug_data=True,
-        use_ddp=use_ddp,
-        debug_ddp=True,
-        debug_model=True,
-    )
     pipeline = FinalPipeline(config)
 
     if config.use_ddp:
@@ -954,7 +971,7 @@ if __name__ == "__main__":
             print(f"Running DDP training on {pipeline.world_size} GPUs")
             print(f"Rank: {pipeline.rank}, Local Rank: {pipeline.local_rank}")
 
-    # Prepare data (only log from main process)
+    # Prepare data
     if not config.use_ddp or pipeline.is_main_process():
         print("Preparing data...")
     pipeline.prepare_data()
