@@ -48,17 +48,20 @@ torch.autograd.set_detect_anomaly(True)
 class PriceHistoryDataset(Dataset):
     def __init__(self, stock_data: Dict[str, np.ndarray],
                  stock_targets: Dict[str, np.ndarray],
+                 stock_returns: Dict[str, np.ndarray],
                  seq_len: int,
                  pred_len: int):
         """
         Args:
             stock_data: Dict mapping stock_id to full feature array (T, F)
-            stock_targets: Dict mapping stock_id to full target array (T,)
+            stock_targets: Dict mapping stock_id to full target array (T,) - normalized prices
+            stock_returns: Dict mapping stock_id to full raw close prices (T,) - for return calculation
             seq_len: Sequence length for context
             pred_len: Prediction length
         """
         self.stock_data = stock_data
         self.targets = stock_targets
+        self.returns = stock_returns
         self.seq_len = seq_len
         self.pred_len = pred_len
 
@@ -93,19 +96,34 @@ class PriceHistoryDataset(Dataset):
         targets = np.zeros((self.pred_len, self.num_horizons),
                            dtype=np.float32)
 
+        # return_targets shape: (pred_len, num_horizons)
+        # Return = future_close / current_close
+        return_targets = np.zeros((self.pred_len, self.num_horizons),
+                                   dtype=np.float32)
+
         for pos_idx in range(self.pred_len):
             current_pos = target_start + pos_idx
+            current_price = self.returns[stock_id][current_pos]
+
             for h_idx, horizon in enumerate(self.horizons):
-                pos = current_pos + horizon
+                future_pos = current_pos + horizon
                 # Bounds check
-                if pos < len(self.targets[stock_id]):
-                    targets[pos_idx, h_idx] = self.targets[stock_id][pos]
+                if future_pos < len(self.targets[stock_id]):
+                    targets[pos_idx, h_idx] = self.targets[stock_id][future_pos]
+                    future_price = self.returns[stock_id][future_pos]
+                    # Return = future_close / current_close
+                    if current_price > 0:
+                        return_targets[pos_idx, h_idx] = future_price / current_price
+                    else:
+                        return_targets[pos_idx, h_idx] = np.nan
                 else:
                     targets[pos_idx, h_idx] = np.nan
+                    return_targets[pos_idx, h_idx] = np.nan
 
         return (
             torch.from_numpy(features).float(),
             torch.from_numpy(targets).float(),
+            torch.from_numpy(return_targets).float(),
         )
 
 
@@ -304,6 +322,7 @@ class MultiReadout(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
 
+        # Price prediction heads
         self.quantized_head = nn.Linear(config.hidden_dim,
                                         config.num_bins * self.num_horizons)
         self.cent_head = nn.Linear(config.hidden_dim,
@@ -312,6 +331,12 @@ class MultiReadout(dummyLightning):
         self.variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
         self.quantile_head = nn.Linear(config.hidden_dim,
                                        config.num_quantiles*self.num_horizons)
+
+        # Return prediction heads (future_close / current_close)
+        self.return_mean_head = nn.Linear(config.hidden_dim, self.num_horizons)
+        self.return_variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
+        self.return_quantile_head = nn.Linear(config.hidden_dim,
+                                              config.num_quantiles*self.num_horizons)
 
     def forward(self, x: torch.Tensor, target_type='mean'):
         """
@@ -336,6 +361,15 @@ class MultiReadout(dummyLightning):
             return F.softplus(self.variance_head(x))
         elif target_type == 'quantile':
             out = self.quantile_head(x)
+            return out.view(batch_size, seq_len, self.num_horizons,
+                            self.num_quantiles)
+        # Return predictions
+        elif target_type == 'return_mean':
+            return self.return_mean_head(x)
+        elif target_type == 'return_var':
+            return F.softplus(self.return_variance_head(x))
+        elif target_type == 'return_quantile':
+            out = self.return_quantile_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
                             self.num_quantiles)
 
@@ -476,8 +510,10 @@ class FinalPipeline(dummyLightning):
 
     def _save_cache(self, train_stock_data: Dict[str, np.ndarray],
                     train_stock_targets: Dict[str, np.ndarray],
+                    train_stock_returns: Dict[str, np.ndarray],
                     val_stock_data: Dict[str, np.ndarray],
                     val_stock_targets: Dict[str, np.ndarray],
+                    val_stock_returns: Dict[str, np.ndarray],
                     quantiles: Dict[str, np.ndarray]):
         """Save dataset dictionaries to disk cache"""
         cache_path = self._get_cache_path()
@@ -498,12 +534,16 @@ class FinalPipeline(dummyLightning):
                 save_dict[f'train_data_{stock_id}'] = data
             for stock_id, targets in train_stock_targets.items():
                 save_dict[f'train_target_{stock_id}'] = targets
+            for stock_id, returns in train_stock_returns.items():
+                save_dict[f'train_return_{stock_id}'] = returns
 
             # Save val data
             for stock_id, data in val_stock_data.items():
                 save_dict[f'val_data_{stock_id}'] = data
             for stock_id, targets in val_stock_targets.items():
                 save_dict[f'val_target_{stock_id}'] = targets
+            for stock_id, returns in val_stock_returns.items():
+                save_dict[f'val_return_{stock_id}'] = returns
 
             # Save stock IDs as metadata
             train_ids = list(train_stock_data.keys())
@@ -516,6 +556,8 @@ class FinalPipeline(dummyLightning):
             print(f"Cache saved successfully!")
 
     def _load_cache(self) -> Optional[Tuple[Dict[str, np.ndarray],
+                                             Dict[str, np.ndarray],
+                                             Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
@@ -534,8 +576,10 @@ class FinalPipeline(dummyLightning):
         # Reconstruct dictionaries
         train_stock_data = {}
         train_stock_targets = {}
+        train_stock_returns = {}
         val_stock_data = {}
         val_stock_targets = {}
+        val_stock_returns = {}
         quantiles = {}
 
         # Load metadata
@@ -551,38 +595,40 @@ class FinalPipeline(dummyLightning):
         for stock_id in train_ids:
             train_stock_data[stock_id] = data[f'train_data_{stock_id}']
             train_stock_targets[stock_id] = data[f'train_target_{stock_id}']
+            train_stock_returns[stock_id] = data[f'train_return_{stock_id}']
 
         # Load val data
         for stock_id in val_ids:
             val_stock_data[stock_id] = data[f'val_data_{stock_id}']
             val_stock_targets[stock_id] = data[f'val_target_{stock_id}']
+            val_stock_returns[stock_id] = data[f'val_return_{stock_id}']
 
         if self.is_main_process():
             print(f"Cache loaded successfully! "
                   f"{len(train_ids)} train stocks, {len(val_ids)} val stocks")
 
-        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles
+        return train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns, quantiles
 
     def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
                      num_bins: int = 256, train_frac: float = 0.9):
         """Prepare data with all preprocessing strategies"""
 
         # Try to load from cache if not forcing recalculation
-        if not self.config.force_recalculate_data:
+        if not self.config.debug_no_cache:
             cached = self._load_cache()
             if cached is not None:
-                train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles = cached
+                train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns, quantiles = cached
                 self.quantiles = quantiles
                 self.encoder.quantiles = self.quantiles['close']
 
                 # Build datasets
                 pred_len = seq_len // 2
                 self.train_dataset = PriceHistoryDataset(
-                    train_stock_data, train_stock_targets,
+                    train_stock_data, train_stock_targets, train_stock_returns,
                     seq_len, pred_len
                 )
                 self.val_dataset = PriceHistoryDataset(
-                    val_stock_data, val_stock_targets,
+                    val_stock_data, val_stock_targets, val_stock_returns,
                     seq_len, pred_len
                 )
                 return
@@ -614,25 +660,25 @@ class FinalPipeline(dummyLightning):
         self.encoder.quantiles = self.quantiles['close']
 
         # Build sequences
-        train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = self._bs(df, seq_len)
+        train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns = self._bs(df, seq_len)
         self.train_dataset = train_stock_data  # Will be reassigned below
         self.val_dataset = val_stock_data  # Will be reassigned below
 
         # Save to cache
         self._save_cache(
-            train_stock_data, train_stock_targets,
-            val_stock_data, val_stock_targets,
+            train_stock_data, train_stock_targets, train_stock_returns,
+            val_stock_data, val_stock_targets, val_stock_returns,
             self.quantiles
         )
 
         # Build dataset objects
         pred_len = seq_len // 2
         self.train_dataset = PriceHistoryDataset(
-            train_stock_data, train_stock_targets,
+            train_stock_data, train_stock_targets, train_stock_returns,
             seq_len, pred_len
         )
         self.val_dataset = PriceHistoryDataset(
-            val_stock_data, val_stock_targets,
+            val_stock_data, val_stock_targets, val_stock_returns,
             seq_len, pred_len
         )
 
@@ -783,13 +829,14 @@ class FinalPipeline(dummyLightning):
 
         return df
 
-    def _bs(self, df, seq_len) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray],
-                                         Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    def _bs(self, df, seq_len) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray],
+                                         Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """
         Build sequences and return the data dictionaries.
 
         Returns:
-            train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
+            train_stock_data, train_stock_targets, train_stock_returns,
+            val_stock_data, val_stock_targets, val_stock_returns
         """
 
         time_stats = df.group_by('datetime').agg(
@@ -805,9 +852,11 @@ class FinalPipeline(dummyLightning):
 
         train_stock_data = {}
         train_stock_targets = {}
+        train_stock_returns = {}
 
         val_stock_data = {}
         val_stock_targets = {}
+        val_stock_returns = {}
 
         cols = [
             'close', 'close_norm', 'close_baseline_norm', 'ret_1min',
@@ -826,6 +875,7 @@ class FinalPipeline(dummyLightning):
             features = stock_df.select(cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close_baseline_norm'].to_numpy().astype(np.float32)
+            close_raw = stock_df['close'].to_numpy().astype(np.float32)  # For return calculation
 
             # Split each stock's data by time - train data and val data
             train_mask = is_train.astype(bool)
@@ -835,13 +885,15 @@ class FinalPipeline(dummyLightning):
             if train_mask.sum() > seq_len + 1:
                 train_stock_data[stock_id] = features[train_mask]
                 train_stock_targets[stock_id] = close[train_mask]
+                train_stock_returns[stock_id] = close_raw[train_mask]
 
             # Only add to val set if we have enough val data
             if val_mask.sum() > seq_len + 1:
                 val_stock_data[stock_id] = features[val_mask]
                 val_stock_targets[stock_id] = close[val_mask]
+                val_stock_returns[stock_id] = close_raw[val_mask]
 
-        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
+        return train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
@@ -849,9 +901,10 @@ class FinalPipeline(dummyLightning):
         return features
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
-        x, y = batch
+        x, y, y_returns = batch
         # x: (batch, seq_len, features)
-        # y: (batch, pred_len, num_horizons) where pred_len = seq_len // 2
+        # y: (batch, pred_len, num_horizons) - normalized prices where pred_len = seq_len // 2
+        # y_returns: (batch, pred_len, num_horizons) - return multipliers (future_close / current_close)
 
         seq_len = x.shape[1]
         losses = {}
@@ -930,17 +983,66 @@ class FinalPipeline(dummyLightning):
         else:
             losses['quantile'] = self._quantile_loss(pred_quantiles, y)
 
+        # ===== Return prediction losses =====
+        y_returns = y_returns.to(pred_mean.dtype)
+
+        # Return mean prediction loss (Huber)
+        pred_return_mean = self.readout(features, 'return_mean')  # (batch, pred_len, num_horizons)
+
+        if self.config.debug_horizons:
+            losses['return_mean'] = 0.0
+            for h_idx, h_name in enumerate(horizon_names):
+                h_loss = self.huber_loss(pred_return_mean[:, :, h_idx], y_returns[:, :, h_idx])
+                losses[f'return_mean_{h_name}'] = h_loss
+                losses['return_mean'] += h_loss / len(horizon_names)
+        else:
+            losses['return_mean'] = self.huber_loss(pred_return_mean, y_returns)
+
+        # Return variance prediction loss (NLL)
+        pred_return_var = self.readout(features, 'return_var')  # (batch, pred_len, num_horizons)
+        pred_return_var += 1e-8
+
+        if self.config.debug_horizons:
+            losses['return_nll'] = 0.0
+            for h_idx, h_name in enumerate(horizon_names):
+                nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var[:, :, h_idx]) +
+                             (y_returns[:, :, h_idx] - pred_return_mean[:, :, h_idx]) ** 2 / pred_return_var[:, :, h_idx])
+                h_loss = nll.mean()
+                losses[f'return_nll_{h_name}'] = h_loss
+                losses['return_nll'] += h_loss / len(horizon_names)
+        else:
+            nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var) +
+                         (y_returns - pred_return_mean) ** 2 / pred_return_var)
+            losses['return_nll'] = nll.mean()
+
+        # Return quantile prediction loss
+        pred_return_quantiles = self.readout(features, 'return_quantile')
+
+        if self.config.debug_horizons:
+            losses['return_quantile'] = 0.0
+            for h_idx, h_name in enumerate(horizon_names):
+                h_loss = self._quantile_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
+                losses[f'return_quantile_{h_name}'] = h_loss
+                losses['return_quantile'] += h_loss / len(horizon_names)
+        else:
+            losses['return_quantile'] = self._quantile_loss(pred_return_quantiles, y_returns)
+
         assert (
             losses['quantized'] >= 0 and
             losses['mean'] >= 0 and
-            losses['quantile'] >= 0
+            losses['quantile'] >= 0 and
+            losses['return_mean'] >= 0 and
+            losses['return_quantile'] >= 0
         ), losses
         # Combine losses
         total_loss = (
-            0.25 * losses['quantized'] +
-            0.25 * losses['mean'] +
-            0.25 * losses['nll'] +
-            0.25 * losses['quantile']
+            0.15 * losses['quantized'] +
+            0.15 * losses['mean'] +
+            0.15 * losses['nll'] +
+            0.15 * losses['quantile'] +
+            0.15 * losses['return_mean'] +
+            0.15 * losses['return_nll'] +
+            0.10 * losses['return_quantile']
         )
 
         # Log aggregate losses
@@ -948,6 +1050,9 @@ class FinalPipeline(dummyLightning):
         self.log('mean_loss', losses['mean'])
         self.log('nll_loss', losses['nll'])
         self.log('quantile_loss', losses['quantile'])
+        self.log('return_mean_loss', losses['return_mean'])
+        self.log('return_nll_loss', losses['return_nll'])
+        self.log('return_quantile_loss', losses['return_quantile'])
 
         # Log per-horizon losses
         if self.config.debug_horizons:
@@ -956,13 +1061,19 @@ class FinalPipeline(dummyLightning):
                 self.log(f'mean_{h_name}', losses[f'mean_{h_name}'])
                 self.log(f'nll_{h_name}', losses[f'nll_{h_name}'])
                 self.log(f'quantile_{h_name}', losses[f'quantile_{h_name}'])
+                self.log(f'return_mean_{h_name}', losses[f'return_mean_{h_name}'])
+                self.log(f'return_nll_{h_name}', losses[f'return_nll_{h_name}'])
+                self.log(f'return_quantile_{h_name}', losses[f'return_quantile_{h_name}'])
 
         result = {
             'loss': total_loss,
             'quantized_loss': losses['quantized'],
             'mean_loss': losses['mean'],
             'nll_loss': losses['nll'],
-            'quantile_loss': losses['quantile']
+            'quantile_loss': losses['quantile'],
+            'return_mean_loss': losses['return_mean'],
+            'return_nll_loss': losses['return_nll'],
+            'return_quantile_loss': losses['return_quantile']
         }
 
         # Add per-horizon losses to result if enabled
@@ -972,6 +1083,9 @@ class FinalPipeline(dummyLightning):
                 result[f'mean_{h_name}'] = losses[f'mean_{h_name}']
                 result[f'nll_{h_name}'] = losses[f'nll_{h_name}']
                 result[f'quantile_{h_name}'] = losses[f'quantile_{h_name}']
+                result[f'return_mean_{h_name}'] = losses[f'return_mean_{h_name}']
+                result[f'return_nll_{h_name}'] = losses[f'return_nll_{h_name}']
+                result[f'return_quantile_{h_name}'] = losses[f'return_quantile_{h_name}']
 
         return result
 
@@ -1066,7 +1180,7 @@ class FinalPipelineConfig:
 
     # Cache settings
     cache_dir: Optional[str] = None
-    force_recalculate_data: bool = False
+    debug_no_cache: bool = False
 
     def __post_init__(self):
         if self.debug_model:
@@ -1094,7 +1208,8 @@ class FinalPipelineConfig:
 
 
 config = FinalPipelineConfig(
-    # debug_data=True,
+    debug_data=True,
+    debug_no_cache=True,
     debug_ddp=True,
     debug_model=True,
     debug_horizons=True,
