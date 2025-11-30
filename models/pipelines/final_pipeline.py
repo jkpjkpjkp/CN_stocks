@@ -687,7 +687,7 @@ class FinalPipeline(dummyLightning):
 
             features = stock_df.select(cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
-            close = stock_df['close'].to_numpy().astype(np.float32)
+            close = stock_df['close_baseline_norm'].to_numpy().astype(np.float32)
 
             # Split each stock's data by time - train data and val data
             train_mask = is_train.astype(bool)
