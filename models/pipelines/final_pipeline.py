@@ -1214,11 +1214,80 @@ config = FinalPipelineConfig(
     debug_model=True,
     debug_horizons=True,
 )
+
+def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfig:
+    """Parse CLI arguments and override config fields"""
+    import argparse
+    import sys
+    from dataclasses import fields
+
+    parser = argparse.ArgumentParser(description='Train FinalPipeline')
+
+    # Dynamically add arguments from dataclass fields
+    for field in fields(FinalPipelineConfig):
+        field_name = field.name
+        field_type = field.type
+        default_val = getattr(base_config, field_name)
+
+        # Handle different types
+        if field_type == bool or field_type == 'bool':
+            parser.add_argument(f'--{field_name}', action='store_true',
+                              help=f'Set {field_name}=True')
+            parser.add_argument(f'--no_{field_name}', dest=field_name,
+                              action='store_false', help=f'Set {field_name}=False')
+            parser.set_defaults(**{field_name: default_val})
+        elif 'bool | int' in str(field_type) or 'int | bool' in str(field_type):
+            # Special handling for bool | int union type
+            parser.add_argument(f'--{field_name}', type=str, default=str(default_val),
+                              help=f'{field_name} (bool or int)')
+        elif field_type == int or field_type == 'int':
+            parser.add_argument(f'--{field_name}', type=int, default=default_val,
+                              help=f'{field_name} (default: {default_val})')
+        elif field_type == float or field_type == 'float':
+            parser.add_argument(f'--{field_name}', type=float, default=default_val,
+                              help=f'{field_name} (default: {default_val})')
+        elif field_type == str or field_type == 'str' or 'Optional[str]' in str(field_type):
+            parser.add_argument(f'--{field_name}', type=str, default=default_val,
+                              help=f'{field_name} (default: {default_val})')
+
+    # Filter out module-like arguments (e.g., "models.pipelines.final_pipeline")
+    # These come from wrappers like utils.oom_debug_hook
+    filtered_argv = [
+        arg for arg in sys.argv[1:]
+        if not arg.count('.') >= 2
+    ]
+
+    args = parser.parse_args(filtered_argv)
+
+    # Override config with parsed args
+    overrides = {}
+    for field in fields(FinalPipelineConfig):
+        field_name = field.name
+        field_type = field.type
+        arg_val = getattr(args, field_name)
+
+        # Handle bool | int type
+        if 'bool | int' in str(field_type) or 'int | bool' in str(field_type):
+            if arg_val.lower() in ('true', '1', 'yes'):
+                overrides[field_name] = True
+            elif arg_val.lower() in ('false', '0', 'no'):
+                overrides[field_name] = False
+            else:
+                overrides[field_name] = int(arg_val)
+        else:
+            overrides[field_name] = arg_val
+
+    return FinalPipelineConfig(**overrides)
+
+
 if __name__ == "__main__":
     import sys
 
+    # Parse CLI arguments
+    config = parse_args_to_config(config)
+
     # Check if running with torchrun
-    config.use_ddp = 'RANK' in os.environ or '--use_ddp' in sys.argv
+    config.use_ddp = 'RANK' in os.environ or config.use_ddp
 
     pipeline = FinalPipeline(config)
 
