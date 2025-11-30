@@ -470,9 +470,126 @@ class FinalPipeline(dummyLightning):
 
         return nn.Sequential(*layers)
 
+    def _get_cache_path(self) -> Path:
+        """Get the path to the cache file"""
+        return Path(self.config.cache_dir) / 'dataset_cache.npz'
+
+    def _save_cache(self, train_stock_data: Dict[str, np.ndarray],
+                    train_stock_targets: Dict[str, np.ndarray],
+                    val_stock_data: Dict[str, np.ndarray],
+                    val_stock_targets: Dict[str, np.ndarray],
+                    quantiles: Dict[str, np.ndarray]):
+        """Save dataset dictionaries to disk cache"""
+        cache_path = self._get_cache_path()
+
+        if self.is_main_process():
+            print(f"Saving cache to {cache_path}...")
+
+            # Convert dicts to a format savez can handle
+            # We'll save with keys like 'train_data_<stock_id>', 'train_target_<stock_id>', etc.
+            save_dict = {}
+
+            # Save quantiles
+            for key, value in quantiles.items():
+                save_dict[f'quantile_{key}'] = value
+
+            # Save train data
+            for stock_id, data in train_stock_data.items():
+                save_dict[f'train_data_{stock_id}'] = data
+            for stock_id, targets in train_stock_targets.items():
+                save_dict[f'train_target_{stock_id}'] = targets
+
+            # Save val data
+            for stock_id, data in val_stock_data.items():
+                save_dict[f'val_data_{stock_id}'] = data
+            for stock_id, targets in val_stock_targets.items():
+                save_dict[f'val_target_{stock_id}'] = targets
+
+            # Save stock IDs as metadata
+            train_ids = list(train_stock_data.keys())
+            val_ids = list(val_stock_data.keys())
+            save_dict['_train_ids'] = np.array(train_ids, dtype=object)
+            save_dict['_val_ids'] = np.array(val_ids, dtype=object)
+            save_dict['_quantile_keys'] = np.array(list(quantiles.keys()), dtype=object)
+
+            np.savez_compressed(cache_path, **save_dict)
+            print(f"Cache saved successfully!")
+
+    def _load_cache(self) -> Optional[Tuple[Dict[str, np.ndarray],
+                                             Dict[str, np.ndarray],
+                                             Dict[str, np.ndarray],
+                                             Dict[str, np.ndarray],
+                                             Dict[str, np.ndarray]]]:
+        """Load dataset dictionaries from disk cache"""
+        cache_path = self._get_cache_path()
+
+        if not cache_path.exists():
+            return None
+
+        if self.is_main_process():
+            print(f"Loading cache from {cache_path}...")
+
+        data = np.load(cache_path, allow_pickle=True)
+
+        # Reconstruct dictionaries
+        train_stock_data = {}
+        train_stock_targets = {}
+        val_stock_data = {}
+        val_stock_targets = {}
+        quantiles = {}
+
+        # Load metadata
+        train_ids = data['_train_ids']
+        val_ids = data['_val_ids']
+        quantile_keys = data['_quantile_keys']
+
+        # Load quantiles
+        for key in quantile_keys:
+            quantiles[key] = data[f'quantile_{key}']
+
+        # Load train data
+        for stock_id in train_ids:
+            train_stock_data[stock_id] = data[f'train_data_{stock_id}']
+            train_stock_targets[stock_id] = data[f'train_target_{stock_id}']
+
+        # Load val data
+        for stock_id in val_ids:
+            val_stock_data[stock_id] = data[f'val_data_{stock_id}']
+            val_stock_targets[stock_id] = data[f'val_target_{stock_id}']
+
+        if self.is_main_process():
+            print(f"Cache loaded successfully! "
+                  f"{len(train_ids)} train stocks, {len(val_ids)} val stocks")
+
+        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles
+
     def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
                      num_bins: int = 256, train_frac: float = 0.9):
         """Prepare data with all preprocessing strategies"""
+
+        # Try to load from cache if not forcing recalculation
+        if not self.config.force_recalculate_data:
+            cached = self._load_cache()
+            if cached is not None:
+                train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles = cached
+                self.quantiles = quantiles
+                self.encoder.quantiles = self.quantiles['close']
+
+                # Build datasets
+                pred_len = seq_len // 2
+                self.train_dataset = PriceHistoryDataset(
+                    train_stock_data, train_stock_targets,
+                    seq_len, pred_len
+                )
+                self.val_dataset = PriceHistoryDataset(
+                    val_stock_data, val_stock_targets,
+                    seq_len, pred_len
+                )
+                return
+
+        # Cache miss or force recalculation - compute from scratch
+        if self.is_main_process():
+            print("Computing data from scratch...")
 
         if path is None:
             path = Path.home() / 'h' / 'data' / 'a_1min.pq'
@@ -497,7 +614,27 @@ class FinalPipeline(dummyLightning):
         self.encoder.quantiles = self.quantiles['close']
 
         # Build sequences
-        self.train_dataset, self.val_dataset = self._bs(df, seq_len)
+        train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = self._bs(df, seq_len)
+        self.train_dataset = train_stock_data  # Will be reassigned below
+        self.val_dataset = val_stock_data  # Will be reassigned below
+
+        # Save to cache
+        self._save_cache(
+            train_stock_data, train_stock_targets,
+            val_stock_data, val_stock_targets,
+            self.quantiles
+        )
+
+        # Build dataset objects
+        pred_len = seq_len // 2
+        self.train_dataset = PriceHistoryDataset(
+            train_stock_data, train_stock_targets,
+            seq_len, pred_len
+        )
+        self.val_dataset = PriceHistoryDataset(
+            val_stock_data, val_stock_targets,
+            seq_len, pred_len
+        )
 
     def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
         """Create dataloader with DDP support via DistributedSampler"""
@@ -646,12 +783,13 @@ class FinalPipeline(dummyLightning):
 
         return df
 
-    def _bs(self, df, seq_len) -> Tuple[Dataset, Dataset]:
+    def _bs(self, df, seq_len) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray],
+                                         Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """
-        Build sequences.
+        Build sequences and return the data dictionaries.
 
-        - Positions 0 to seq_len//2: no prediction
-        - Positions seq_len//2 to seq_len: each predicts all horizons
+        Returns:
+            train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
         """
 
         time_stats = df.group_by('datetime').agg(
@@ -703,17 +841,7 @@ class FinalPipeline(dummyLightning):
                 val_stock_data[stock_id] = features[val_mask]
                 val_stock_targets[stock_id] = close[val_mask]
 
-        pred_len = seq_len // 2
-        train_dataset = PriceHistoryDataset(
-            train_stock_data, train_stock_targets,
-            seq_len, pred_len
-        )
-        val_dataset = PriceHistoryDataset(
-            val_stock_data, val_stock_targets,
-            seq_len, pred_len
-        )
-
-        return train_dataset, val_dataset
+        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
@@ -936,6 +1064,10 @@ class FinalPipelineConfig:
     debug_ddp: bool = False
     debug_model: bool = False
 
+    # Cache settings
+    cache_dir: Optional[str] = None
+    force_recalculate_data: bool = False
+
     def __post_init__(self):
         if self.debug_model:
             self.hidden_dim //= 4
@@ -950,9 +1082,19 @@ class FinalPipelineConfig:
         # Data
         self.num_cents = self.max_cents * 2 + 1
 
+        # Cache directory
+        if self.cache_dir is None:
+            base_cache = Path.home() / 'h' / 'cache' / 'pipeline_data'
+            if self.debug_data:
+                n = self.debug_data if isinstance(self.debug_data, int) else 5
+                self.cache_dir = str(base_cache / f'debug_{n}')
+            else:
+                self.cache_dir = str(base_cache / 'full')
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+
 
 config = FinalPipelineConfig(
-    debug_data=True,
+    # debug_data=True,
     debug_ddp=True,
     debug_model=True,
     debug_horizons=True,
