@@ -1,12 +1,9 @@
 """
-Final pipeline implementation combining all components from main.md files
-
-This pipeline implements:
 1. Multiple encoding strategies:
    - Quantize: 1/256 percentile-based token encoding
    - Cent quantize: cent-level delta encoding for small values
-   - CNN: Image encoding over K-line graphs (from draw.py) (TODO)
    - Sin encoding: Sinusoidal encoding for continuous values
+   - CNN: Image encoding over K-line graphs (from draw.py) (TODO)
 
 2. Multiple preprocessing approaches:
    - Raw values (close, open, high, low, volume)
@@ -54,8 +51,10 @@ class PriceHistoryDataset(Dataset):
         """
         Args:
             stock_data: Dict mapping stock_id to full feature array (T, F)
-            stock_targets: Dict mapping stock_id to full target array (T,) - normalized prices
-            stock_returns: Dict mapping stock_id to full raw close prices (T,) - for return calculation
+            stock_targets: Dict mapping stock_id to full target array (T,)
+              - normalized prices
+            stock_returns: Dict mapping stock_id to full raw close prices (T,)
+              - for return calculation
             seq_len: Sequence length for context
             pred_len: Prediction length
         """
@@ -99,7 +98,7 @@ class PriceHistoryDataset(Dataset):
         # return_targets shape: (pred_len, num_horizons)
         # Return = future_close / current_close
         return_targets = np.zeros((self.pred_len, self.num_horizons),
-                                   dtype=np.float32)
+                                  dtype=np.float32)
 
         for pos_idx in range(self.pred_len):
             current_pos = target_start + pos_idx
@@ -1045,25 +1044,31 @@ class FinalPipeline(dummyLightning):
             0.10 * losses['return_quantile']
         )
 
-        # Log aggregate losses
-        self.log('quantized_loss', losses['quantized'])
-        self.log('mean_loss', losses['mean'])
-        self.log('nll_loss', losses['nll'])
-        self.log('quantile_loss', losses['quantile'])
-        self.log('return_mean_loss', losses['return_mean'])
-        self.log('return_nll_loss', losses['return_nll'])
-        self.log('return_quantile_loss', losses['return_quantile'])
+        # Log aggregate losses with hierarchical grouping
+        # Price prediction losses
+        self.log('price_prediction/quantized', losses['quantized'])
+        self.log('price_prediction/mean', losses['mean'])
+        self.log('price_prediction/nll', losses['nll'])
+        self.log('price_prediction/quantile', losses['quantile'])
+
+        # Return prediction losses
+        self.log('return_prediction/mean', losses['return_mean'])
+        self.log('return_prediction/nll', losses['return_nll'])
+        self.log('return_prediction/quantile', losses['return_quantile'])
 
         # Log per-horizon losses
         if self.config.debug_horizons:
             for h_name in horizon_names:
-                self.log(f'quantized_{h_name}', losses[f'quantized_{h_name}'])
-                self.log(f'mean_{h_name}', losses[f'mean_{h_name}'])
-                self.log(f'nll_{h_name}', losses[f'nll_{h_name}'])
-                self.log(f'quantile_{h_name}', losses[f'quantile_{h_name}'])
-                self.log(f'return_mean_{h_name}', losses[f'return_mean_{h_name}'])
-                self.log(f'return_nll_{h_name}', losses[f'return_nll_{h_name}'])
-                self.log(f'return_quantile_{h_name}', losses[f'return_quantile_{h_name}'])
+                # Price prediction per horizon
+                self.log(f'price_prediction/horizons/{h_name}/quantized', losses[f'quantized_{h_name}'])
+                self.log(f'price_prediction/horizons/{h_name}/mean', losses[f'mean_{h_name}'])
+                self.log(f'price_prediction/horizons/{h_name}/nll', losses[f'nll_{h_name}'])
+                self.log(f'price_prediction/horizons/{h_name}/quantile', losses[f'quantile_{h_name}'])
+
+                # Return prediction per horizon
+                self.log(f'return_prediction/horizons/{h_name}/mean', losses[f'return_mean_{h_name}'])
+                self.log(f'return_prediction/horizons/{h_name}/nll', losses[f'return_nll_{h_name}'])
+                self.log(f'return_prediction/horizons/{h_name}/quantile', losses[f'return_quantile_{h_name}'])
 
         result = {
             'loss': total_loss,
