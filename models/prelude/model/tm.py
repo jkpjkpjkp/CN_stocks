@@ -22,11 +22,12 @@ class Rope(nn.Module):
         self.config = config
 
         device = config.device
-        if hasattr(config, 'use_normal_rope') and config.use_normal_rope:
+        if config.standard_rope:
             attn_dim = config.hidden_dim
         else:
             attn_dim = config.head_dim * config.num_heads
-        channel_range = torch.arange(0, attn_dim, 2, dtype=torch.float32, device=device)
+        channel_range = torch.arange(0, attn_dim, 2, dtype=torch.float32,
+                                     device=device)
         inv_freq = 1.0 / (10000 ** (channel_range / attn_dim))
         t = torch.arange(config.seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)

@@ -100,24 +100,21 @@ class PriceHistoryDataset(Dataset):
         return_targets = np.zeros((self.pred_len, self.num_horizons),
                                   dtype=np.float32)
 
-        for pos_idx in range(self.pred_len):
-            current_pos = target_start + pos_idx
-            current_price = self.returns[stock_id][current_pos]
+        # Vectorize outer loop using slicing
+        current_positions = target_start + np.arange(self.pred_len)
+        current_prices = self.returns[stock_id][current_positions]
 
-            for h_idx, horizon in enumerate(self.horizons):
-                future_pos = current_pos + horizon
-                # Bounds check
-                if future_pos < len(self.targets[stock_id]):
-                    targets[pos_idx, h_idx] = self.targets[stock_id][future_pos]
-                    future_price = self.returns[stock_id][future_pos]
-                    # Return = future_close / current_close
-                    if current_price > 0:
-                        return_targets[pos_idx, h_idx] = future_price / current_price
-                    else:
-                        return_targets[pos_idx, h_idx] = np.nan
-                else:
-                    targets[pos_idx, h_idx] = np.nan
-                    return_targets[pos_idx, h_idx] = np.nan
+        for h_idx, horizon in enumerate(self.horizons):
+            future_positions = current_positions + horizon
+            targets[:, h_idx] = self.targets[stock_id][future_positions]
+            future_prices = self.returns[stock_id][future_positions]
+
+            # Return = future_close / current_close (set NaN where current_price <= 0)
+            return_targets[:, h_idx] = np.where(
+                current_prices > 0,
+                future_prices / current_prices,
+                np.nan
+            )
 
         return (
             torch.from_numpy(features).float(),
@@ -161,47 +158,32 @@ class TransformerBlock(dummyLightning):
         batch_size, seq_len, _ = x.shape
 
         residual = x
-        x = self.norm1(x)
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        if config.qk_norm:
+        x = self.norm1(x)
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        if self.qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
-
-        if not (hasattr(self.config, 'use_normal_rope') and
-                self.config.use_normal_rope):
+        if not self.standard_rope:
             q = self.rope(q)
             k = self.rope(k)
 
-        # Rearrange for attention: (batch, num_heads, seq_len, head_dim)
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
-
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        if (hasattr(self.config, 'use_normal_rope') and
-                self.config.use_normal_rope):
+        if self.standard_rope:
             q = self.rope(q)
             k = self.rope(k)
 
-        # Apply scaled dot-product attention
-        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)\
+                       .transpose(1, 2).contiguous()\
+                       .view(batch_size, seq_len, self.attn_dim)
 
-        # Rearrange back: (batch, seq_len, num_heads, head_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.attn_dim)
+        x = residual + self.o_proj(attn_output)
 
-        # Output projection
-        attn_output = self.o_proj(attn_output)
-        x = residual + attn_output
-
-        # Feed-forward network
-        residual = x
-        x = self.norm2(x)
-        x = residual + self.ffn(x)
+        x = x + self.ffn(self.norm2(x))
 
         return x
 
@@ -1143,6 +1125,7 @@ class FinalPipelineConfig:
     num_heads: int = 8
     attn_ratio: float = 1.
     max_freq: float = 10000.
+    standard_rope: bool = False  # use fine-grained rope
     qk_norm: bool = False
 
     # Training
