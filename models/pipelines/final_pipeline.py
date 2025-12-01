@@ -35,6 +35,9 @@ from pathlib import Path
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 import os
+import gc
+import psutil
+import warnings
 
 from ..prelude.model import dummyLightning
 from ..prelude.model import Rope
@@ -81,7 +84,9 @@ class PriceHistoryDataset(Dataset):
         stock_id, start_idx = self.index[idx]
         end_idx = start_idx + self.seq_len
 
-        features = self.stock_data[stock_id][start_idx:end_idx]
+        # Copy data from memory-mapped array to ensure thread-safety
+        # and avoid holding references to the mmap
+        features = self.stock_data[stock_id][start_idx:end_idx].copy()
 
         # Get prediction positions' targets (latter half)
         # For each position in the latter half, get targets at all horizons
@@ -98,12 +103,14 @@ class PriceHistoryDataset(Dataset):
 
         # Vectorize outer loop using slicing
         current_positions = target_start + np.arange(self.pred_len)
-        current_prices = self.targets[stock_id][current_positions]
+        # Copy from memory-mapped array
+        current_prices = self.targets[stock_id][current_positions].copy()
 
         for h_idx, horizon in enumerate(self.horizons):
             future_positions = current_positions + horizon
+            # Copy from memory-mapped array
             targets[:, h_idx] = self.targets[stock_id][future_positions]
-            future_prices = self.targets[stock_id][future_positions]
+            future_prices = self.targets[stock_id][future_positions].copy()
 
             return_targets[:, h_idx] = future_prices / current_prices
 
@@ -517,16 +524,17 @@ class FinalPipeline(dummyLightning):
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
                                              Dict[str, torch.Tensor]]]:
-        """Load dataset dictionaries from disk cache"""
+        """Load dataset dictionaries from disk cache using memory-mapped arrays"""
         cache_path = self._get_cache_path()
 
         if not cache_path.exists():
             return None
 
         if self.is_main_process():
-            print(f"Loading cache from {cache_path}...")
+            print(f"Loading cache from {cache_path} (memory-mapped mode)...")
 
-        data = np.load(cache_path, allow_pickle=True)
+        # Use mmap_mode='r' to load arrays as memory-mapped (lazy loading)
+        data = np.load(cache_path, allow_pickle=True, mmap_mode='r')
 
         # Reconstruct dictionaries
         train_stock_data = {}
@@ -535,16 +543,17 @@ class FinalPipeline(dummyLightning):
         val_stock_targets = {}
         quantiles = {}
 
-        # Load metadata
-        train_ids = data['_train_ids']
-        val_ids = data['_val_ids']
-        quantile_keys = data['_quantile_keys']
+        # Load metadata (these are small, so load into memory)
+        train_ids = data['_train_ids'].copy()
+        val_ids = data['_val_ids'].copy()
+        quantile_keys = data['_quantile_keys'].copy()
 
-        # Load quantiles
+        # Load quantiles (small arrays, load into memory)
         for key in quantile_keys:
-            quantiles[key] = torch.from_numpy(data[f'quantile_{key}']).float()
+            quantiles[key] = torch.from_numpy(data[f'quantile_{key}'].copy()).float()
 
-        # Load train data
+        # Store references to memory-mapped arrays (lazy loading)
+        # Arrays will only be loaded into memory when accessed
         for stock_id in train_ids:
             train_stock_data[stock_id] = data[f'train_data_{stock_id}']
             train_stock_targets[stock_id] = data[f'train_target_{stock_id}']
@@ -555,7 +564,7 @@ class FinalPipeline(dummyLightning):
             val_stock_targets[stock_id] = data[f'val_target_{stock_id}']
 
         if self.is_main_process():
-            print(f"Cache loaded successfully! "
+            print(f"Cache loaded successfully (memory-mapped)! "
                   f"{len(train_ids)} train stocks, {len(val_ids)} val stocks")
 
         return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles
@@ -601,13 +610,10 @@ class FinalPipeline(dummyLightning):
             df = df.filter(pl.col('id').is_in(ids.implode())).collect()
         else:
             df = pl.read_parquet(str(path))
-        df = df.sort(['id', 'datetime'])
         assert len(df)
 
         df = self._compute_features(df)
-        assert len(df)
         df = self._split_data(df, train_frac)
-        assert len(df)
         self.quantiles = self._compute_quantiles(df, num_bins)
 
         self.encoder.quantiles = self.quantiles['close']
@@ -750,8 +756,7 @@ class FinalPipeline(dummyLightning):
             -> Dict[str, torch.Tensor]:
         """Compute quantiles for different features"""
 
-        train_df = df.filter(pl.col('is_train'))
-        assert len(df)
+        train_df = df.filter(pl.col('is_train')).sample(10000000)
 
         quantiles = {}
         for col in ['close', 'ret_1min', 'ret_30min', 'volume']:
