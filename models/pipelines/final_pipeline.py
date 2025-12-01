@@ -109,12 +109,7 @@ class PriceHistoryDataset(Dataset):
             targets[:, h_idx] = self.targets[stock_id][future_positions]
             future_prices = self.returns[stock_id][future_positions]
 
-            # Return = future_close / current_close (set NaN where current_price <= 0)
-            return_targets[:, h_idx] = np.where(
-                current_prices > 0,
-                future_prices / current_prices,
-                np.nan
-            )
+            return_targets[:, h_idx] = future_prices / current_prices
 
         return (
             torch.from_numpy(features).float(),
@@ -195,10 +190,8 @@ class QuantizeEncoder(dummyLightning):
 
     def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
         # x: (batch, 1) - single feature values
-        tokens = torch.from_numpy(np.digitize(x.cpu().numpy(), quantiles[1:-1],
-                                              right=True)).to(x.device)
-        # tokens shape: (batch, 1), squeeze to (batch,) for embedding
-        tokens = tokens.squeeze(-1)
+        quantiles_tensor = torch.from_numpy(quantiles[1:-1]).to(x.device, dtype=x.dtype)
+        tokens = torch.bucketize(x.squeeze(-1), quantiles_tensor, right=True)
         result = self.embedding(tokens)
         return result
 
@@ -221,10 +214,9 @@ class CentsEncoder(dummyLightning):
 class SinEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
 
         freqs = torch.exp(
-            torch.linspace(0, np.log(self.max_freq), config.embed_dim // 2)
+            torch.linspace(0, np.log(config.max_freq), config.embed_dim // 2)
         )
         freqs = freqs.unsqueeze(0).unsqueeze(0)
         self.register_buffer('freqs', freqs)
@@ -706,8 +698,8 @@ class FinalPipeline(dummyLightning):
         return df
 
     def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
-        unique_datetimes = df['datetime'].unique().sort().to_numpy()
-        cutoff = np.quantile(unique_datetimes, train_frac)
+        unique_datetimes = df['datetime'].unique().sort()
+        cutoff = unique_datetimes.quantile(train_frac)
 
         df = df.with_columns((pl.col('datetime') <= cutoff).alias('is_train'))
 
@@ -745,15 +737,25 @@ class FinalPipeline(dummyLightning):
 
         return df
 
-    def _compute_quantiles(self, df: pl.DataFrame, num_bins: int) -> Dict[str, np.ndarray]:
+    def _compute_quantiles(self, df: pl.DataFrame, num_bins: int)\
+            -> Dict[str, torch.Tensor]:
         """Compute quantiles for different features"""
 
         train_df = df.filter(pl.col('is_train'))
 
         quantiles = {}
         for col in ['close', 'ret_1min', 'ret_30min', 'volume']:
-            data = train_df[col].to_numpy()
-            quantiles[col] = np.quantile(data, np.linspace(0, 1, num_bins + 1))
+            data = train_df[col].to_torch().float()
+            n = len(data)
+            assert n
+            # Compute k-th values for each quantile position
+            q_positions = torch.linspace(0, 1, num_bins + 1)
+            k_indices = (q_positions * (n - 1)).long() + 1
+            k_indices = torch.clamp(k_indices, 1, n)
+
+            data = data.sort()
+            quantile_values = data[k_indices - 1]  # -1 for 0-indexed
+            quantiles[col] = quantile_values
 
         return quantiles
 
