@@ -789,11 +789,9 @@ class FinalPipeline(dummyLightning):
 
         train_stock_data = {}
         train_stock_targets = {}
-        train_stock_returns = {}
 
         val_stock_data = {}
         val_stock_targets = {}
-        val_stock_returns = {}
 
         cols = [
             'close', 'close_norm', 'ret_1min',
