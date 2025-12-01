@@ -3,7 +3,7 @@
    - Quantize: 1/256 percentile-based token encoding
    - Cent quantize: cent-level delta encoding for small values
    - Sin encoding: Sinusoidal encoding for continuous values
-   - CNN: Image encoding over K-line graphs (from draw.py) (TODO)
+   - TODO: CNN: Image encoding over K-line graphs (from draw.py)
 
 2. Multiple preprocessing approaches:
    - Raw values (close, open, high, low, volume)
@@ -21,7 +21,7 @@
 
 5. Multiple prediction horizons:
    - 1min, 30min, 1day, 2day ahead
-   - Next day OHLC predictions
+   - TODO: Next day OHLC predictions
 """
 import torch
 import torch.nn as nn
@@ -45,7 +45,6 @@ torch.autograd.set_detect_anomaly(True)
 class PriceHistoryDataset(Dataset):
     def __init__(self, stock_data: Dict[str, np.ndarray],
                  stock_targets: Dict[str, np.ndarray],
-                 stock_returns: Dict[str, np.ndarray],
                  seq_len: int,
                  pred_len: int):
         """
@@ -53,14 +52,11 @@ class PriceHistoryDataset(Dataset):
             stock_data: Dict mapping stock_id to full feature array (T, F)
             stock_targets: Dict mapping stock_id to full target array (T,)
               - normalized prices
-            stock_returns: Dict mapping stock_id to full raw close prices (T,)
-              - for return calculation
             seq_len: Sequence length for context
             pred_len: Prediction length
         """
         self.stock_data = stock_data
         self.targets = stock_targets
-        self.returns = stock_returns
         self.seq_len = seq_len
         self.pred_len = pred_len
 
@@ -102,12 +98,12 @@ class PriceHistoryDataset(Dataset):
 
         # Vectorize outer loop using slicing
         current_positions = target_start + np.arange(self.pred_len)
-        current_prices = self.returns[stock_id][current_positions]
+        current_prices = self.targets[stock_id][current_positions]
 
         for h_idx, horizon in enumerate(self.horizons):
             future_positions = current_positions + horizon
             targets[:, h_idx] = self.targets[stock_id][future_positions]
-            future_prices = self.returns[stock_id][future_positions]
+            future_prices = self.targets[stock_id][future_positions]
 
             return_targets[:, h_idx] = future_prices / current_prices
 
@@ -190,7 +186,8 @@ class QuantizeEncoder(dummyLightning):
 
     def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
         # x: (batch, 1) - single feature values
-        quantiles_tensor = torch.from_numpy(quantiles[1:-1]).to(x.device, dtype=x.dtype)
+        quantiles_tensor = torch.from_numpy(quantiles[1:-1]).to(x.device,
+                                                                dtype=x.dtype)
         tokens = torch.bucketize(x.squeeze(-1), quantiles_tensor, right=True)
         result = self.embedding(tokens)
         return result
@@ -206,16 +203,31 @@ class CentsEncoder(dummyLightning):
                               config.embed_dim)
 
     def forward(self, x):
-        """Convert cent differences to tokens"""
+        """Convert cent differences to tokens
+
+        Args:
+            x: (batch, num_cent_features) - delta price features (ret_1min, ret_30min)
+
+        Returns:
+            (batch, embed_dim) - projected embeddings
+        """
+        # Convert to cents and clamp
+        # x: (batch, num_cent_features)
         x = (x * 100).long().clamp(-self.max_cent_abs-1, self.max_cent_abs+1)
         x = x + self.max_cent_abs + 1
-        x = x.squeeze(-1)  # TODO: ?
-        return self.embedding(x)
+
+        # Embed each feature: (batch, num_cent_features, embed_dim)
+        embedded = self.embedding(x)
+
+        # Flatten and project: (batch, num_cent_features * embed_dim) -> (batch, embed_dim)
+        batch_size = embedded.shape[0]
+        flattened = embedded.reshape(batch_size, -1)
+        return self.proj(flattened)
 
 
 class SinEncoder(dummyLightning):
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
 
         freqs = torch.exp(
             torch.linspace(0, np.log(config.max_freq), config.sin_embed_dim // 2)
@@ -255,9 +267,10 @@ class MultiEncoder(dummyLightning):
         batch_size, seq_len, feat_dim = x.shape
 
         x_flat = x.view(-1, feat_dim)
+        # Cent encoder uses features at indices 2-3 (ret_1min, ret_30min)
         embeddings = [
             self.quantize_encoder(x_flat, self.quantiles),
-            self.cent_encoder(x_flat[:, :self.num_cent_features]),
+            self.cent_encoder(x_flat[:, 2:2+self.num_cent_features]),  # ret_1min, ret_30min
             self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
@@ -456,10 +469,8 @@ class FinalPipeline(dummyLightning):
 
     def _save_cache(self, train_stock_data: Dict[str, np.ndarray],
                     train_stock_targets: Dict[str, np.ndarray],
-                    train_stock_returns: Dict[str, np.ndarray],
                     val_stock_data: Dict[str, np.ndarray],
                     val_stock_targets: Dict[str, np.ndarray],
-                    val_stock_returns: Dict[str, np.ndarray],
                     quantiles: Dict[str, np.ndarray]):
         """Save dataset dictionaries to disk cache"""
         cache_path = self._get_cache_path()
@@ -480,16 +491,12 @@ class FinalPipeline(dummyLightning):
                 save_dict[f'train_data_{stock_id}'] = data
             for stock_id, targets in train_stock_targets.items():
                 save_dict[f'train_target_{stock_id}'] = targets
-            for stock_id, returns in train_stock_returns.items():
-                save_dict[f'train_return_{stock_id}'] = returns
 
             # Save val data
             for stock_id, data in val_stock_data.items():
                 save_dict[f'val_data_{stock_id}'] = data
             for stock_id, targets in val_stock_targets.items():
                 save_dict[f'val_target_{stock_id}'] = targets
-            for stock_id, returns in val_stock_returns.items():
-                save_dict[f'val_return_{stock_id}'] = returns
 
             # Save stock IDs as metadata
             train_ids = list(train_stock_data.keys())
@@ -502,8 +509,6 @@ class FinalPipeline(dummyLightning):
             print(f"Cache saved successfully!")
 
     def _load_cache(self) -> Optional[Tuple[Dict[str, np.ndarray],
-                                             Dict[str, np.ndarray],
-                                             Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
@@ -522,10 +527,8 @@ class FinalPipeline(dummyLightning):
         # Reconstruct dictionaries
         train_stock_data = {}
         train_stock_targets = {}
-        train_stock_returns = {}
         val_stock_data = {}
         val_stock_targets = {}
-        val_stock_returns = {}
         quantiles = {}
 
         # Load metadata
@@ -541,19 +544,17 @@ class FinalPipeline(dummyLightning):
         for stock_id in train_ids:
             train_stock_data[stock_id] = data[f'train_data_{stock_id}']
             train_stock_targets[stock_id] = data[f'train_target_{stock_id}']
-            train_stock_returns[stock_id] = data[f'train_return_{stock_id}']
 
         # Load val data
         for stock_id in val_ids:
             val_stock_data[stock_id] = data[f'val_data_{stock_id}']
             val_stock_targets[stock_id] = data[f'val_target_{stock_id}']
-            val_stock_returns[stock_id] = data[f'val_return_{stock_id}']
 
         if self.is_main_process():
             print(f"Cache loaded successfully! "
                   f"{len(train_ids)} train stocks, {len(val_ids)} val stocks")
 
-        return train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns, quantiles
+        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles
 
     def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
                      num_bins: int = 256, train_frac: float = 0.9):
@@ -563,18 +564,18 @@ class FinalPipeline(dummyLightning):
         if not self.config.debug_no_cache:
             cached = self._load_cache()
             if cached is not None:
-                train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns, quantiles = cached
+                train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles = cached
                 self.quantiles = quantiles
                 self.encoder.quantiles = self.quantiles['close']
 
                 # Build datasets
                 pred_len = seq_len // 2
                 self.train_dataset = PriceHistoryDataset(
-                    train_stock_data, train_stock_targets, train_stock_returns,
+                    train_stock_data, train_stock_targets,
                     seq_len, pred_len
                 )
                 self.val_dataset = PriceHistoryDataset(
-                    val_stock_data, val_stock_targets, val_stock_returns,
+                    val_stock_data, val_stock_targets,
                     seq_len, pred_len
                 )
                 return
@@ -608,25 +609,25 @@ class FinalPipeline(dummyLightning):
         self.encoder.quantiles = self.quantiles['close']
 
         # Build sequences
-        train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns = self._bs(df, seq_len)
+        train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = self._bs(df, seq_len)
         self.train_dataset = train_stock_data  # Will be reassigned below
         self.val_dataset = val_stock_data  # Will be reassigned below
 
         # Save to cache
         self._save_cache(
-            train_stock_data, train_stock_targets, train_stock_returns,
-            val_stock_data, val_stock_targets, val_stock_returns,
+            train_stock_data, train_stock_targets,
+            val_stock_data, val_stock_targets,
             self.quantiles
         )
 
         # Build dataset objects
         pred_len = seq_len // 2
         self.train_dataset = PriceHistoryDataset(
-            train_stock_data, train_stock_targets, train_stock_returns,
+            train_stock_data, train_stock_targets,
             seq_len, pred_len
         )
         self.val_dataset = PriceHistoryDataset(
-            val_stock_data, val_stock_targets, val_stock_returns,
+            val_stock_data, val_stock_targets,
             seq_len, pred_len
         )
 
@@ -779,13 +780,13 @@ class FinalPipeline(dummyLightning):
         return df
 
     def _bs(self, df, seq_len) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray],
-                                         Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+                                         Dict[str, np.ndarray]]:
         """
         Build sequences and return the data dictionaries.
 
         Returns:
-            train_stock_data, train_stock_targets, train_stock_returns,
-            val_stock_data, val_stock_targets, val_stock_returns
+            train_stock_data, train_stock_targets,
+            val_stock_data, val_stock_targets
         """
 
         time_stats = df.group_by('datetime').agg(
@@ -837,7 +838,7 @@ class FinalPipeline(dummyLightning):
                 val_stock_data[stock_id] = features[val_mask]
                 val_stock_targets[stock_id] = close[val_mask]
 
-        return train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns
+        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
@@ -1104,6 +1105,14 @@ class FinalPipelineConfig:
     num_bins: int = 256
     max_cent_abs: int = 64
     embed_dim: int = 256
+
+    # Feature counts (14 total: close, close_norm, ret_1min, ret_30min,
+    # ret_1min_ratio, ret_30min_ratio, ret_1day_ratio, ret_2day_ratio,
+    # close_open_ratio, high_open_ratio, low_open_ratio, high_low_ratio,
+    # volume, volume_norm)
+    num_features: int = 14
+    # Cent-encoded features: ret_1min, ret_30min (indices 2-3)
+    num_cent_features: int = 2
 
     num_horizons: int = 4
     num_quantiles: int = 5
