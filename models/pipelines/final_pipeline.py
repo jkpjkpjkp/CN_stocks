@@ -184,10 +184,9 @@ class QuantizeEncoder(dummyLightning):
         super().__init__(config)
         self.embedding = nn.Embedding(config.num_bins, config.embed_dim)
 
-    def forward(self, x: torch.Tensor, quantiles: np.ndarray) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, quantiles: torch.Tensor) -> torch.Tensor:
         # x: (batch, 1) - single feature values
-        quantiles_tensor = torch.from_numpy(quantiles[1:-1]).to(x.device,
-                                                                dtype=x.dtype)
+        quantiles_tensor = quantiles[1:-1].to(x.device, dtype=x.dtype)
         tokens = torch.bucketize(x.squeeze(-1), quantiles_tensor, right=True)
         result = self.embedding(tokens)
         return result
@@ -267,9 +266,10 @@ class MultiEncoder(dummyLightning):
         batch_size, seq_len, feat_dim = x.shape
 
         x_flat = x.view(-1, feat_dim)
+        # Quantize encoder uses feature at index 0 (close)
         # Cent encoder uses features at indices 2-3 (ret_1min, ret_30min)
         embeddings = [
-            self.quantize_encoder(x_flat, self.quantiles),
+            self.quantize_encoder(x_flat[:, 0:1], self.quantiles),
             self.cent_encoder(x_flat[:, 2:2+self.num_cent_features]),  # ret_1min, ret_30min
             self.sin_encoder(x_flat),
         ]
@@ -471,7 +471,7 @@ class FinalPipeline(dummyLightning):
                     train_stock_targets: Dict[str, np.ndarray],
                     val_stock_data: Dict[str, np.ndarray],
                     val_stock_targets: Dict[str, np.ndarray],
-                    quantiles: Dict[str, np.ndarray]):
+                    quantiles: Dict[str, torch.Tensor]):
         """Save dataset dictionaries to disk cache"""
         cache_path = self._get_cache_path()
 
@@ -484,7 +484,11 @@ class FinalPipeline(dummyLightning):
 
             # Save quantiles
             for key, value in quantiles.items():
-                save_dict[f'quantile_{key}'] = value
+                # Convert torch.Tensor to numpy for saving
+                if isinstance(value, torch.Tensor):
+                    save_dict[f'quantile_{key}'] = value.cpu().numpy()
+                else:
+                    save_dict[f'quantile_{key}'] = value
 
             # Save train data
             for stock_id, data in train_stock_data.items():
@@ -512,7 +516,7 @@ class FinalPipeline(dummyLightning):
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
-                                             Dict[str, np.ndarray]]]:
+                                             Dict[str, torch.Tensor]]]:
         """Load dataset dictionaries from disk cache"""
         cache_path = self._get_cache_path()
 
@@ -538,7 +542,7 @@ class FinalPipeline(dummyLightning):
 
         # Load quantiles
         for key in quantile_keys:
-            quantiles[key] = data[f'quantile_{key}']
+            quantiles[key] = torch.from_numpy(data[f'quantile_{key}']).float()
 
         # Load train data
         for stock_id in train_ids:
@@ -862,7 +866,7 @@ class FinalPipeline(dummyLightning):
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
-        quantiles_tensor = torch.from_numpy(self.quantiles['close']).to(y.device, dtype=y.dtype)
+        quantiles_tensor = self.quantiles['close'].to(y.device, dtype=y.dtype)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
         target_quantized = torch.clamp(target_quantized, 0, self.config.num_bins - 1)
 
@@ -1175,6 +1179,7 @@ config = FinalPipelineConfig(
     debug_model=True,
     debug_horizons=True,
 )
+
 
 def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfig:
     """Parse CLI arguments and override config fields"""
