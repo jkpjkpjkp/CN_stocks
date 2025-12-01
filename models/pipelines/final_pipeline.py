@@ -199,24 +199,26 @@ class QuantizeEncoder(dummyLightning):
 class CentsEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.max_cents = config.max_cents
-        self.embedding = nn.Embedding(2 * config.max_cents + 3,
+        self.max_cent_abs = config.max_cent_abs
+        self.embedding = nn.Embedding(2 * config.max_cent_abs + 3,
                                       config.embed_dim)
+        self.proj = nn.Linear(config.embed_dim * config.num_cent_features,
+                              config.embed_dim)
 
     def forward(self, x):
         """Convert cent differences to tokens"""
-        x = torch.clamp(x, -self.max_cents-1, self.max_cents+1)
-        x = x + self.max_cents + 1
+        x = (x * 100).long().clamp(-self.max_cent_abs-1, self.max_cent_abs+1)
+        x = x + self.max_cent_abs + 1
         x = x.squeeze(-1)  # TODO: ?
         return self.embedding(x)
 
 
-class SinEncoder(nn.Module):
+class SinEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__()
 
         freqs = torch.exp(
-            torch.linspace(0, np.log(config.max_freq), config.embed_dim // 2)
+            torch.linspace(0, np.log(config.max_freq), config.sin_embed_dim // 2)
         )
         freqs = freqs.unsqueeze(0).unsqueeze(0)
         self.register_buffer('freqs', freqs)
@@ -224,7 +226,7 @@ class SinEncoder(nn.Module):
         # Project flattened sin/cos features to embed_dim
         # Input will be (batch, features * embed_dim) after flattening
         # For 12 features: 12 * embed_dim
-        self.proj = nn.Linear(12 * config.embed_dim, config.embed_dim)
+        self.proj = nn.Linear(config.num_features * config.sin_embed_dim, config.embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, features)"""
@@ -254,9 +256,9 @@ class MultiEncoder(dummyLightning):
 
         x_flat = x.view(-1, feat_dim)
         embeddings = [
-            self.quantize_encoder(x_flat[:, 0:1], self.quantiles),
-            self.cent_encoder((x_flat[:, 1:2] * 100).long()),
-            self.sin_encoder(x_flat[:, 2:]),
+            self.quantize_encoder(x_flat, self.quantiles),
+            self.cent_encoder(x_flat[:, :self.num_cent_features]),
+            self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
 
@@ -267,7 +269,6 @@ class MultiReadout(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
 
-        # Price prediction heads
         self.quantized_head = nn.Linear(config.hidden_dim,
                                         config.num_bins * self.num_horizons)
         self.cent_head = nn.Linear(config.hidden_dim,
@@ -1101,7 +1102,7 @@ class FinalPipelineConfig:
     seq_len: int = 256
     train_ratio: float = 0.9
     num_bins: int = 256
-    max_cents: int = 64
+    max_cent_abs: int = 64
     embed_dim: int = 256
 
     num_horizons: int = 4
@@ -1143,8 +1144,9 @@ class FinalPipelineConfig:
         self.intermediate_dim = int(self.hidden_dim * self.intermediate_ratio)
         self.head_dim = int(self.hidden_dim * self.attn_ratio / self.num_heads)
 
-        # Data
-        self.num_cents = self.max_cents * 2 + 1
+        # Embedding
+        self.sin_embed_dim = self.embed_dim // 2
+        self.num_cents = self.max_cent_abs * 2 + 1
 
         # Cache directory
         if self.cache_dir is None:
