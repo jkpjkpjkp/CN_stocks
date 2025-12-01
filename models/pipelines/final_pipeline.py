@@ -203,7 +203,7 @@ class QuantizeEncoder(dummyLightning):
         return result
 
 
-class CentQuantizeEncoder(dummyLightning):
+class CentsEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.max_cents = config.max_cents
@@ -212,94 +212,55 @@ class CentQuantizeEncoder(dummyLightning):
 
     def forward(self, x):
         """Convert cent differences to tokens"""
-        x = x.squeeze(-1)
-        tokens = torch.clamp(x, -self.max_cents-1,
-                             self.max_cents+1
-                             ) + self.max_cents + 1
-        tokens = torch.where(torch.isnan(x), torch.zeros_like(tokens), tokens)
-        return self.embedding(tokens)
+        x = torch.clamp(x, -self.max_cents-1, self.max_cents+1)
+        x = x + self.max_cents + 1
+        x = x.squeeze(-1)  # TODO: ?
+        return self.embedding(x)
 
 
 class SinEncoder(nn.Module):
-    """Sinusoidal encoding for continuous values"""
-
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.embed_dim = config.embed_dim
-        self.max_freq = config.max_freq
 
-        freqs = torch.exp(torch.linspace(0, np.log(self.max_freq),
-                                         self.embed_dim // 2))
+        freqs = torch.exp(
+            torch.linspace(0, np.log(self.max_freq), config.embed_dim // 2)
+        )
+        freqs = freqs.unsqueeze(0).unsqueeze(0)
         self.register_buffer('freqs', freqs)
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, features)"""
-        # Take the mean across feature dimension for sinusoidal encoding
-        x_mean = x.mean(dim=-1, keepdim=True)  # (batch, 1)
-
-        # Apply sinusoidal encoding
-        sin_emb = torch.sin(x_mean * self.freqs.unsqueeze(0))
-        cos_emb = torch.cos(x_mean * self.freqs.unsqueeze(0))
-
-        # Interleave sin and cos
-        emb = torch.stack([sin_emb, cos_emb], dim=-1).flatten(start_dim=-2)
-        emb = emb[..., :self.embed_dim]
-        return emb
+        sin_emb = torch.sin(x * self.freqs)
+        cos_emb = torch.cos(x * self.freqs)
+        return torch.stack((sin_emb, cos_emb), dim=-1)
 
 
 class MultiEncoder(dummyLightning):
-    """Combines multiple encoding strategies"""
-
-    def __init__(self, config, quantiles: Optional[np.ndarray] = None):
+    def __init__(self, config):
         super().__init__(config)
-        self.config = config
-        self.quantiles = quantiles
-
-        # Individual encoders
         self.quantize_encoder = QuantizeEncoder(config)
-        self.cent_encoder = CentQuantizeEncoder(config)
+        self.cent_encoder = CentsEncoder(config)
         self.sin_encoder = SinEncoder(config)
 
-        # Combine different encodings
-        total_dim = config.embed_dim * 3  # 3 encoding types (quant, cent, sin)
-        self.combiner = nn.Linear(total_dim, config.hidden_dim)
+        self.combiner = nn.Linear(3 * config.embed_dim, config.hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, seq_len, features)"""
         batch_size, seq_len, feat_dim = x.shape
 
-        # Flatten for processing
         x_flat = x.view(-1, feat_dim)
-        # Apply different encodings to different features
-        embeddings = []
+        embeddings = [
+            self.quantize_encoder(x_flat[:, 0:1], self.quantiles),
+            self.cent_encoder((x_flat[:, 1:2] * 100).long()),
+            self.sin_encoder(x_flat[:, 2:]),
+        ]
+        output = self.combiner(torch.cat(embeddings, dim=-1))
 
-        # Quantize encoding (use first feature)
-        # TODO: use more features
-        quant_emb = self.quantize_encoder(x_flat[:, 0:1], self.quantiles)
-        embeddings.append(quant_emb)
-
-        # Cent quantization (use return features)
-        cent_emb = self.cent_encoder((x_flat[:, 2:3] * 100).long())
-        embeddings.append(cent_emb)
-
-        # Sin encoding (use all features)
-        sin_emb = self.sin_encoder(x_flat)
-        embeddings.append(sin_emb)
-
-        # Combine embeddings - all should have shape (batch_size * seq_len,
-        #                                             hidden_dim)
-
-        combined = torch.cat(embeddings, dim=-1)
-        output = self.combiner(combined)
-
-        # Reshape back to sequence format
-        return output.view(batch_size, seq_len, -1)
+        return output.unflatten(0, (batch_size, seq_len))
 
 
 class MultiReadout(dummyLightning):
-    """Multiple readout strategies and multi-horizons"""
-
     def __init__(self, config):
         super().__init__(config)
 
