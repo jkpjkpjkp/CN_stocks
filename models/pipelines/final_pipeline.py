@@ -585,10 +585,12 @@ class FinalPipeline(dummyLightning):
         else:
             df = pl.read_parquet(str(path))
         df = df.sort(['id', 'datetime'])
+        assert len(df)
 
         df = self._compute_features(df)
-        df = self._detect_trading_gaps(df)  # Add gap detection
+        assert len(df)
         df = self._split_data(df, train_frac)
+        assert len(df)
         self.quantiles = self._compute_quantiles(df, num_bins)
 
         self.encoder.quantiles = self.quantiles['close']
@@ -698,10 +700,15 @@ class FinalPipeline(dummyLightning):
         return df
 
     def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
-        unique_datetimes = df['datetime'].unique().sort()
-        cutoff = unique_datetimes.quantile(train_frac)
+        cutoff = df.select(
+            pl.col('datetime').unique().cast(pl.Int64).quantile(0.9)
+        )
 
-        df = df.with_columns((pl.col('datetime') <= cutoff).alias('is_train'))
+        df = df.with_columns(
+            is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff['datetime'])
+        )
+        assert len(df.filter('is_train'))
+        assert len(df.filter(~pl.col('is_train')))
 
         stats = df.filter(pl.col('is_train')).group_by('id').agg([
             pl.col('close').mean().alias('mean_close'),
@@ -710,30 +717,15 @@ class FinalPipeline(dummyLightning):
             pl.col('volume').std().alias('std_volume')
         ])
 
-        df = df.join(stats, on='id')
+        df = df.join(stats, on='id', how='left')
+        assert len(df)
 
-        # Compute 2010-2020 average price per stock for normalization
-        # Filter for dates in 2010-2020 range
-        year_2010 = pl.datetime(2010, 1, 1)
-        year_2021 = pl.datetime(2021, 1, 1)
-
-        baseline_stats = df.filter(
-            (pl.col('datetime') >= year_2010) &
-            (pl.col('datetime') < year_2021)
-        ).group_by('id').agg(
-            per_stock_mean_close=pl.col('close').mean(),
-        )
-
-        df = df.lazy()\
-               .filter(pl.col('id').is_in(baseline_stats['id'].implode()))\
-               .join(baseline_stats.lazy(), on='id', how='left')
-
-        # normalized features
+        # normalize
         df = df.with_columns(
             ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-8)).alias('close_norm'),
             ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
-            (pl.col('close') / (pl.col('per_stock_mean_close') + 1e-8)).alias('close_baseline_norm')
-        ).collect()
+        )
+        assert len(df)
 
         return df
 
@@ -742,6 +734,7 @@ class FinalPipeline(dummyLightning):
         """Compute quantiles for different features"""
 
         train_df = df.filter(pl.col('is_train'))
+        assert len(df)
 
         quantiles = {}
         for col in ['close', 'ret_1min', 'ret_30min', 'volume']:
@@ -753,7 +746,7 @@ class FinalPipeline(dummyLightning):
             k_indices = (q_positions * (n - 1)).long() + 1
             k_indices = torch.clamp(k_indices, 1, n)
 
-            data = data.sort()
+            data.sort()
             quantile_values = data[k_indices - 1]  # -1 for 0-indexed
             quantiles[col] = quantile_values
 
@@ -803,7 +796,7 @@ class FinalPipeline(dummyLightning):
         val_stock_returns = {}
 
         cols = [
-            'close', 'close_norm', 'close_baseline_norm', 'ret_1min',
+            'close', 'close_norm', 'ret_1min',
             'ret_30min', 'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio',
             'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
             'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
@@ -818,9 +811,8 @@ class FinalPipeline(dummyLightning):
 
             features = stock_df.select(cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
-            close = stock_df['close_baseline_norm'].to_numpy().astype(np.float32)
-            close_raw = stock_df['close'].to_numpy().astype(np.float32)  # For return calculation
-
+            close = stock_df['close_norm'].to_numpy().astype(np.float32)
+            
             # Split each stock's data by time - train data and val data
             train_mask = is_train.astype(bool)
             val_mask = ~train_mask
@@ -829,13 +821,11 @@ class FinalPipeline(dummyLightning):
             if train_mask.sum() > seq_len + 1:
                 train_stock_data[stock_id] = features[train_mask]
                 train_stock_targets[stock_id] = close[train_mask]
-                train_stock_returns[stock_id] = close_raw[train_mask]
 
             # Only add to val set if we have enough val data
             if val_mask.sum() > seq_len + 1:
                 val_stock_data[stock_id] = features[val_mask]
                 val_stock_targets[stock_id] = close[val_mask]
-                val_stock_returns[stock_id] = close_raw[val_mask]
 
         return train_stock_data, train_stock_targets, train_stock_returns, val_stock_data, val_stock_targets, val_stock_returns
 
