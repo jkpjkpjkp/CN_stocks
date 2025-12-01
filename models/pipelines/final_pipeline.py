@@ -220,12 +220,23 @@ class SinEncoder(nn.Module):
         )
         freqs = freqs.unsqueeze(0).unsqueeze(0)
         self.register_buffer('freqs', freqs)
-    
+
+        # Project flattened sin/cos features to embed_dim
+        # Input will be (batch, features * embed_dim) after flattening
+        # For 12 features: 12 * embed_dim
+        self.proj = nn.Linear(12 * config.embed_dim, config.embed_dim)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, features)"""
-        sin_emb = torch.sin(x * self.freqs)
-        cos_emb = torch.cos(x * self.freqs)
-        return torch.stack((sin_emb, cos_emb), dim=-1)
+        # x: (batch, features), freqs: (1, 1, embed_dim // 2)
+        # Add dimension for broadcasting: (batch, features, 1) * (1, 1, embed_dim // 2) -> (batch, features, embed_dim // 2)
+        sin_emb = torch.sin(x.unsqueeze(-1) * self.freqs)
+        cos_emb = torch.cos(x.unsqueeze(-1) * self.freqs)
+        # Stack: (batch, features, embed_dim // 2, 2), then flatten to (batch, features * embed_dim)
+        stacked = torch.stack((sin_emb, cos_emb), dim=-1)
+        flattened = stacked.flatten(1)
+        # Project to embed_dim: (batch, features * embed_dim) -> (batch, embed_dim)
+        return self.proj(flattened)
 
 
 class MultiEncoder(dummyLightning):
