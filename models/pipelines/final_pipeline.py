@@ -221,8 +221,8 @@ class TransformerBlock(dummyLightning):
 class QuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.num_bins, config.embed_dim)
-        self.proj = nn.Linear(config.embed_dim * config.num_quantize_features,
+        self.embedding = nn.Embedding(config.num_bins, config.quantize_embed_dim)
+        self.proj = nn.Linear(config.quantize_embed_dim * config.num_quantize_features,
                               config.embed_dim)
 
     def forward(self, x: torch.Tensor, quantiles: torch.Tensor):
@@ -787,7 +787,7 @@ class FinalPipeline(dummyLightning):
 
     def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
         cutoff = df.select(
-            pl.col('datetime').unique().cast(pl.Int64).quantile(0.9)
+            pl.col('datetime').sample(1000000, with_replacement=self.debug_data).unique().cast(pl.Int64).quantile(0.9)
         ).collect()['datetime'][0]
 
         df = df.with_columns(
@@ -822,20 +822,29 @@ class FinalPipeline(dummyLightning):
             torch.Tensor: (num_bins+1, num_features) quantile boundaries
         """
         train_df = df.filter(pl.col('is_train'))
+        q_positions = [i / num_bins for i in range(num_bins + 1)]
 
+        # Compute all quantiles for all columns in a single Polars query
+        sample_exprs = []
+        quantile_exprs = []
+        for col in self.feature_cols:
+            sample_exprs.append(pl.col(col).sample(1000000, with_replacement=self.debug_data))
+            for i, q in enumerate(q_positions):
+                quantile_exprs.append(
+                    pl.col(col).quantile(q, interpolation='linear').alias(f'{col}_q{i}')
+                )
+
+        # Single collect - much more memory efficient
+        result = train_df.select(sample_exprs).select(quantile_exprs).collect()
+
+        # Build tensor from results
         quantiles_list = []
         for col in self.feature_cols:
-            data = train_df.select(pl.col(col).sample(10000000, with_replacement=self.debug_data)).collect().to_torch().squeeze(0).float()
-            n = len(data)
-            assert n
-            # Compute k-th values for each quantile position
-            q_positions = torch.linspace(0, 1, num_bins + 1)
-            k_indices = (q_positions * (n - 1)).long() + 1
-            k_indices = torch.clamp(k_indices, 1, n)
+            col_quantiles = [result[f'{col}_q{i}'][0] for i in range(len(q_positions))]
+            quantiles_list.append(torch.tensor(col_quantiles, dtype=torch.float32))
 
-            data.sort()
-            quantile_values = data[k_indices - 1]  # -1 for 0-indexed
-            quantiles_list.append(quantile_values)
+        del result
+        gc.collect()
 
         # Stack to (num_bins+1, num_features)
         quantiles = torch.stack(quantiles_list, dim=1)
@@ -956,7 +965,11 @@ class FinalPipeline(dummyLightning):
                 del val_features, val_targets
 
             # Clean up intermediate arrays
-            del features, is_train, close
+            del stock_df, features, is_train, close
+
+            # Periodic garbage collection to prevent memory buildup
+            if idx % 100 == 0:
+                gc.collect()
 
         if self.is_main_process():
             print(f"Completed processing {total_stocks} stocks with memory-mapped arrays")
@@ -1280,6 +1293,8 @@ class FinalPipelineConfig:
         # Embedding
         self.sin_embed_dim = self.embed_dim // 2
         self.num_cents = self.max_cent_abs * 2 + 1
+        self.num_quantize_features = self.num_features
+        self.quantize_embed_dim = self.sin_embed_dim
 
         # Cache directory
         if self.cache_dir is None:
