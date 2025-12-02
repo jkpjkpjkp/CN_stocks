@@ -722,42 +722,75 @@ class FinalPipeline(dummyLightning):
             chunk_size: Number of stocks to process per chunk (default 300)
 
         Returns:
-            train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
+            train_stock_data, train_stock_targets, val_stock_data,
+            val_stock_targets
         """
         if self.is_main_process():
             print(f"Processing data in chunks of {chunk_size} stocks...")
 
-        # Step 1: Get all unique stock IDs
-        all_stock_ids = pl.scan_parquet(str(path)).select('id').unique().collect()['id'].to_list()
+        # Step 1: Get time-based cutoff for train/val split (lightweight)
+        if self.is_main_process():
+            print("Computing train/val cutoff...")
+        cutoff = (pl.scan_parquet(str(path))
+                  .select(pl.col('datetime')
+                          .sample(1000000)
+                          .unique()
+                          .cast(pl.Int64)
+                          .quantile(0.9))
+                  .collect()['datetime'][0])
+
+        if self.is_main_process():
+            print(f"Train/val cutoff timestamp: {cutoff}")
+        gc.collect()
+
+        # Step 2: Get all unique stock IDs (lightweight)
+        if self.is_main_process():
+            print("Getting stock IDs...")
+        all_stock_ids = (pl.scan_parquet(str(path))
+                        .select('id')
+                        .unique()
+                        .collect()['id']
+                        .to_list())
         total_stocks = len(all_stock_ids)
 
         if self.is_main_process():
             print(f"Total stocks to process: {total_stocks}")
+        gc.collect()
 
-        # Step 2: Compute quantiles from a sample across all stocks
-        # Sample data for quantile computation (doesn't need all data)
+        # Step 3: Compute quantiles from first chunk only
+        # (avoids loading all data)
         if self.is_main_process():
-            print("Computing quantiles from sampled data...")
+            print("Computing quantiles from first chunk...")
 
-        df_sample = pl.scan_parquet(str(path))
+        first_chunk_ids = all_stock_ids[:chunk_size]
+        df_sample = (pl.scan_parquet(str(path))
+                    .filter(pl.col('id').is_in(first_chunk_ids)))
         df_sample = self._compute_features(df_sample)
-        df_sample = self._split_data(df_sample, train_frac)
+        df_sample = df_sample.with_columns(
+            is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff)
+        )
+
+        # Compute stats for normalization from training data
+        stats = df_sample.filter(pl.col('is_train')).group_by('id').agg([
+            pl.col('close').mean().alias('mean_close'),
+            pl.col('close').std().alias('std_close'),
+            pl.col('volume').mean().alias('mean_volume'),
+            pl.col('volume').std().alias('std_volume')
+        ])
+
+        df_sample = df_sample.join(stats, on='id', how='left')
+        df_sample = df_sample.with_columns(
+            ((pl.col('close') - pl.col('mean_close'))
+             / (pl.col('std_close') + 1e-8)).alias('close_norm'),
+            ((pl.col('volume') - pl.col('mean_volume'))
+             / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
+        )
+
+        # Compute quantiles
         self.quantiles = self._compute_quantiles(df_sample, num_bins)
         self.encoder.quantiles = self.quantiles
-        del df_sample
+        del df_sample, stats
         gc.collect()
-
-        # Step 3: Get time-based cutoff for train/val split
-        # Re-compute it here to get the cutoff value
-        df_for_cutoff = pl.scan_parquet(str(path))
-        cutoff = df_for_cutoff.select(
-            pl.col('datetime').sample(1000000).unique().cast(pl.Int64).quantile(0.9)
-        ).collect()['datetime'][0]
-        del df_for_cutoff
-        gc.collect()
-
-        if self.is_main_process():
-            print(f"Train/val cutoff timestamp: {cutoff}")
 
         # Step 4: Process stocks in chunks
         train_stock_data = {}
@@ -774,13 +807,13 @@ class FinalPipeline(dummyLightning):
             chunk_stock_ids = all_stock_ids[start_idx:end_idx]
 
             if self.is_main_process():
-                print(f"\nProcessing chunk {chunk_idx + 1}/{num_chunks} "
-                      f"(stocks {start_idx}-{end_idx}, {len(chunk_stock_ids)} stocks)")
+                print(f"\nChunk {chunk_idx + 1}/{num_chunks} "
+                      f"(stocks {start_idx}-{end_idx}, "
+                      f"{len(chunk_stock_ids)} stocks)")
 
             # Load only this chunk of stocks
-            df_chunk = pl.scan_parquet(str(path)).filter(
-                pl.col('id').is_in(chunk_stock_ids)
-            )
+            df_chunk = (pl.scan_parquet(str(path))
+                       .filter(pl.col('id').is_in(chunk_stock_ids)))
 
             # Compute features for this chunk
             df_chunk = self._compute_features(df_chunk)
@@ -800,8 +833,10 @@ class FinalPipeline(dummyLightning):
 
             df_chunk = df_chunk.join(stats, on='id', how='left')
             df_chunk = df_chunk.with_columns(
-                ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-8)).alias('close_norm'),
-                ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
+                ((pl.col('close') - pl.col('mean_close'))
+                 / (pl.col('std_close') + 1e-8)).alias('close_norm'),
+                ((pl.col('volume') - pl.col('mean_volume'))
+                 / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
             )
 
             # Compute time-based stats for this chunk
@@ -811,15 +846,17 @@ class FinalPipeline(dummyLightning):
             )
             df_chunk = df_chunk.join(time_stats, on='datetime')
             df_chunk = df_chunk.with_columns(
-                close_time_norm=((pl.col('close') - pl.col('time_mean_close'))
+                close_time_norm=((pl.col('close')
+                                  - pl.col('time_mean_close'))
                                  / (pl.col('time_std_close') + 1e-8))
             )
 
-            # Process each stock in the chunk
+            # Collect chunk
             chunk_df = df_chunk.collect()
-            del df_chunk
+            del df_chunk, stats, time_stats
             gc.collect()
 
+            # Process each stock in the chunk
             for stock_id in chunk_stock_ids:
                 stock_df = chunk_df.filter(pl.col('id') == stock_id)
 
@@ -827,7 +864,9 @@ class FinalPipeline(dummyLightning):
                     continue
 
                 # Convert to numpy
-                features = stock_df.select(self.feature_cols).to_numpy().astype(np.float32)
+                features = (stock_df.select(self.feature_cols)
+                           .to_numpy()
+                           .astype(np.float32))
                 is_train = stock_df['is_train'].to_numpy()
                 close = stock_df['close_norm'].to_numpy().astype(np.float32)
 
@@ -837,8 +876,10 @@ class FinalPipeline(dummyLightning):
 
                 # Save training data
                 if train_mask.sum() > seq_len + 1:
-                    train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
-                    train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
+                    train_features_path = (mmap_dir
+                                          / f"train_data_{stock_id}.npy")
+                    train_targets_path = (mmap_dir
+                                         / f"train_target_{stock_id}.npy")
 
                     train_features = features[train_mask]
                     train_targets = close[train_mask]
@@ -846,15 +887,19 @@ class FinalPipeline(dummyLightning):
                     np.save(train_features_path, train_features)
                     np.save(train_targets_path, train_targets)
 
-                    train_stock_data[stock_id] = np.load(train_features_path, mmap_mode='r')
-                    train_stock_targets[stock_id] = np.load(train_targets_path, mmap_mode='r')
+                    train_stock_data[stock_id] = np.load(
+                        train_features_path, mmap_mode='r')
+                    train_stock_targets[stock_id] = np.load(
+                        train_targets_path, mmap_mode='r')
 
                     del train_features, train_targets
 
                 # Save validation data
                 if val_mask.sum() > seq_len + 1:
-                    val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
-                    val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
+                    val_features_path = (mmap_dir
+                                        / f"val_data_{stock_id}.npy")
+                    val_targets_path = (mmap_dir
+                                       / f"val_target_{stock_id}.npy")
 
                     val_features = features[val_mask]
                     val_targets = close[val_mask]
@@ -862,14 +907,16 @@ class FinalPipeline(dummyLightning):
                     np.save(val_features_path, val_features)
                     np.save(val_targets_path, val_targets)
 
-                    val_stock_data[stock_id] = np.load(val_features_path, mmap_mode='r')
-                    val_stock_targets[stock_id] = np.load(val_targets_path, mmap_mode='r')
+                    val_stock_data[stock_id] = np.load(
+                        val_features_path, mmap_mode='r')
+                    val_stock_targets[stock_id] = np.load(
+                        val_targets_path, mmap_mode='r')
 
                     del val_features, val_targets
 
                 del stock_df, features, is_train, close
 
-            # Clean up chunk
+            # Clean up chunk completely
             del chunk_df
             gc.collect()
 
@@ -877,14 +924,18 @@ class FinalPipeline(dummyLightning):
             process = psutil.Process()
             mem_gb = process.memory_info().rss / (1024 ** 3)
             if self.is_main_process():
-                print(f"  Memory after chunk: {mem_gb:.2f} GB, "
-                      f"train stocks: {len(train_stock_data)}, val stocks: {len(val_stock_data)}")
+                print(f"  Memory: {mem_gb:.2f} GB, "
+                      f"train: {len(train_stock_data)}, "
+                      f"val: {len(val_stock_data)}")
 
         if self.is_main_process():
-            print(f"\nCompleted processing {total_stocks} stocks in {num_chunks} chunks")
-            print(f"Final: {len(train_stock_data)} train stocks, {len(val_stock_data)} val stocks")
+            print(f"\nCompleted {total_stocks} stocks in "
+                  f"{num_chunks} chunks")
+            print(f"Final: {len(train_stock_data)} train stocks, "
+                  f"{len(val_stock_data)} val stocks")
 
-        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
+        return (train_stock_data, train_stock_targets,
+                val_stock_data, val_stock_targets)
 
     def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
         """Create dataloader with DDP support via DistributedSampler"""
