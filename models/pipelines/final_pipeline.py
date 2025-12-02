@@ -816,7 +816,7 @@ class FinalPipeline(dummyLightning):
 
     def _compute_quantiles(self, df: pl.DataFrame, num_bins: int)\
             -> torch.Tensor:
-        """Compute quantiles for all features
+        """Compute quantiles for all features using sorting and indexing
 
         Returns:
             torch.Tensor: (num_bins+1, num_features) quantile boundaries
@@ -824,26 +824,41 @@ class FinalPipeline(dummyLightning):
         train_df = df.filter(pl.col('is_train'))
         q_positions = [i / num_bins for i in range(num_bins + 1)]
 
-        # Compute all quantiles for all columns in a single Polars query
+        # Sample data for all columns
         sample_exprs = []
-        quantile_exprs = []
         for col in self.feature_cols:
             sample_exprs.append(pl.col(col).sample(1000000, with_replacement=self.debug_data))
-            for i, q in enumerate(q_positions):
-                quantile_exprs.append(
-                    pl.col(col).quantile(q, interpolation='linear').alias(f'{col}_q{i}')
-                )
 
-        # Single collect - much more memory efficient
-        result = train_df.select(sample_exprs).select(quantile_exprs).collect()
+        sampled = train_df.select(sample_exprs).collect()
 
-        # Build tensor from results
+        # Build quantiles by sorting and indexing
         quantiles_list = []
         for col in self.feature_cols:
-            col_quantiles = [result[f'{col}_q{i}'][0] for i in range(len(q_positions))]
+            # Get the column data and sort it
+            col_data = sampled[col].sort()
+            n = len(col_data)
+
+            # Compute index positions for each quantile
+            col_quantiles = []
+            for q in q_positions:
+                # Linear interpolation index: q * (n - 1)
+                idx = q * (n - 1)
+                idx_lower = int(np.floor(idx))
+                idx_upper = int(np.ceil(idx))
+
+                if idx_lower == idx_upper:
+                    # Exact index
+                    quantile_val = col_data[idx_lower]
+                else:
+                    # Linear interpolation between adjacent values
+                    weight = idx - idx_lower
+                    quantile_val = (1 - weight) * col_data[idx_lower] + weight * col_data[idx_upper]
+
+                col_quantiles.append(quantile_val)
+
             quantiles_list.append(torch.tensor(col_quantiles, dtype=torch.float32))
 
-        del result
+        del sampled
         gc.collect()
 
         # Stack to (num_bins+1, num_features)
