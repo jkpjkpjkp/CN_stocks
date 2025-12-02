@@ -787,7 +787,7 @@ class FinalPipeline(dummyLightning):
 
     def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
         cutoff = df.select(
-            pl.col('datetime').sample(1000000, with_replacement=self.debug_data).unique().cast(pl.Int64).quantile(0.9)
+            pl.col('datetime').sample(1000000).unique().cast(pl.Int64).quantile(0.9)
         ).collect()['datetime'][0]
 
         df = df.with_columns(
@@ -824,12 +824,11 @@ class FinalPipeline(dummyLightning):
         train_df = df.filter(pl.col('is_train'))
         q_positions = [i / num_bins for i in range(num_bins + 1)]
 
-        # Sample data for all columns
-        sample_exprs = []
-        for col in self.feature_cols:
-            sample_exprs.append(pl.col(col).sample(1000000, with_replacement=self.debug_data))
-
-        sampled = train_df.select(sample_exprs).collect()
+        # Sample rows once, then select all columns from those rows
+        sampled = (train_df
+                   .select(self.feature_cols)
+                   .collect()
+                   .sample(n=1000000))
 
         # Build quantiles by sorting and indexing
         quantiles_list = []
