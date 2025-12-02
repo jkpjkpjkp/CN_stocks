@@ -73,7 +73,7 @@ class dummyLightning(Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-
+    
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)

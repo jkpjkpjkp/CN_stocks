@@ -37,13 +37,9 @@ from dataclasses import dataclass
 import os
 import gc
 import psutil
-import warnings
 import time
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
-from ..prelude.model import dummyLightning
-from ..prelude.model import Rope
+from ..prelude.model import dummyLightning, Rope, tm
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -175,9 +171,9 @@ class TransformerBlock(dummyLightning):
         self.norm2 = nn.LayerNorm(self.hidden_dim)
 
         self.ffn = nn.Sequential(
-            nn.Linear(self.hidden_dim, config.intermediate_dim),
+            nn.Linear(self.hidden_dim, config.interim_dim),
             nn.SiLU(),
-            nn.Linear(config.intermediate_dim, self.hidden_dim),
+            nn.Linear(config.interim_dim, self.hidden_dim),
         )
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
@@ -221,9 +217,9 @@ class TransformerBlock(dummyLightning):
 class QuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.num_bins,
-                                      config.quantize_embed_dim)
-        self.proj = nn.Linear(config.quantize_embed_dim
+        self.embedding = nn.Embedding(config.n_quantize,
+                                      config.q_dim)
+        self.proj = nn.Linear(config.q_dim
                               * config.num_quantize_features,
                               config.embed_dim)
 
@@ -289,7 +285,7 @@ class SinEncoder(dummyLightning):
 
         freqs = torch.exp(
             torch.linspace(0, np.log(config.max_freq),
-                           config.sin_embed_dim // 2)
+                           config.sin_dim // 2)
         )
         freqs = freqs.unsqueeze(0).unsqueeze(0)
         self.register_buffer('freqs', freqs)
@@ -297,7 +293,7 @@ class SinEncoder(dummyLightning):
         # Project flattened sin/cos features to embed_dim
         # Input will be (batch, features * embed_dim) after flattening
         # For 12 features: 12 * embed_dim
-        self.proj = nn.Linear(config.num_features * config.sin_embed_dim,
+        self.proj = nn.Linear(config.num_features * config.sin_dim,
                               config.embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -344,7 +340,7 @@ class MultiReadout(dummyLightning):
         super().__init__(config)
 
         self.quantized_head = nn.Linear(config.hidden_dim,
-                                        config.num_bins * self.num_horizons)
+                                        config.n_quantize * self.num_horizons)
         self.cent_head = nn.Linear(config.hidden_dim,
                                    config.num_cents * self.num_horizons)
         self.mean_head = nn.Linear(config.hidden_dim, self.num_horizons)
@@ -370,7 +366,7 @@ class MultiReadout(dummyLightning):
         if target_type == 'quantized':
             out = self.quantized_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
-                            self.num_bins)
+                            self.n_quantize)
         elif target_type == 'cent':
             out = self.cent_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
@@ -399,25 +395,8 @@ class FinalPipeline(dummyLightning):
 
     def __init__(self, config):
         super().__init__(config)
-        self.config = config
-
-        # Feature columns in order
-        self.feature_cols = [
-            'close', 'close_norm', 'delta_1min',
-            'delta_30min', 'ret_1min', 'ret_30min', 'ret_1day',
-            'ret_2day', 'close_open', 'high_open',
-            'low_open', 'high_low', 'volume', 'volume_norm'
-        ]
-
-        # DDP setup
-        self.is_distributed = config.use_ddp
-        self.rank = 0
-        self.world_size = 1
-        self.local_rank = 0
-        self._ddp_model = None
-
         self.encoder = MultiEncoder(config)
-        self.backbone = self._build_backbone()
+        self.backbone = tm(config)
         self.readout = MultiReadout(config)
 
         # Loss functions
@@ -441,10 +420,8 @@ class FinalPipeline(dummyLightning):
         self.world_size = world_size
         self.local_rank = int(os.environ.get('LOCAL_RANK', rank))
 
-        # Set device
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.local_rank if not self.config.debug_ddp else 0)
-            self.config.device = f'cuda:{self.local_rank}'
+        torch.cuda.set_device(self.local_rank)
+        self.device = f'cuda:{self.local_rank}'
 
         # Initialize process group
         if not dist.is_initialized():
@@ -456,10 +433,8 @@ class FinalPipeline(dummyLightning):
                 world_size=self.world_size
             )
 
-        self.is_distributed = True
-
         # Move model to device before wrapping with DDP
-        self.to(self.config.device)
+        self.to(self.device)
 
         # Wrap model with DDP
         self._ddp_model = DDP(
@@ -472,24 +447,12 @@ class FinalPipeline(dummyLightning):
         """Return the underlying model (unwrapped from DDP if necessary)"""
         return self._ddp_model.module if self._ddp_model is not None else self
 
-    def barrier(self):
-        """Synchronization barrier across all processes"""
-        if self.is_distributed:
-            dist.barrier()
-
-    def is_main_process(self) -> bool:
-        """Check if this is the main process (rank 0)"""
+    def is_root(self):
         return self.rank == 0
-
-    def cleanup_ddp(self):
-        """Cleanup DDP process group"""
-        if self.is_distributed and dist.is_initialized():
-            dist.destroy_process_group()
-            self.is_distributed = False
 
     def all_reduce(self, tensor: torch.Tensor, op=None) -> torch.Tensor:
         """All-reduce operation across all processes"""
-        if not self.is_distributed:
+        if not self.use_ddp:
             return tensor
 
         if op is None:
@@ -501,7 +464,7 @@ class FinalPipeline(dummyLightning):
 
     def all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
         """Gather tensors from all processes"""
-        if not self.is_distributed:
+        if not self.use_ddp:
             return tensor
 
         tensor_list = [torch.zeros_like(tensor) for _ in range(self.world_size)]
@@ -510,7 +473,7 @@ class FinalPipeline(dummyLightning):
 
     def reduce_dict(self, metrics: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Reduce a dictionary of metrics across all processes"""
-        if not self.is_distributed:
+        if not self.use_ddp:
             return metrics
 
         reduced = {}
@@ -521,14 +484,6 @@ class FinalPipeline(dummyLightning):
                 reduced[key] = value
 
         return reduced
-
-    def _build_backbone(self) -> dummyLightning:
-        layers = []
-
-        for _ in range(self.config.num_layers):
-            layers.append(TransformerBlock(self.config))
-
-        return nn.Sequential(*layers)
 
     def _get_cache_path(self) -> Path:
         """Get the path to the cache file"""
@@ -552,12 +507,12 @@ class FinalPipeline(dummyLightning):
         """
         cache_path = self._get_cache_path()
 
-        if self.is_main_process():
+        if self.is_root():
             print(f"Saving cache metadata to {cache_path}...")
 
             save_dict = {}
 
-            # Save quantiles as single tensor (num_bins+1, num_features)
+            # Save quantiles as single tensor (n_quantize+1, num_features)
             save_dict['quantiles'] = quantiles.cpu().numpy()
 
             # Save stock IDs as metadata (arrays are already on disk)
@@ -584,11 +539,11 @@ class FinalPipeline(dummyLightning):
 
         # Check if mmap directory exists and has files
         if not mmap_dir.exists() or not any(mmap_dir.iterdir()):
-            if self.is_main_process():
+            if self.is_root():
                 print(f"Cache metadata found but mmap directory is missing or empty. Recomputing...")
             return None
 
-        if self.is_main_process():
+        if self.is_root():
             print(f"Loading cache from {cache_path} (memory-mapped mode)...")
 
         # Load metadata
@@ -604,7 +559,7 @@ class FinalPipeline(dummyLightning):
         train_ids = data['_train_ids'].copy()
         val_ids = data['_val_ids'].copy()
 
-        # Load quantiles as single tensor (num_bins+1, num_features)
+        # Load quantiles as single tensor (n_quantize+1, num_features)
         quantiles = torch.from_numpy(data['quantiles'].copy()).float()
 
         # Load memory-mapped arrays for train data
@@ -616,7 +571,7 @@ class FinalPipeline(dummyLightning):
                 train_stock_data[stock_id] = np.load(train_features_path, mmap_mode='r')
                 train_stock_targets[stock_id] = np.load(train_targets_path, mmap_mode='r')
             else:
-                if self.is_main_process():
+                if self.is_root():
                     print(f"Warning: Missing memory-mapped files for train stock {stock_id}")
 
         # Load memory-mapped arrays for val data
@@ -628,21 +583,21 @@ class FinalPipeline(dummyLightning):
                 val_stock_data[stock_id] = np.load(val_features_path, mmap_mode='r')
                 val_stock_targets[stock_id] = np.load(val_targets_path, mmap_mode='r')
             else:
-                if self.is_main_process():
+                if self.is_root():
                     print(f"Warning: Missing memory-mapped files for val stock {stock_id}")
 
-        if self.is_main_process():
+        if self.is_root():
             print(f"Cache loaded successfully (memory-mapped)! "
                   f"{len(train_ids)} train stocks, {len(val_ids)} val stocks")
 
         return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles
 
     def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
-                     num_bins: int = 256, train_frac: float = 0.9):
+                     n_quantize: int = 256, train_frac: float = 0.9):
         """Prepare data with all preprocessing strategies"""
 
         # Try to load from cache if not forcing recalculation
-        if not self.config.debug_no_cache:
+        if not self.config.debug_data:
             cached = self._load_cache()
             if cached is not None:
                 train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles = cached
@@ -662,7 +617,7 @@ class FinalPipeline(dummyLightning):
                 return
 
         # Cache miss or force recalculation - compute from scratch
-        if self.is_main_process():
+        if self.is_root():
             print("Computing data from scratch...")
 
         if path is None:
@@ -679,7 +634,7 @@ class FinalPipeline(dummyLightning):
 
             df = self._compute_features(df)
             df = self._split_data(df, train_frac)
-            self.quantiles = self._compute_quantiles(df, num_bins)
+            self.quantiles = self._compute_quantiles(df, n_quantize)
             self.encoder.quantiles = self.quantiles
 
             # Build sequences
@@ -687,7 +642,7 @@ class FinalPipeline(dummyLightning):
         else:
             # Full dataset - process in chunks to avoid OOM
             train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = \
-                self._prepare_data_chunked(path, seq_len, num_bins, train_frac)
+                self._prepare_data_chunked(path, seq_len, n_quantize, train_frac)
 
         # Save to cache
         self._save_cache(
@@ -707,14 +662,14 @@ class FinalPipeline(dummyLightning):
             seq_len, pred_len
         )
 
-    def _prepare_data_chunked(self, path: Path, seq_len: int, num_bins: int,
+    def _prepare_data_chunked(self, path: Path, seq_len: int, n_quantize: int,
                                train_frac: float, chunk_size: int = 300):
         """Prepare data in chunks to avoid OOM for full dataset.
 
         Args:
             path: Path to parquet file
             seq_len: Sequence length
-            num_bins: Number of quantile bins
+            n_quantize: Number of quantile bins
             train_frac: Fraction of data for training
             chunk_size: Number of stocks to process per chunk (default 300)
 
@@ -722,11 +677,11 @@ class FinalPipeline(dummyLightning):
             train_stock_data, train_stock_targets, val_stock_data,
             val_stock_targets
         """
-        if self.is_main_process():
+        if self.is_root():
             print(f"Processing data in chunks of {chunk_size} stocks...")
 
         # Step 1: Get time-based cutoff for train/val split (lightweight)
-        if self.is_main_process():
+        if self.is_root():
             print("Computing train/val cutoff...")
         cutoff = (pl.scan_parquet(str(path))
                   .select(pl.col('datetime')
@@ -736,12 +691,12 @@ class FinalPipeline(dummyLightning):
                           .quantile(0.9))
                   .collect()['datetime'][0])
 
-        if self.is_main_process():
+        if self.is_root():
             print(f"Train/val cutoff timestamp: {cutoff}")
         gc.collect()
 
         # Step 2: Get all unique stock IDs (lightweight)
-        if self.is_main_process():
+        if self.is_root():
             print("Getting stock IDs...")
         all_stock_ids = (pl.scan_parquet(str(path))
                         .select('id')
@@ -750,13 +705,13 @@ class FinalPipeline(dummyLightning):
                         .to_list())
         total_stocks = len(all_stock_ids)
 
-        if self.is_main_process():
+        if self.is_root():
             print(f"Total stocks to process: {total_stocks}")
         gc.collect()
 
         # Step 3: Compute quantiles from first chunk only
         # (avoids loading all data)
-        if self.is_main_process():
+        if self.is_root():
             print("Computing quantiles from first chunk...")
 
         first_chunk_ids = all_stock_ids[:chunk_size]
@@ -784,7 +739,7 @@ class FinalPipeline(dummyLightning):
         )
 
         # Compute quantiles
-        self.quantiles = self._compute_quantiles(df_sample, num_bins)
+        self.quantiles = self._compute_quantiles(df_sample, n_quantize)
         self.encoder.quantiles = self.quantiles
         del df_sample, stats
         gc.collect()
@@ -803,7 +758,7 @@ class FinalPipeline(dummyLightning):
             end_idx = min(start_idx + chunk_size, total_stocks)
             chunk_stock_ids = all_stock_ids[start_idx:end_idx]
 
-            if self.is_main_process():
+            if self.is_root():
                 print(f"\nChunk {chunk_idx + 1}/{num_chunks} "
                       f"(stocks {start_idx}-{end_idx}, "
                       f"{len(chunk_stock_ids)} stocks)")
@@ -861,7 +816,7 @@ class FinalPipeline(dummyLightning):
                     continue
 
                 # Convert to numpy
-                features = (stock_df.select(self.feature_cols)
+                features = (stock_df.select(self.features)
                            .to_numpy()
                            .astype(np.float32))
                 is_train = stock_df['is_train'].to_numpy()
@@ -920,12 +875,12 @@ class FinalPipeline(dummyLightning):
             # Check memory after each chunk
             process = psutil.Process()
             mem_gb = process.memory_info().rss / (1024 ** 3)
-            if self.is_main_process():
+            if self.is_root():
                 print(f"  Memory: {mem_gb:.2f} GB, "
                       f"train: {len(train_stock_data)}, "
                       f"val: {len(val_stock_data)}")
 
-        if self.is_main_process():
+        if self.is_root():
             print(f"\nCompleted {total_stocks} stocks in "
                   f"{num_chunks} chunks")
             print(f"Final: {len(train_stock_data)} train stocks, "
@@ -938,7 +893,7 @@ class FinalPipeline(dummyLightning):
         """Create dataloader with DDP support via DistributedSampler"""
         from torch.utils.data import DataLoader
 
-        if self.is_distributed:
+        if self.use_ddp:
             # Use DistributedSampler for DDP
             sampler = DistributedSampler(
                 dataset,
@@ -1043,25 +998,25 @@ class FinalPipeline(dummyLightning):
 
         return df
 
-    def _compute_quantiles(self, df: pl.DataFrame, num_bins: int)\
+    def _compute_quantiles(self, df: pl.DataFrame, n_quantize: int)\
             -> torch.Tensor:
         """Compute quantiles for all features using sorting and indexing
 
         Returns:
-            torch.Tensor: (num_bins+1, num_features) quantile boundaries
+            torch.Tensor: (n_quantize+1, num_features) quantile boundaries
         """
         train_df = df.filter(pl.col('is_train'))
-        q_positions = [i / num_bins for i in range(num_bins + 1)]
+        q_positions = [i / n_quantize for i in range(n_quantize + 1)]
 
         # Sample rows once, then select all columns from those rows
         sampled = (train_df
-                   .select(self.feature_cols)
+                   .select(self.features)
                    .collect()
                    .sample(n=1000000))
 
         # Build quantiles by sorting and indexing
         quantiles_list = []
-        for col in self.feature_cols:
+        for col in self.features:
             # Get the column data and sort it
             col_data = sampled[col].sort()
             n = len(col_data)
@@ -1089,7 +1044,7 @@ class FinalPipeline(dummyLightning):
         del sampled
         gc.collect()
 
-        # Stack to (num_bins+1, num_features)
+        # Stack to (n_quantize+1, num_features)
         quantiles = torch.stack(quantiles_list, dim=1)
         return quantiles
 
@@ -1145,7 +1100,7 @@ class FinalPipeline(dummyLightning):
         total_stocks = len(stock_ids)
 
         for idx, stock_id in enumerate(stock_ids):
-            if self.is_main_process() and idx % 100 == 0:
+            if self.is_root() and idx % 100 == 0:
                 print(f"Processing stock {idx}/{total_stocks}: {stock_id}")
 
             stock_df = df.filter(pl.col('id') == stock_id).collect()
@@ -1157,7 +1112,7 @@ class FinalPipeline(dummyLightning):
             backoff_delay = check_memory_usage(max_gb=300.0, backoff_delay=backoff_delay)
 
             # Convert to numpy
-            features = stock_df.select(self.feature_cols).to_numpy().astype(np.float32)
+            features = stock_df.select(self.features).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close_norm'].to_numpy().astype(np.float32)
 
@@ -1214,7 +1169,7 @@ class FinalPipeline(dummyLightning):
             if idx % 100 == 0:
                 gc.collect()
 
-        if self.is_main_process():
+        if self.is_root():
             print(f"Completed processing {total_stocks} stocks with memory-mapped arrays")
 
         return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
@@ -1237,28 +1192,28 @@ class FinalPipeline(dummyLightning):
         features = self.forward(x)[:, seq_len//2:, :]
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
-        pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, num_bins)
+        pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, n_quantize)
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
         # Use close feature quantiles (index 0)
         quantiles_tensor = self.quantiles.squeeze(-1)[:, 0].to(y.device, dtype=y.dtype)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
-        target_quantized = torch.clamp(target_quantized, 0, self.config.num_bins - 1)
+        target_quantized = torch.clamp(target_quantized, 0, self.config.n_quantize - 1)
 
         if self.config.debug_horizons:
             # Compute per-horizon losses
             losses['quantized'] = 0.0
             for h_idx, h_name in enumerate(horizon_names):
                 h_loss = self.ce_loss(
-                    pred_quantized[:, :, h_idx, :].reshape(-1, self.config.num_bins),
+                    pred_quantized[:, :, h_idx, :].reshape(-1, self.config.n_quantize),
                     target_quantized[:, :, h_idx].reshape(-1)
                 )
                 losses[f'quantized_{h_name}'] = h_loss
                 losses['quantized'] += h_loss / len(horizon_names)
         else:
             losses['quantized'] = self.ce_loss(
-                pred_quantized.reshape(-1, self.config.num_bins),
+                pred_quantized.reshape(-1, self.config.n_quantize),
                 target_quantized.reshape(-1)
             )
 
@@ -1420,25 +1375,12 @@ class FinalPipeline(dummyLightning):
 
         return result
 
-    def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor):
-        """Quantile loss with sided weighting
-
-        Args:
-            pred: (batch, pred_len, num_horizons, num_quantiles) or
-                  (batch, pred_len, num_quantiles)
-            target: (batch, pred_len, num_horizons) or
-                    (batch, pred_len)
+    def _quantile_loss(self, pred, target):
+        """ pred: (b, l, num_horizons, num_quantiles)
+          target: (b, l, num_horizons)
         """
-        quantiles = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9],
-                                 device=pred.device)
-
-        # Handle both 3D and 4D tensors
-        if pred.ndim == 3:
-            # Shape: (batch, pred_len, num_quantiles)
-            quantiles = quantiles.view(1, 1, -1)
-        else:
-            # Shape: (batch, pred_len, num_horizons, num_quantiles)
-            quantiles = quantiles.view(1, 1, 1, -1)
+        quantiles = torch.tensor(self.quantiles, device=pred.device)
+        quantiles = quantiles.unsqueeze(0).unsqueeze(0).unsqueeze(0)
 
         quantiles = quantiles.expand(pred.shape)
         target = target.unsqueeze(-1)
@@ -1455,14 +1397,15 @@ class FinalPipeline(dummyLightning):
             delta - 0.5
         )
 
-        return torch.mean(huber * weight)
+        return (huber * weight).mean()
 
 
 @dataclass
 class FinalPipelineConfig:
     # Model
+    embed_dim: int = 256
     hidden_dim: int = 256
-    intermediate: float = 2.
+    expand: float = 2.
     num_layers: int = 6
     num_heads: int = 8
     attn: float = 1.
@@ -1479,9 +1422,9 @@ class FinalPipelineConfig:
 
     # Data
     seq_len: int = 256
-    num_bins: int = 128
+    n_quantize: int = 128
     max_cent_abs: int = 64
-    embed_dim: int = 256
+    cache_dir: str | None = None
 
     features: tuple = ('close', 'close_norm', 'delta_1min', 'delta_30min',
                        'ret_1min', 'ret_30min', 'ret_1day',
@@ -1491,7 +1434,7 @@ class FinalPipelineConfig:
     horizons: tuple = (1, 30, 240, 480)
     quantiles: tuple = (10, 25, 50, 75, 90)
 
-    debug_data: bool | int = False
+    debug_data: int = 0
     debug_horizons: bool = False
 
     # DDP settings
@@ -1501,49 +1444,38 @@ class FinalPipelineConfig:
     master_port: str = '12355'
 
     debug_ddp: bool = False
-    debug_model: bool = False
     num_workers: int | None = None
 
-    # Cache settings
-    cache_dir: Optional[str] = None
-    debug_no_cache: bool = False
     
     use_ddp: bool = False
 
     def __post_init__(self):
-        if self.debug_model:
+        # Model
+        self.interim_dim = int(self.hidden_dim * self.expand)
+        self.head_dim = int(self.hidden_dim * self.attn / self.num_heads)
+
+        # Embedding
+        self.q_dim = self.sin_dim = self.embed_dim // 2
+        self.num_cents = self.max_cent_abs * 2 + 1
+        
+        # Dataloader
+        self.num_workers = self.num_workers or os.cpu_count() // 2
+        self.cache_dir = self.cache_dir or str(Path.home() / 'h' / 'cache' / 'pipeline_data' / f'debug_{self.debug_data}')
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+    
+    def __init__(self, shrink_model=False, **kwargs):
+        super().__init__(**kwargs)
+        if shrink_model:
             self.hidden_dim //= 4
             self.num_heads //= 2
             self.num_layers //= 2
             self.embed_dim //= 2
-        
-        self.num_workers = self.num_workers or os.cpu_count() // 2
-        self.debug_no_cache = self.debug_no_cache or bool(self.debug_data)
-
-        # Model
-        self.intermediate_dim = int(self.hidden_dim * self.intermediate)
-        self.head_dim = int(self.hidden_dim * self.attn / self.num_heads)
-
-        # Embedding
-        self.sin_embed_dim = self.embed_dim // 2
-        self.num_cents = self.max_cent_abs * 2 + 1
-        self.quantize_embed_dim = self.sin_embed_dim
-
-        # Cache directory
-        if self.cache_dir is None:
-            base_cache = Path.home() / 'h' / 'cache' / 'pipeline_data'
-            if self.debug_data:
-                n = self.debug_data if isinstance(self.debug_data, int) else 5
-                self.cache_dir = str(base_cache / f'debug_{n}')
-            else:
-                self.cache_dir = str(base_cache / 'full')
-        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
 
 config = FinalPipelineConfig(
+    shrink_model=True,
     debug_data=True,
     use_ddp=False,
-    debug_model=True,
     debug_horizons=True,
 )
 
@@ -1614,7 +1546,7 @@ def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfi
 if __name__ == "__main__":
     config = parse_args_to_config(config)
     pipeline = FinalPipeline(config)
-    is_root = not config.use_ddp or pipeline.is_main_process()
+    is_root = not config.use_ddp or pipeline.is_root()
 
     if config.use_ddp:
         pipeline.setup_ddp()
@@ -1626,13 +1558,13 @@ if __name__ == "__main__":
     pipeline.prepare_data()
 
     if config.use_ddp:
-        pipeline.barrier()
+        dist.barrier()
 
     if is_root:
         print("Starting training...")
     pipeline.fit()
 
     if config.use_ddp:
-        pipeline.cleanup_ddp()
+        dist.destroy_process_group()
     if is_root:
         breakpoint()
