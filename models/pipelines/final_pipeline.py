@@ -221,14 +221,28 @@ class QuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.embedding = nn.Embedding(config.num_bins, config.embed_dim)
+        self.proj = nn.Linear(config.embed_dim * config.num_features, config.embed_dim)
 
     def forward(self, x: torch.Tensor, quantiles: torch.Tensor):
-        # x: (batch, 1) - single feature values
-        breakpoint()
-        quantiles_tensor = quantiles[1:-1].to(x.device, dtype=x.dtype)
-        tokens = torch.bucketize(x.squeeze(-1), quantiles_tensor, right=True)
-        result = self.embedding(tokens)
-        return result
+        # x: (batch, num_features)
+        # quantiles: (num_quantiles, num_features)
+
+        # Use interior quantile boundaries for bucketization
+        quantiles_tensor = quantiles.squeeze(-1)[1:-1, :].to(x.device, dtype=x.dtype)  # (num_bins-1, num_features)
+
+        # Bucketize each feature with its corresponding quantiles
+        tokens = torch.stack([
+            torch.bucketize(x[:, i].contiguous(), quantiles_tensor[:, i].contiguous(), right=True)
+            for i in range(x.shape[1])
+        ], dim=1)  # (batch, num_features)
+
+        # Embed each feature: (batch, num_features, embed_dim)
+        embedded = self.embedding(tokens)
+
+        # Flatten and project: (batch, num_features * embed_dim) -> (batch, embed_dim)
+        batch_size = embedded.shape[0]
+        flattened = embedded.reshape(batch_size, -1)
+        return self.proj(flattened)
 
 
 class CentsEncoder(dummyLightning):
@@ -305,7 +319,7 @@ class MultiEncoder(dummyLightning):
         batch_size, seq_len, feat_dim = x.shape
 
         x_flat = x.view(-1, feat_dim)
-        # Quantize encoder uses feature at index 0 (close)
+        # Quantize encoder uses all features with per-feature quantiles
         # Cent encoder uses features at indices 2-3 (delta_1min, delta_30min)
         embeddings = [
             self.quantize_encoder(x_flat, self.quantiles),
@@ -378,6 +392,14 @@ class FinalPipeline(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
+
+        # Feature columns in order
+        self.feature_cols = [
+            'close', 'close_norm', 'delta_1min',
+            'delta_30min', 'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio',
+            'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
+            'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
+        ]
 
         # DDP setup
         self.is_distributed = config.use_ddp
@@ -516,7 +538,7 @@ class FinalPipeline(dummyLightning):
                     train_stock_targets: Dict[str, np.ndarray],
                     val_stock_data: Dict[str, np.ndarray],
                     val_stock_targets: Dict[str, np.ndarray],
-                    quantiles: Dict[str, torch.Tensor]):
+                    quantiles: torch.Tensor):
         """Save dataset metadata to disk cache.
 
         Note: Individual stock arrays are already saved as memory-mapped files by _bs.
@@ -529,20 +551,14 @@ class FinalPipeline(dummyLightning):
 
             save_dict = {}
 
-            # Save quantiles
-            for key, value in quantiles.items():
-                # Convert torch.Tensor to numpy for saving
-                if isinstance(value, torch.Tensor):
-                    save_dict[f'quantile_{key}'] = value.cpu().numpy()
-                else:
-                    save_dict[f'quantile_{key}'] = value
+            # Save quantiles as single tensor (num_bins+1, num_features)
+            save_dict['quantiles'] = quantiles.cpu().numpy()
 
             # Save stock IDs as metadata (arrays are already on disk)
             train_ids = list(train_stock_data.keys())
             val_ids = list(val_stock_data.keys())
             save_dict['_train_ids'] = np.array(train_ids, dtype=object)
             save_dict['_val_ids'] = np.array(val_ids, dtype=object)
-            save_dict['_quantile_keys'] = np.array(list(quantiles.keys()), dtype=object)
 
             np.savez_compressed(cache_path, **save_dict)
             print(f"Cache metadata saved successfully!")
@@ -552,7 +568,7 @@ class FinalPipeline(dummyLightning):
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
-                                             Dict[str, torch.Tensor]]]:
+                                             torch.Tensor]]:
         """Load dataset dictionaries from disk cache using memory-mapped arrays"""
         cache_path = self._get_cache_path()
         mmap_dir = self._get_mmap_dir()
@@ -577,16 +593,13 @@ class FinalPipeline(dummyLightning):
         train_stock_targets = {}
         val_stock_data = {}
         val_stock_targets = {}
-        quantiles = {}
 
         # Load metadata (these are small, so load into memory)
         train_ids = data['_train_ids'].copy()
         val_ids = data['_val_ids'].copy()
-        quantile_keys = data['_quantile_keys'].copy()
 
-        # Load quantiles (small arrays, load into memory)
-        for key in quantile_keys:
-            quantiles[key] = torch.from_numpy(data[f'quantile_{key}'].copy()).float()
+        # Load quantiles as single tensor (num_bins+1, num_features)
+        quantiles = torch.from_numpy(data['quantiles'].copy()).float()
 
         # Load memory-mapped arrays for train data
         for stock_id in train_ids:
@@ -664,7 +677,7 @@ class FinalPipeline(dummyLightning):
         df = self._split_data(df, train_frac)
         self.quantiles = self._compute_quantiles(df, num_bins)
 
-        self.encoder.quantiles = self.quantiles['close']
+        self.encoder.quantiles = self.quantiles
 
         # Build sequences
         train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = self._bs(df, seq_len)
@@ -799,13 +812,16 @@ class FinalPipeline(dummyLightning):
         return df
 
     def _compute_quantiles(self, df: pl.DataFrame, num_bins: int)\
-            -> Dict[str, torch.Tensor]:
-        """Compute quantiles for different features"""
+            -> torch.Tensor:
+        """Compute quantiles for all features
 
+        Returns:
+            torch.Tensor: (num_bins+1, num_features) quantile boundaries
+        """
         train_df = df.filter(pl.col('is_train'))
 
-        quantiles = {}
-        for col in ['close', 'delta_1min', 'delta_30min', 'volume']:
+        quantiles_list = []
+        for col in self.feature_cols:
             data = train_df.select(pl.col(col).sample(10000000, with_replacement=self.debug_data)).collect().to_torch().squeeze(0).float()
             n = len(data)
             assert n
@@ -816,8 +832,10 @@ class FinalPipeline(dummyLightning):
 
             data.sort()
             quantile_values = data[k_indices - 1]  # -1 for 0-indexed
-            quantiles[col] = quantile_values
+            quantiles_list.append(quantile_values)
 
+        # Stack to (num_bins+1, num_features)
+        quantiles = torch.stack(quantiles_list, dim=1)
         return quantiles
 
     def _detect_trading_gaps(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -861,13 +879,6 @@ class FinalPipeline(dummyLightning):
         val_stock_data = {}
         val_stock_targets = {}
 
-        cols = [
-            'close', 'close_norm', 'delta_1min',
-            'delta_30min', 'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio',
-            'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
-            'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
-        ]
-
         # Get memory-mapped directory
         mmap_dir = self._get_mmap_dir()
 
@@ -891,7 +902,7 @@ class FinalPipeline(dummyLightning):
             backoff_delay = check_memory_usage(max_gb=300.0, backoff_delay=backoff_delay)
 
             # Convert to numpy
-            features = stock_df.select(cols).to_numpy().astype(np.float32)
+            features = stock_df.select(self.feature_cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close_norm'].to_numpy().astype(np.float32)
 
@@ -971,7 +982,8 @@ class FinalPipeline(dummyLightning):
         y = y.to(pred_quantized.dtype)
 
         # Quantized prediction loss
-        quantiles_tensor = self.quantiles['close'].to(y.device, dtype=y.dtype)
+        # Use close feature quantiles (index 0)
+        quantiles_tensor = self.quantiles.squeeze(-1)[:, 0].to(y.device, dtype=y.dtype)
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
         target_quantized = torch.clamp(target_quantized, 0, self.config.num_bins - 1)
 
