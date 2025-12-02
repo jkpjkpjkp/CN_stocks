@@ -38,11 +38,42 @@ import os
 import gc
 import psutil
 import warnings
+import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from ..prelude.model import dummyLightning
 from ..prelude.model import Rope
 
 torch.autograd.set_detect_anomaly(True)
+
+
+def check_memory_usage(max_gb: float = 320.0, backoff_delay: float = 1.0) -> float:
+    """Check current process memory usage and enforce limit with exponential backoff.
+
+    Args:
+        max_gb: Maximum memory in GB before triggering garbage collection
+        backoff_delay: Current backoff delay in seconds
+
+    Returns:
+        Updated backoff delay (doubled if GC was triggered, reset to 1.0 if under limit)
+    """
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    current_gb = mem_info.rss / (1024 ** 3)  # Convert bytes to GB
+
+    if current_gb > max_gb:
+        print(f"Memory usage {current_gb:.2f} GB exceeds limit {max_gb} GB. "
+              f"Running GC and backing off for {backoff_delay:.2f}s...")
+        gc.collect()
+        time.sleep(backoff_delay)
+        # Check again after GC
+        mem_info = process.memory_info()
+        current_gb = mem_info.rss / (1024 ** 3)
+        print(f"After GC: {current_gb:.2f} GB")
+        return backoff_delay * 2  # Exponential backoff
+
+    return 1.0  # Reset backoff delay
 
 
 class PriceHistoryDataset(Dataset):
@@ -191,8 +222,9 @@ class QuantizeEncoder(dummyLightning):
         super().__init__(config)
         self.embedding = nn.Embedding(config.num_bins, config.embed_dim)
 
-    def forward(self, x: torch.Tensor, quantiles: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, quantiles: torch.Tensor):
         # x: (batch, 1) - single feature values
+        breakpoint()
         quantiles_tensor = quantiles[1:-1].to(x.device, dtype=x.dtype)
         tokens = torch.bucketize(x.squeeze(-1), quantiles_tensor, right=True)
         result = self.embedding(tokens)
@@ -212,7 +244,7 @@ class CentsEncoder(dummyLightning):
         """Convert cent differences to tokens
 
         Args:
-            x: (batch, num_cent_features) - delta price features (ret_1min, ret_30min)
+            x: (batch, num_cent_features) - delta price features (delta_1min, delta_30min)
 
         Returns:
             (batch, embed_dim) - projected embeddings
@@ -274,10 +306,10 @@ class MultiEncoder(dummyLightning):
 
         x_flat = x.view(-1, feat_dim)
         # Quantize encoder uses feature at index 0 (close)
-        # Cent encoder uses features at indices 2-3 (ret_1min, ret_30min)
+        # Cent encoder uses features at indices 2-3 (delta_1min, delta_30min)
         embeddings = [
-            self.quantize_encoder(x_flat[:, 0:1], self.quantiles),
-            self.cent_encoder(x_flat[:, 2:2+self.num_cent_features]),  # ret_1min, ret_30min
+            self.quantize_encoder(x_flat, self.quantiles),
+            self.cent_encoder(x_flat[:, 2:2+self.num_cent_features]),  # delta_1min, delta_30min
             self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
@@ -474,19 +506,27 @@ class FinalPipeline(dummyLightning):
         """Get the path to the cache file"""
         return Path(self.config.cache_dir) / 'dataset_cache.npz'
 
+    def _get_mmap_dir(self) -> Path:
+        """Get the directory for memory-mapped arrays"""
+        mmap_dir = Path(self.config.cache_dir) / 'mmap_arrays'
+        mmap_dir.mkdir(parents=True, exist_ok=True)
+        return mmap_dir
+
     def _save_cache(self, train_stock_data: Dict[str, np.ndarray],
                     train_stock_targets: Dict[str, np.ndarray],
                     val_stock_data: Dict[str, np.ndarray],
                     val_stock_targets: Dict[str, np.ndarray],
                     quantiles: Dict[str, torch.Tensor]):
-        """Save dataset dictionaries to disk cache"""
+        """Save dataset metadata to disk cache.
+
+        Note: Individual stock arrays are already saved as memory-mapped files by _bs.
+        This method only saves quantiles and metadata.
+        """
         cache_path = self._get_cache_path()
 
         if self.is_main_process():
-            print(f"Saving cache to {cache_path}...")
+            print(f"Saving cache metadata to {cache_path}...")
 
-            # Convert dicts to a format savez can handle
-            # We'll save with keys like 'train_data_<stock_id>', 'train_target_<stock_id>', etc.
             save_dict = {}
 
             # Save quantiles
@@ -497,19 +537,7 @@ class FinalPipeline(dummyLightning):
                 else:
                     save_dict[f'quantile_{key}'] = value
 
-            # Save train data
-            for stock_id, data in train_stock_data.items():
-                save_dict[f'train_data_{stock_id}'] = data
-            for stock_id, targets in train_stock_targets.items():
-                save_dict[f'train_target_{stock_id}'] = targets
-
-            # Save val data
-            for stock_id, data in val_stock_data.items():
-                save_dict[f'val_data_{stock_id}'] = data
-            for stock_id, targets in val_stock_targets.items():
-                save_dict[f'val_target_{stock_id}'] = targets
-
-            # Save stock IDs as metadata
+            # Save stock IDs as metadata (arrays are already on disk)
             train_ids = list(train_stock_data.keys())
             val_ids = list(val_stock_data.keys())
             save_dict['_train_ids'] = np.array(train_ids, dtype=object)
@@ -517,7 +545,8 @@ class FinalPipeline(dummyLightning):
             save_dict['_quantile_keys'] = np.array(list(quantiles.keys()), dtype=object)
 
             np.savez_compressed(cache_path, **save_dict)
-            print(f"Cache saved successfully!")
+            print(f"Cache metadata saved successfully!")
+            print(f"Memory-mapped arrays are in {self._get_mmap_dir()}")
 
     def _load_cache(self) -> Optional[Tuple[Dict[str, np.ndarray],
                                              Dict[str, np.ndarray],
@@ -526,15 +555,22 @@ class FinalPipeline(dummyLightning):
                                              Dict[str, torch.Tensor]]]:
         """Load dataset dictionaries from disk cache using memory-mapped arrays"""
         cache_path = self._get_cache_path()
+        mmap_dir = self._get_mmap_dir()
 
         if not cache_path.exists():
+            return None
+
+        # Check if mmap directory exists and has files
+        if not mmap_dir.exists() or not any(mmap_dir.iterdir()):
+            if self.is_main_process():
+                print(f"Cache metadata found but mmap directory is missing or empty. Recomputing...")
             return None
 
         if self.is_main_process():
             print(f"Loading cache from {cache_path} (memory-mapped mode)...")
 
-        # Use mmap_mode='r' to load arrays as memory-mapped (lazy loading)
-        data = np.load(cache_path, allow_pickle=True, mmap_mode='r')
+        # Load metadata
+        data = np.load(cache_path, allow_pickle=True)
 
         # Reconstruct dictionaries
         train_stock_data = {}
@@ -552,16 +588,29 @@ class FinalPipeline(dummyLightning):
         for key in quantile_keys:
             quantiles[key] = torch.from_numpy(data[f'quantile_{key}'].copy()).float()
 
-        # Store references to memory-mapped arrays (lazy loading)
-        # Arrays will only be loaded into memory when accessed
+        # Load memory-mapped arrays for train data
         for stock_id in train_ids:
-            train_stock_data[stock_id] = data[f'train_data_{stock_id}']
-            train_stock_targets[stock_id] = data[f'train_target_{stock_id}']
+            train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
+            train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
 
-        # Load val data
+            if train_features_path.exists() and train_targets_path.exists():
+                train_stock_data[stock_id] = np.load(train_features_path, mmap_mode='r')
+                train_stock_targets[stock_id] = np.load(train_targets_path, mmap_mode='r')
+            else:
+                if self.is_main_process():
+                    print(f"Warning: Missing memory-mapped files for train stock {stock_id}")
+
+        # Load memory-mapped arrays for val data
         for stock_id in val_ids:
-            val_stock_data[stock_id] = data[f'val_data_{stock_id}']
-            val_stock_targets[stock_id] = data[f'val_target_{stock_id}']
+            val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
+            val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
+
+            if val_features_path.exists() and val_targets_path.exists():
+                val_stock_data[stock_id] = np.load(val_features_path, mmap_mode='r')
+                val_stock_targets[stock_id] = np.load(val_targets_path, mmap_mode='r')
+            else:
+                if self.is_main_process():
+                    print(f"Warning: Missing memory-mapped files for val stock {stock_id}")
 
         if self.is_main_process():
             print(f"Cache loaded successfully (memory-mapped)! "
@@ -579,7 +628,7 @@ class FinalPipeline(dummyLightning):
             if cached is not None:
                 train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles = cached
                 self.quantiles = quantiles
-                self.encoder.quantiles = self.quantiles['close']
+                self.encoder.quantiles = quantiles
 
                 # Build datasets
                 pred_len = seq_len // 2
@@ -607,10 +656,9 @@ class FinalPipeline(dummyLightning):
                                                      int) else 5
             df = df.head(n * 300 * 20 * 240)
             ids = df.select('id').unique().head(n).collect()['id']
-            df = df.filter(pl.col('id').is_in(ids.implode())).collect()
+            df = df.filter(pl.col('id').is_in(ids.implode()))
         else:
-            df = pl.read_parquet(str(path))
-        assert len(df)
+            df = pl.scan_parquet(str(path))
 
         df = self._compute_features(df)
         df = self._split_data(df, train_frac)
@@ -687,15 +735,14 @@ class FinalPipeline(dummyLightning):
     def _compute_features(self, df: pl.DataFrame) -> pl.DataFrame:
         """Compute all feature types"""
 
-        # Returns at different time scales (1min, 30min, 6hr, 24hr, 2days)
-        # Note: Assuming 240 minutes per trading day (6.5 hours)
+        # Returns at different time scales (1min, 30min, 1day, 2days)
         df = df.with_columns(
-            ret_1min=pl.col('close') - pl.col('close').shift(1).over('id'),
-            ret_30min=pl.col('close') - pl.col('close').shift(30).over('id'),
-            ret_1min_ratio=(pl.col('close') / pl.col('close').shift(1).over('id') - 1),
-            ret_30min_ratio=(pl.col('close') / pl.col('close').shift(30).over('id') - 1),
-            ret_1day_ratio=(pl.col('close') / pl.col('close').shift(240).over('id') - 1),
-            ret_2day_ratio=(pl.col('close') / pl.col('close').shift(480).over('id') - 1),  # 2 days
+            delta_1min=pl.col('close').shift(-1).over('id') - pl.col('close'),
+            delta_30min=pl.col('close').shift(-30).over('id') - pl.col('close'),
+            ret_1min_ratio=(pl.col('close').shift(-1).over('id') / pl.col('close') - 1),
+            ret_30min_ratio=(pl.col('close').shift(-30).over('id') / pl.col('close') - 1),
+            ret_1day_ratio=(pl.col('close').shift(-240).over('id') / pl.col('close') - 1),
+            ret_2day_ratio=(pl.col('close').shift(-480).over('id') / pl.col('close') - 1),  # 2 days
         )
 
         # Intra-minute relative features
@@ -708,8 +755,8 @@ class FinalPipeline(dummyLightning):
 
         # Fill NaN values
         df = df.with_columns([
-            pl.col('ret_1min').fill_null(0.),
-            pl.col('ret_30min').fill_null(0.),
+            pl.col('delta_1min').fill_null(0.),
+            pl.col('delta_30min').fill_null(0.),
             pl.col('ret_1min_ratio').fill_null(0.),
             pl.col('ret_30min_ratio').fill_null(0.),
             pl.col('ret_1day_ratio').fill_null(0.),
@@ -725,13 +772,14 @@ class FinalPipeline(dummyLightning):
     def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
         cutoff = df.select(
             pl.col('datetime').unique().cast(pl.Int64).quantile(0.9)
-        )
+        ).collect()['datetime'][0]
 
         df = df.with_columns(
-            is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff['datetime'])
+            is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff)
         )
-        assert len(df.filter('is_train'))
-        assert len(df.filter(~pl.col('is_train')))
+        if self.debug_data:
+            assert len(df.collect().filter('is_train'))
+            assert len(df.collect().filter(~pl.col('is_train')))
 
         stats = df.filter(pl.col('is_train')).group_by('id').agg([
             pl.col('close').mean().alias('mean_close'),
@@ -741,14 +789,12 @@ class FinalPipeline(dummyLightning):
         ])
 
         df = df.join(stats, on='id', how='left')
-        assert len(df)
 
         # normalize
         df = df.with_columns(
             ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-8)).alias('close_norm'),
             ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
         )
-        assert len(df)
 
         return df
 
@@ -756,11 +802,11 @@ class FinalPipeline(dummyLightning):
             -> Dict[str, torch.Tensor]:
         """Compute quantiles for different features"""
 
-        train_df = df.filter(pl.col('is_train')).sample(10000000)
+        train_df = df.filter(pl.col('is_train'))
 
         quantiles = {}
-        for col in ['close', 'ret_1min', 'ret_30min', 'volume']:
-            data = train_df[col].to_torch().float()
+        for col in ['close', 'delta_1min', 'delta_30min', 'volume']:
+            data = train_df.select(pl.col(col).sample(10000000, with_replacement=self.debug_data)).collect().to_torch().squeeze(0).float()
             n = len(data)
             assert n
             # Compute k-th values for each quantile position
@@ -791,7 +837,7 @@ class FinalPipeline(dummyLightning):
     def _bs(self, df, seq_len) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray],
                                          Dict[str, np.ndarray]]:
         """
-        Build sequences and return the data dictionaries.
+        Build sequences and return the data dictionaries with memory-mapped arrays.
 
         Returns:
             train_stock_data, train_stock_targets,
@@ -816,36 +862,90 @@ class FinalPipeline(dummyLightning):
         val_stock_targets = {}
 
         cols = [
-            'close', 'close_norm', 'ret_1min',
-            'ret_30min', 'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio',
+            'close', 'close_norm', 'delta_1min',
+            'delta_30min', 'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio',
             'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
             'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
         ]
 
+        # Get memory-mapped directory
+        mmap_dir = self._get_mmap_dir()
+
+        # Initialize backoff delay
+        backoff_delay = 1.0
+
         # TODO: align for cross attention
-        for stock_id in df['id'].unique():
-            stock_df = df.filter(pl.col('id') == stock_id).sort('datetime')
+        stock_ids = df.select('id').unique().collect()['id']
+        total_stocks = len(stock_ids)
+
+        for idx, stock_id in enumerate(stock_ids):
+            if self.is_main_process() and idx % 100 == 0:
+                print(f"Processing stock {idx}/{total_stocks}: {stock_id}")
+
+            stock_df = df.filter(pl.col('id') == stock_id).collect()
 
             if len(stock_df) <= seq_len + 1:
                 continue
 
+            # Check memory before conversion and apply backoff if needed
+            backoff_delay = check_memory_usage(max_gb=300.0, backoff_delay=backoff_delay)
+
+            # Convert to numpy
             features = stock_df.select(cols).to_numpy().astype(np.float32)
             is_train = stock_df['is_train'].to_numpy()
             close = stock_df['close_norm'].to_numpy().astype(np.float32)
-            
+
             # Split each stock's data by time - train data and val data
             train_mask = is_train.astype(bool)
             val_mask = ~train_mask
 
             # Only add to train set if we have enough train data
             if train_mask.sum() > seq_len + 1:
-                train_stock_data[stock_id] = features[train_mask]
-                train_stock_targets[stock_id] = close[train_mask]
+                # Create memory-mapped files for this stock's training data
+                train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
+                train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
+
+                # Save to disk as memory-mapped array
+                train_features = features[train_mask]
+                train_targets = close[train_mask]
+
+                # Write to disk
+                np.save(train_features_path, train_features)
+                np.save(train_targets_path, train_targets)
+
+                # Load as memory-mapped (read-only for efficiency)
+                train_stock_data[stock_id] = np.load(train_features_path, mmap_mode='r')
+                train_stock_targets[stock_id] = np.load(train_targets_path, mmap_mode='r')
+
+                # Immediately flush to disk (though np.save already does this)
+                del train_features, train_targets
 
             # Only add to val set if we have enough val data
             if val_mask.sum() > seq_len + 1:
-                val_stock_data[stock_id] = features[val_mask]
-                val_stock_targets[stock_id] = close[val_mask]
+                # Create memory-mapped files for this stock's validation data
+                val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
+                val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
+
+                # Save to disk as memory-mapped array
+                val_features = features[val_mask]
+                val_targets = close[val_mask]
+
+                # Write to disk
+                np.save(val_features_path, val_features)
+                np.save(val_targets_path, val_targets)
+
+                # Load as memory-mapped (read-only for efficiency)
+                val_stock_data[stock_id] = np.load(val_features_path, mmap_mode='r')
+                val_stock_targets[stock_id] = np.load(val_targets_path, mmap_mode='r')
+
+                # Immediately flush to disk
+                del val_features, val_targets
+
+            # Clean up intermediate arrays
+            del features, is_train, close
+
+        if self.is_main_process():
+            print(f"Completed processing {total_stocks} stocks with memory-mapped arrays")
 
         return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
 
@@ -1115,12 +1215,12 @@ class FinalPipelineConfig:
     max_cent_abs: int = 64
     embed_dim: int = 256
 
-    # Feature counts (14 total: close, close_norm, ret_1min, ret_30min,
+    # Feature counts (14 total: close, close_norm, delta_1min, delta_30min,
     # ret_1min_ratio, ret_30min_ratio, ret_1day_ratio, ret_2day_ratio,
     # close_open_ratio, high_open_ratio, low_open_ratio, high_low_ratio,
     # volume, volume_norm)
     num_features: int = 14
-    # Cent-encoded features: ret_1min, ret_30min (indices 2-3)
+    # Cent-encoded features: delta_1min, delta_30min (indices 2-3)
     num_cent_features: int = 2
 
     num_horizons: int = 4
