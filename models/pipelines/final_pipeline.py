@@ -884,9 +884,9 @@ class FinalPipeline(dummyLightning):
             # When using DistributedSampler, shuffle must be False in DataLoader
             dataloader = DataLoader(
                 dataset,
-                batch_size=self.config.batch_size,
+                batch_size=self.batch_size,
                 sampler=sampler,
-                num_workers=self.config.num_workers,
+                num_workers=self.num_workers,
                 pin_memory=True,
                 drop_last=drop_last
             )
@@ -894,9 +894,9 @@ class FinalPipeline(dummyLightning):
             # Standard DataLoader for non-distributed training
             dataloader = DataLoader(
                 dataset,
-                batch_size=self.config.batch_size,
+                batch_size=self.batch_size,
                 shuffle=shuffle,
-                num_workers=self.config.num_workers,
+                num_workers=self.num_workers,
                 pin_memory=True,
                 drop_last=drop_last
             )
@@ -1338,14 +1338,14 @@ class FinalPipelineConfig:
     qk_norm: bool = False
 
     # Training
-    batch_size: int = 512
-    lr: float = 1e-3
+    batch_size: int = 256
+    lr: float = 3e-4
     epochs: int = 100
     warmup_steps: int = 1000
     grad_clip: float = 1.0
 
     # Data
-    seq_len: int = 256
+    seq_len: int = 4096
     n_quantize: int = 128
     max_cent_abs: int = 64
     cache_dir: str | None = None
