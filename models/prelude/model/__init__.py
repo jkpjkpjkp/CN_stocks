@@ -1,3 +1,3 @@
 from .main import dummyLightning
-from .tm import Rope
+from .tm import Rope, tm
 from .config import transformerConfig

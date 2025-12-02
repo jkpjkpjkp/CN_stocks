@@ -21,8 +21,8 @@ class Rope(nn.Module):
         super().__init__()
         self.config = config
 
-        device = config.device
-        if config.standard_rope:
+        device = getattr(config, 'device', 'cuda')
+        if getattr(config, 'standard_rope', True):
             attn_dim = config.hidden_dim
         else:
             attn_dim = config.head_dim * config.num_heads
@@ -42,7 +42,7 @@ class mha(Module):
         super().__init__()
         self.qkv = nn.Linear(config.hidden_dim, 3 * config.hidden_dim)
         self.fc2 = nn.Linear(config.hidden_dim, config.hidden_dim)
-        device = config.device
+        device = getattr(config, 'device', 'cuda')
         channel_range = torch.arange(0, config.hidden_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (10000 ** (channel_range / config.hidden_dim))
         t = torch.arange(config.seq_len, dtype=torch.float32, device=device)
@@ -77,15 +77,17 @@ class decoderLayer(Module):
     def __init__(self, config):
         super().__init__()
         self.attn = mha(config)
-        self.l1 = nn.Linear(config.hidden_dim, config.intermediate_size)
-        self.l2 = nn.Linear(config.intermediate_size, config.hidden_dim)
-        if config.norm == 'LayerNorm':
+        intermediate_size = getattr(config, 'intermediate_size', getattr(config, 'interim_dim', config.hidden_dim * 4))
+        self.l1 = nn.Linear(config.hidden_dim, intermediate_size)
+        self.l2 = nn.Linear(intermediate_size, config.hidden_dim)
+        norm = getattr(config, 'norm', 'LayerNorm')
+        if norm == 'LayerNorm':
             self.norm1 = nn.LayerNorm(config.hidden_dim)
             self.norm2 = nn.LayerNorm(config.hidden_dim)
-        elif config.norm == 'RMSNorm':
+        elif norm == 'RMSNorm':
             self.norm1 = self.norm2 = F.rms_norm
         else:
-            raise ValueError(f'Unknown norm: {config.norm}')
+            raise ValueError(f'Unknown norm: {norm}')
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -96,7 +98,8 @@ class decoderLayer(Module):
 class tm(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.layers = nn.ModuleList([decoderLayer(config) for _ in range(config.layers)])
+        num_layers = getattr(config, 'layers', getattr(config, 'num_layers', 6))
+        self.layers = nn.ModuleList([decoderLayer(config) for _ in range(num_layers)])
         self.optimizers()
 
     def forward(self, x):

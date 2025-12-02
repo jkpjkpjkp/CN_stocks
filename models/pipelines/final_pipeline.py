@@ -228,10 +228,13 @@ class QuantizeEncoder(dummyLightning):
 
         # Bucketize each feature with its corresponding quantiles
         tokens = torch.stack([
-            torch.bucketize(x[:, i].contiguous(), 
+            torch.bucketize(x[:, i].contiguous(),
                             quantiles_tensor[:, i].contiguous(), right=True)
             for i in range(x.shape[1])
         ], dim=1)  # (batch, num_features)
+
+        # Clamp to valid embedding indices [0, n_quantize-1]
+        tokens = tokens.clamp(0, self.n_quantize - 1)
 
         # Embed each feature: (batch, num_features, embed_dim)
         embedded = self.embedding(tokens)
@@ -248,7 +251,7 @@ class CentsEncoder(dummyLightning):
         self.max_cent_abs = config.max_cent_abs
         self.embedding = nn.Embedding(2 * config.max_cent_abs + 3,
                                       config.embed_dim)
-        self.proj = nn.Linear(config.embed_dim * config.cent_feats,
+        self.proj = nn.Linear(config.embed_dim * config.num_cent_feats,
                               config.embed_dim)
 
     def forward(self, x):
@@ -319,10 +322,12 @@ class MultiEncoder(dummyLightning):
 
         x_flat = x.view(-1, feat_dim)
         # Quantize encoder uses all features with per-feature quantiles
-        # Cent encoder uses features at indices 2-3 (delta_1min, delta_30min)
+        # Cent encoder uses delta features (delta_1min, delta_30min)
+        cent_start = self.cent_feats_start
+        cent_end = cent_start + self.num_cent_feats
         embeddings = [
             self.quantize_encoder(x_flat, self.quantiles),
-            self.cent_encoder(x_flat[:, 2:2+self.cent_feats]),  # delta_1min, delta_30min
+            self.cent_encoder(x_flat[:, cent_start:cent_end]),
             self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
@@ -393,6 +398,12 @@ class FinalPipeline(dummyLightning):
         self.encoder = MultiEncoder(config)
         self.backbone = tm(config)
         self.readout = MultiReadout(config)
+
+        # Initialize DDP attributes
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+        self._ddp_model = None
 
     def setup_ddp(self, rank: Optional[int] = None,
                   world_size: Optional[int] = None):
@@ -1261,41 +1272,31 @@ class FinalPipeline(dummyLightning):
         self.log('return_prediction/nll', losses['return_nll'])
         self.log('return_prediction/quantile', losses['return_quantile'])
 
-        # Log per-horizon losses
-        if self.config.debug_horizons:
-            for h_name in self.horizons:
-                # Price prediction per horizon
-                self.log(f'price_prediction/horizons/{h_name}/quantized', losses[f'quantized_{h_name}'])
-                self.log(f'price_prediction/horizons/{h_name}/mean', losses[f'mean_{h_name}'])
-                self.log(f'price_prediction/horizons/{h_name}/nll', losses[f'nll_{h_name}'])
-                self.log(f'price_prediction/horizons/{h_name}/quantile', losses[f'quantile_{h_name}'])
+        for h_name in self.horizons:
+            # Price prediction per horizon
+            self.log(f'price_prediction/horizons/{h_name}/quantized', losses[f'quantized_{h_name}'])
+            self.log(f'price_prediction/horizons/{h_name}/nll', losses[f'nll_{h_name}'])
+            self.log(f'price_prediction/horizons/{h_name}/quantile', losses[f'quantile_{h_name}'])
 
-                # Return prediction per horizon
-                self.log(f'return_prediction/horizons/{h_name}/mean', losses[f'return_mean_{h_name}'])
-                self.log(f'return_prediction/horizons/{h_name}/nll', losses[f'return_nll_{h_name}'])
-                self.log(f'return_prediction/horizons/{h_name}/quantile', losses[f'return_quantile_{h_name}'])
+            # Return prediction per horizon
+            self.log(f'return_prediction/horizons/{h_name}/nll', losses[f'return_nll_{h_name}'])
+            self.log(f'return_prediction/horizons/{h_name}/quantile', losses[f'return_quantile_{h_name}'])
 
         result = {
             'loss': total_loss,
             'quantized_loss': losses['quantized'],
-            'mean_loss': losses['mean'],
             'nll_loss': losses['nll'],
             'quantile_loss': losses['quantile'],
-            'return_mean_loss': losses['return_mean'],
             'return_nll_loss': losses['return_nll'],
             'return_quantile_loss': losses['return_quantile']
         }
 
-        # Add per-horizon losses to result if enabled
-        if self.config.debug_horizons:
-            for h_name in self.horizons:
-                result[f'quantized_{h_name}'] = losses[f'quantized_{h_name}']
-                result[f'mean_{h_name}'] = losses[f'mean_{h_name}']
-                result[f'nll_{h_name}'] = losses[f'nll_{h_name}']
-                result[f'quantile_{h_name}'] = losses[f'quantile_{h_name}']
-                result[f'return_mean_{h_name}'] = losses[f'return_mean_{h_name}']
-                result[f'return_nll_{h_name}'] = losses[f'return_nll_{h_name}']
-                result[f'return_quantile_{h_name}'] = losses[f'return_quantile_{h_name}']
+        for h_name in self.horizons:
+            result[f'quantized_{h_name}'] = losses[f'quantized_{h_name}']
+            result[f'nll_{h_name}'] = losses[f'nll_{h_name}']
+            result[f'quantile_{h_name}'] = losses[f'quantile_{h_name}']
+            result[f'return_nll_{h_name}'] = losses[f'return_nll_{h_name}']
+            result[f'return_quantile_{h_name}'] = losses[f'return_quantile_{h_name}']
 
         return result
 
@@ -1338,7 +1339,8 @@ class FinalPipelineConfig:
     qk_norm: bool = False
 
     # Training
-    batch_size: int = 256
+    vram_gb: int = 16
+    batch_size: int | None = None
     lr: float = 3e-4
     epochs: int = 100
     warmup_steps: int = 1000
@@ -1358,8 +1360,8 @@ class FinalPipelineConfig:
     horizons: tuple = (1, 30, 240, 480)
     quantiles: tuple = (10, 25, 50, 75, 90)
 
-    debug_data: int = 0
-    debug_horizons: bool = False
+    debug_data: int | None = None
+    debug_model: bool = False
 
     # DDP settings
     use_ddp: bool = False
@@ -1369,11 +1371,17 @@ class FinalPipelineConfig:
 
     debug_ddp: bool = False
     num_workers: int | None = None
-
-    
-    use_ddp: bool = False
+    shrink_model: bool = False
+    device: str = 'cuda'
 
     def __post_init__(self):
+        # Handle shrink_model before other calculations
+        if self.shrink_model:
+            self.hidden_dim //= 4
+            self.num_heads //= 2
+            self.num_layers //= 2
+            self.embed_dim //= 2
+
         # Model
         self.interim_dim = int(self.hidden_dim * self.expand)
         self.head_dim = int(self.hidden_dim * self.attn / self.num_heads)
@@ -1381,26 +1389,29 @@ class FinalPipelineConfig:
         # Embedding
         self.q_dim = self.sin_dim = self.embed_dim // 2
         self.num_cents = self.max_cent_abs * 2 + 1
-        
+
+        # Features
+        self.num_features = len(self.features)
+        self.num_quantize_features = self.num_features
+        self.num_cent_feats = len(self.cent_feats)  # number of cent features
+        # Find the starting index of cent features in the features tuple
+        self.cent_feats_start = self.features.index(self.cent_feats[0]) if self.cent_feats else 0
+        self.num_horizons = len(self.horizons)
+        self.num_quantiles = len(self.quantiles)
+        self.pred_len = self.seq_len // 2
+
         # Dataloader
+        self.batch_size = self.vram_gb * 2 ** 26 // self.seq_len // self.num_layers // self.interim_dim
         self.num_workers = self.num_workers or os.cpu_count() // 2
         self.cache_dir = self.cache_dir or str(Path.home() / 'h' / 'cache' / 'pipeline_data' / f'debug_{self.debug_data}')
         Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
-    
-    def __init__(self, shrink_model=False, **kwargs):
-        super().__init__(**kwargs)
-        if shrink_model:
-            self.hidden_dim //= 4
-            self.num_heads //= 2
-            self.num_layers //= 2
-            self.embed_dim //= 2
 
 
 config = FinalPipelineConfig(
     shrink_model=True,
-    debug_data=True,
+    debug_data=10,
+    debug_model=True,
     use_ddp=False,
-    debug_horizons=True,
 )
 
 
@@ -1427,15 +1438,21 @@ def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfi
             # Special handling for bool | int union type
             parser.add_argument(f'--{field_name}', type=str, default=str(default_val),
                               help=f'{field_name} (bool or int)')
-        elif tp == int or tp == 'int':
+        elif tp == int or tp == 'int' or 'int | None' in str(tp):
             parser.add_argument(f'--{field_name}', type=int, default=default_val,
                               help=f'{field_name} (default: {default_val})')
         elif tp == float or tp == 'float':
             parser.add_argument(f'--{field_name}', type=float, default=default_val,
                               help=f'{field_name} (default: {default_val})')
-        elif tp == str or tp == 'str' or 'Optional[str]' in str(tp):
+        elif tp == str or tp == 'str' or 'str | None' in str(tp) or 'Optional[str]' in str(tp):
             parser.add_argument(f'--{field_name}', type=str, default=default_val,
                               help=f'{field_name} (default: {default_val})')
+        elif 'tuple' in str(tp):
+            # Skip tuple types - they are not meant to be overridden from CLI
+            parser.set_defaults(**{field_name: default_val})
+        else:
+            # Fallback for any other type
+            parser.set_defaults(**{field_name: default_val})
 
     # Filter out module-like arguments (e.g., "models.pipelines.final_pipeline")
     # These come from wrappers like utils.oom_debug_hook
