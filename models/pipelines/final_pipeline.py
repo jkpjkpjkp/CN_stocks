@@ -48,15 +48,16 @@ from ..prelude.model import Rope
 torch.autograd.set_detect_anomaly(True)
 
 
-def check_memory_usage(max_gb: float = 320.0, backoff_delay: float = 1.0) -> float:
-    """Check current process memory usage and enforce limit with exponential backoff.
+def check_memory_usage(max_gb: float = 320.0, backoff_delay: float = 1.0)\
+         -> float:
+    """Check memory usage and wait with exponential backoff.
 
     Args:
         max_gb: Maximum memory in GB before triggering garbage collection
         backoff_delay: Current backoff delay in seconds
 
     Returns:
-        Updated backoff delay (doubled if GC was triggered, reset to 1.0 if under limit)
+        Updated backoff delay (doubled if GC was triggered, reset to 1.0)
     """
     process = psutil.Process()
     mem_info = process.memory_info()
@@ -221,14 +222,16 @@ class QuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.embedding = nn.Embedding(config.num_bins, config.embed_dim)
-        self.proj = nn.Linear(config.embed_dim * config.num_features, config.embed_dim)
+        self.proj = nn.Linear(config.embed_dim * config.num_quantize_features,
+                              config.embed_dim)
 
     def forward(self, x: torch.Tensor, quantiles: torch.Tensor):
         # x: (batch, num_features)
         # quantiles: (num_quantiles, num_features)
 
         # Use interior quantile boundaries for bucketization
-        quantiles_tensor = quantiles.squeeze(-1)[1:-1, :].to(x.device, dtype=x.dtype)  # (num_bins-1, num_features)
+        quantiles_tensor = quantiles.squeeze(-1)[1:-1, :].to(x.device,
+                                                             dtype=x.dtype)
 
         # Bucketize each feature with its corresponding quantiles
         tokens = torch.stack([
