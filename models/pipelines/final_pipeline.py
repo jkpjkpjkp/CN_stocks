@@ -74,25 +74,20 @@ def check_memory_usage(max_gb: float = 320.0, backoff_delay: float = 1.0)\
 
 
 class PriceHistoryDataset(Dataset):
-    def __init__(self, stock_data: Dict[str, np.ndarray],
-                 stock_targets: Dict[str, np.ndarray],
-                 seq_len: int,
-                 pred_len: int):
+    def __init__(self, config, stock_data: Dict[str, np.ndarray],
+                 stock_targets: Dict[str, np.ndarray]):
         """
         Args:
             stock_data: Dict mapping stock_id to full feature array (T, F)
             stock_targets: Dict mapping stock_id to full target array (T,)
               - normalized prices
-            seq_len: Sequence length for context
-            pred_len: Prediction length
         """
         self.stock_data = stock_data
         self.targets = stock_targets
-        self.seq_len = seq_len
-        self.pred_len = pred_len
+        self.seq_len = config.seq_len
+        self.pred_len = config.pred_len
 
-        # Prediction horizons in minutes: 1min, 30min, 1day, 2days
-        self.horizons = [1, 30, 240, 480]
+        self.horizons = config.horizons
         self.num_horizons = len(self.horizons)
 
         # Build index: list of (stock_id, start_idx) tuples
@@ -100,7 +95,7 @@ class PriceHistoryDataset(Dataset):
         self.index = []
         for stock_id, data in stock_data.items():
             max_horizon = max(self.horizons)
-            num_windows = len(data) - seq_len - max_horizon  # for all horizons
+            num_windows = len(data) - self.seq_len - max_horizon  # for all horizons
             if num_windows > 0:
                 for start_idx in range(num_windows):
                     self.index.append((stock_id, start_idx))
@@ -589,9 +584,6 @@ class FinalPipeline(dummyLightning):
 
     def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
                      n_quantize: int = 256, train_frac: float = 0.9):
-        """Prepare data with all preprocessing strategies"""
-
-        # Try to load from cache if not forcing recalculation
         if not self.config.debug_data:
             cached = self._load_cache()
             if cached is not None:
@@ -599,15 +591,11 @@ class FinalPipeline(dummyLightning):
                 self.quantiles = quantiles
                 self.encoder.quantiles = quantiles
 
-                # Build datasets
-                pred_len = seq_len // 2
                 self.train_dataset = PriceHistoryDataset(
-                    train_stock_data, train_stock_targets,
-                    seq_len, pred_len
+                    self.config, train_stock_data, train_stock_targets,
                 )
                 self.val_dataset = PriceHistoryDataset(
-                    val_stock_data, val_stock_targets,
-                    seq_len, pred_len
+                    self.config, val_stock_data, val_stock_targets,
                 )
                 return
 
@@ -639,23 +627,19 @@ class FinalPipeline(dummyLightning):
             train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = \
                 self._prepare_data_chunked(path, seq_len, n_quantize, train_frac)
 
-        # Save to cache
         self._save_cache(
             train_stock_data, train_stock_targets,
             val_stock_data, val_stock_targets,
             self.quantiles
         )
 
-        # Build dataset objects
-        pred_len = seq_len // 2
         self.train_dataset = PriceHistoryDataset(
-            train_stock_data, train_stock_targets,
-            seq_len, pred_len
+            self.config, train_stock_data, train_stock_targets,
         )
         self.val_dataset = PriceHistoryDataset(
-            val_stock_data, val_stock_targets,
-            seq_len, pred_len
+            self.config, val_stock_data, val_stock_targets,
         )
+        return
 
     def _prepare_data_chunked(self, path: Path, seq_len: int, n_quantize: int,
                                train_frac: float, chunk_size: int = 300):
@@ -1182,28 +1166,28 @@ class FinalPipeline(dummyLightning):
 
         seq_len = x.shape[1]
         losses = {}
-        horizon_names = ['1min', '30min', '1day', '2day']
-
+        
         features = self.forward(x)[:, seq_len//2:, :]
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
         pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, n_quantize)
         y = y.to(pred_quantized.dtype)
+        y_returns_typed = y_returns.to(pred_quantized.dtype)
 
-        # Quantized prediction loss
+        # Quantized prediction loss - predicting returns
         # Use close feature quantiles (index 0)
-        quantiles_tensor = self.quantiles.squeeze(-1)[:, 0].to(y.device, dtype=y.dtype)
-        target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
+        quantiles_tensor = self.quantiles.squeeze(-1)[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)
+        target_quantized = torch.bucketize(y_returns_typed, quantiles_tensor)  # (batch, pred_len, num_horizons)
         target_quantized = torch.clamp(target_quantized, 0, self.config.n_quantize - 1)
 
         losses['quantized'] = 0.0
-        for h_idx, h_name in enumerate(horizon_names):
+        for h_idx, h_name in enumerate(self.horizons):
             h_loss = F.cross_entropy(
                 pred_quantized[:, :, h_idx, :].reshape(-1, self.config.n_quantize),
                 target_quantized[:, :, h_idx].reshape(-1)
             )
             losses[f'quantized_{h_name}'] = h_loss
-            losses['quantized'] += h_loss / len(horizon_names)
+            losses['quantized'] += h_loss / len(self.horizons)
 
         # Mean + Variance prediction loss (NLL)
         pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
@@ -1211,22 +1195,22 @@ class FinalPipeline(dummyLightning):
         pred_var += 1e-8  # (batch, pred_len, num_horizons)
 
         losses['nll'] = 0.0
-        for h_idx, h_name in enumerate(horizon_names):
+        for h_idx, h_name in enumerate(self.horizons):
             # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
             nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
                             (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
             h_loss = nll.mean()
             losses[f'nll_{h_name}'] = h_loss
-            losses['nll'] += h_loss / len(horizon_names)
+            losses['nll'] += h_loss / len(self.horizons)
 
         # Quantile prediction loss
         pred_quantiles = self.readout(features, 'quantile')
 
         losses['quantile'] = 0.0
-        for h_idx, h_name in enumerate(horizon_names):
+        for h_idx, h_name in enumerate(self.horizons):
             h_loss = self._quantile_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
             losses[f'quantile_{h_name}'] = h_loss
-            losses['quantile'] += h_loss / len(horizon_names)
+            losses['quantile'] += h_loss / len(self.horizons)
 
         # ===== Return prediction losses =====
         y_returns = y_returns.to(pred_mean.dtype)
@@ -1237,21 +1221,21 @@ class FinalPipeline(dummyLightning):
         pred_return_var += 1e-8
 
         losses['return_nll'] = 0.0
-        for h_idx, h_name in enumerate(horizon_names):
+        for h_idx, h_name in enumerate(self.horizons):
             nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var[:, :, h_idx]) +
                          (y_returns[:, :, h_idx] - pred_return_mean[:, :, h_idx]) ** 2 / pred_return_var[:, :, h_idx])
             h_loss = nll.mean()
             losses[f'return_nll_{h_name}'] = h_loss
-            losses['return_nll'] += h_loss / len(horizon_names)
+            losses['return_nll'] += h_loss / len(self.horizons)
 
         # Return quantile prediction loss
         pred_return_quantiles = self.readout(features, 'return_quantile')
 
         losses['return_quantile'] = 0.0
-        for h_idx, h_name in enumerate(horizon_names):
+        for h_idx, h_name in enumerate(self.horizons):
             h_loss = self._quantile_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
             losses[f'return_quantile_{h_name}'] = h_loss
-            losses['return_quantile'] += h_loss / len(horizon_names)
+            losses['return_quantile'] += h_loss / len(self.horizons)
         
         assert (
             losses['quantized'] >= 0 and
@@ -1279,7 +1263,7 @@ class FinalPipeline(dummyLightning):
 
         # Log per-horizon losses
         if self.config.debug_horizons:
-            for h_name in horizon_names:
+            for h_name in self.horizons:
                 # Price prediction per horizon
                 self.log(f'price_prediction/horizons/{h_name}/quantized', losses[f'quantized_{h_name}'])
                 self.log(f'price_prediction/horizons/{h_name}/mean', losses[f'mean_{h_name}'])
@@ -1304,7 +1288,7 @@ class FinalPipeline(dummyLightning):
 
         # Add per-horizon losses to result if enabled
         if self.config.debug_horizons:
-            for h_name in horizon_names:
+            for h_name in self.horizons:
                 result[f'quantized_{h_name}'] = losses[f'quantized_{h_name}']
                 result[f'mean_{h_name}'] = losses[f'mean_{h_name}']
                 result[f'nll_{h_name}'] = losses[f'nll_{h_name}']
