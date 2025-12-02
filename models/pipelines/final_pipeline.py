@@ -257,27 +257,27 @@ class CentsEncoder(dummyLightning):
         self.max_cent_abs = config.max_cent_abs
         self.embedding = nn.Embedding(2 * config.max_cent_abs + 3,
                                       config.embed_dim)
-        self.proj = nn.Linear(config.embed_dim * config.num_cent_features,
+        self.proj = nn.Linear(config.embed_dim * config.cent_feats,
                               config.embed_dim)
 
     def forward(self, x):
         """Convert cent differences to tokens
 
         Args:
-            x: (batch, num_cent_features) - delta price features (delta_1min, delta_30min)
+            x: (batch, cent_feats) - delta price features (delta_1min, delta_30min)
 
         Returns:
             (batch, embed_dim) - projected embeddings
         """
         # Convert to cents and clamp
-        # x: (batch, num_cent_features)
+        # x: (batch, cent_feats)
         x = (x * 100).long().clamp(-self.max_cent_abs-1, self.max_cent_abs+1)
         x = x + self.max_cent_abs + 1
 
-        # Embed each feature: (batch, num_cent_features, embed_dim)
+        # Embed each feature: (batch, cent_feats, embed_dim)
         embedded = self.embedding(x)
 
-        # Flatten and project: (batch, num_cent_features * embed_dim) -> (batch, embed_dim)
+        # Flatten and project: (batch, cent_feats * embed_dim) -> (batch, embed_dim)
         batch_size = embedded.shape[0]
         flattened = embedded.reshape(batch_size, -1)
         return self.proj(flattened)
@@ -331,7 +331,7 @@ class MultiEncoder(dummyLightning):
         # Cent encoder uses features at indices 2-3 (delta_1min, delta_30min)
         embeddings = [
             self.quantize_encoder(x_flat, self.quantiles),
-            self.cent_encoder(x_flat[:, 2:2+self.num_cent_features]),  # delta_1min, delta_30min
+            self.cent_encoder(x_flat[:, 2:2+self.cent_feats]),  # delta_1min, delta_30min
             self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
@@ -404,9 +404,9 @@ class FinalPipeline(dummyLightning):
         # Feature columns in order
         self.feature_cols = [
             'close', 'close_norm', 'delta_1min',
-            'delta_30min', 'ret_1min_ratio', 'ret_30min_ratio', 'ret_1day_ratio',
-            'ret_2day_ratio', 'close_open_ratio', 'high_open_ratio',
-            'low_open_ratio', 'high_low_ratio', 'volume', 'volume_norm'
+            'delta_30min', 'ret_1min', 'ret_30min', 'ret_1day',
+            'ret_2day', 'close_open', 'high_open',
+            'low_open', 'high_low', 'volume', 'volume_norm'
         ]
 
         # DDP setup
@@ -464,10 +464,8 @@ class FinalPipeline(dummyLightning):
         # Wrap model with DDP
         self._ddp_model = DDP(
             self,
-            device_ids=[self.local_rank] if torch.cuda.is_available() else None,
-            output_device=self.local_rank if torch.cuda.is_available() else None,
-            find_unused_parameters=self.config.ddp_find_unused_parameters,
-            static_graph=self.config.ddp_static_graph
+            device_ids=[self.local_rank],
+            output_device=self.local_rank,
         )
 
     def get_model(self):
@@ -671,7 +669,6 @@ class FinalPipeline(dummyLightning):
             path = Path.home() / 'h' / 'data' / 'a_1min.pq'
         path = Path(path)
 
-        # For debug mode, use small dataset (original behavior)
         if self.config.debug_data:
             df = pl.scan_parquet(str(path))
             n = self.config.debug_data if isinstance(self.config.debug_data,
@@ -987,32 +984,32 @@ class FinalPipeline(dummyLightning):
         df = df.with_columns(
             delta_1min=pl.col('close').shift(-1).over('id') - pl.col('close'),
             delta_30min=pl.col('close').shift(-30).over('id') - pl.col('close'),
-            ret_1min_ratio=(pl.col('close').shift(-1).over('id') / pl.col('close') - 1),
-            ret_30min_ratio=(pl.col('close').shift(-30).over('id') / pl.col('close') - 1),
-            ret_1day_ratio=(pl.col('close').shift(-240).over('id') / pl.col('close') - 1),
-            ret_2day_ratio=(pl.col('close').shift(-480).over('id') / pl.col('close') - 1),  # 2 days
+            ret_1min=(pl.col('close').shift(-1).over('id') / pl.col('close') - 1),
+            ret_30min=(pl.col('close').shift(-30).over('id') / pl.col('close') - 1),
+            ret_1day=(pl.col('close').shift(-240).over('id') / pl.col('close') - 1),
+            ret_2day=(pl.col('close').shift(-480).over('id') / pl.col('close') - 1),  # 2 days
         )
 
         # Intra-minute relative features
         df = df.with_columns([
-            (pl.col('close') / pl.col('open')).alias('close_open_ratio'),
-            (pl.col('high') / pl.col('open')).alias('high_open_ratio'),
-            (pl.col('low') / pl.col('open')).alias('low_open_ratio'),
-            (pl.col('high') / pl.col('low')).alias('high_low_ratio')
+            (pl.col('close') / pl.col('open')).alias('close_open'),
+            (pl.col('high') / pl.col('open')).alias('high_open'),
+            (pl.col('low') / pl.col('open')).alias('low_open'),
+            (pl.col('high') / pl.col('low')).alias('high_low')
         ])
 
         # Fill NaN values
         df = df.with_columns([
             pl.col('delta_1min').fill_null(0.),
             pl.col('delta_30min').fill_null(0.),
-            pl.col('ret_1min_ratio').fill_null(0.),
-            pl.col('ret_30min_ratio').fill_null(0.),
-            pl.col('ret_1day_ratio').fill_null(0.),
-            pl.col('ret_2day_ratio').fill_null(0.),
-            pl.col('close_open_ratio').fill_null(1.),
-            pl.col('high_open_ratio').fill_null(1.),
-            pl.col('low_open_ratio').fill_null(1.),
-            pl.col('high_low_ratio').fill_null(1.)
+            pl.col('ret_1min').fill_null(0.),
+            pl.col('ret_30min').fill_null(0.),
+            pl.col('ret_1day').fill_null(0.),
+            pl.col('ret_2day').fill_null(0.),
+            pl.col('close_open').fill_null(1.),
+            pl.col('high_open').fill_null(1.),
+            pl.col('low_open').fill_null(1.),
+            pl.col('high_low').fill_null(1.)
         ])
 
         return df
@@ -1463,14 +1460,12 @@ class FinalPipeline(dummyLightning):
 
 @dataclass
 class FinalPipelineConfig:
-    """Configuration for the final pipeline"""
-
-    # Model architecture
+    # Model
     hidden_dim: int = 256
-    intermediate_ratio: float = 2.
+    intermediate: float = 2.
     num_layers: int = 6
     num_heads: int = 8
-    attn_ratio: float = 1.
+    attn: float = 1.
     max_freq: float = 10000.
     standard_rope: bool = False  # use fine-grained rope
     qk_norm: bool = False
@@ -1484,28 +1479,17 @@ class FinalPipelineConfig:
 
     # Data
     seq_len: int = 256
-    train_ratio: float = 0.9
-    num_bins: int = 256
+    num_bins: int = 128
     max_cent_abs: int = 64
     embed_dim: int = 256
 
-    # Feature counts (14 total: close, close_norm, delta_1min, delta_30min,
-    # ret_1min_ratio, ret_30min_ratio, ret_1day_ratio, ret_2day_ratio,
-    # close_open_ratio, high_open_ratio, low_open_ratio, high_low_ratio,
-    # volume, volume_norm)
-    num_features: int = 14
-    # Cent-encoded features: delta_1min, delta_30min (indices 2-3)
-    num_cent_features: int = 2
-
-    num_horizons: int = 4
-    num_quantiles: int = 5
-
-    # Device
-    device: str = 'cuda'
-    num_workers: int = 4
-
-    # Muon optimizer for 2D parameters
-    use_muon: bool = True
+    features: tuple = ('close', 'close_norm', 'delta_1min', 'delta_30min',
+                       'ret_1min', 'ret_30min', 'ret_1day',
+                       'ret_2day', 'close_open', 'high_open',
+                       'low_open', 'high_low', 'volume', 'volume_norm')
+    cent_feats: tuple = ('delta_1min', 'delta_30min')
+    horizons: tuple = (1, 30, 240, 480)
+    quantiles: tuple = (10, 25, 50, 75, 90)
 
     debug_data: bool | int = False
     debug_horizons: bool = False
@@ -1513,17 +1497,18 @@ class FinalPipelineConfig:
     # DDP settings
     use_ddp: bool = False
     ddp_backend: str = 'nccl'
-    ddp_find_unused_parameters: bool = False
-    ddp_static_graph: bool = False
     master_addr: str = 'localhost'
     master_port: str = '12355'
 
     debug_ddp: bool = False
     debug_model: bool = False
+    num_workers: int | None = None
 
     # Cache settings
     cache_dir: Optional[str] = None
     debug_no_cache: bool = False
+    
+    use_ddp: bool = False
 
     def __post_init__(self):
         if self.debug_model:
@@ -1531,15 +1516,17 @@ class FinalPipelineConfig:
             self.num_heads //= 2
             self.num_layers //= 2
             self.embed_dim //= 2
+        
+        self.num_workers = self.num_workers or os.cpu_count() // 2
+        self.debug_no_cache = self.debug_no_cache or bool(self.debug_data)
 
         # Model
-        self.intermediate_dim = int(self.hidden_dim * self.intermediate_ratio)
-        self.head_dim = int(self.hidden_dim * self.attn_ratio / self.num_heads)
+        self.intermediate_dim = int(self.hidden_dim * self.intermediate)
+        self.head_dim = int(self.hidden_dim * self.attn / self.num_heads)
 
         # Embedding
         self.sin_embed_dim = self.embed_dim // 2
         self.num_cents = self.max_cent_abs * 2 + 1
-        self.num_quantize_features = self.num_features
         self.quantize_embed_dim = self.sin_embed_dim
 
         # Cache directory
@@ -1555,45 +1542,42 @@ class FinalPipelineConfig:
 
 config = FinalPipelineConfig(
     debug_data=True,
-    debug_no_cache=True,
-    debug_ddp=True,
+    use_ddp=False,
     debug_model=True,
     debug_horizons=True,
 )
 
 
 def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfig:
-    """Parse CLI arguments and override config fields"""
+    """GENERATED. Parse CLI arguments and override config fields"""
     import argparse
     import sys
     from dataclasses import fields
 
     parser = argparse.ArgumentParser(description='Train FinalPipeline')
 
-    # Dynamically add arguments from dataclass fields
     for field in fields(FinalPipelineConfig):
         field_name = field.name
-        field_type = field.type
+        tp = field.type
         default_val = getattr(base_config, field_name)
 
-        # Handle different types
-        if field_type == bool or field_type == 'bool':
+        if tp == bool or tp == 'bool':
             parser.add_argument(f'--{field_name}', action='store_true',
                               help=f'Set {field_name}=True')
             parser.add_argument(f'--no_{field_name}', dest=field_name,
                               action='store_false', help=f'Set {field_name}=False')
             parser.set_defaults(**{field_name: default_val})
-        elif 'bool | int' in str(field_type) or 'int | bool' in str(field_type):
+        elif 'bool | int' in str(tp) or 'int | bool' in str(tp):
             # Special handling for bool | int union type
             parser.add_argument(f'--{field_name}', type=str, default=str(default_val),
                               help=f'{field_name} (bool or int)')
-        elif field_type == int or field_type == 'int':
+        elif tp == int or tp == 'int':
             parser.add_argument(f'--{field_name}', type=int, default=default_val,
                               help=f'{field_name} (default: {default_val})')
-        elif field_type == float or field_type == 'float':
+        elif tp == float or tp == 'float':
             parser.add_argument(f'--{field_name}', type=float, default=default_val,
                               help=f'{field_name} (default: {default_val})')
-        elif field_type == str or field_type == 'str' or 'Optional[str]' in str(field_type):
+        elif tp == str or tp == 'str' or 'Optional[str]' in str(tp):
             parser.add_argument(f'--{field_name}', type=str, default=default_val,
                               help=f'{field_name} (default: {default_val})')
 
@@ -1610,11 +1594,11 @@ def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfi
     overrides = {}
     for field in fields(FinalPipelineConfig):
         field_name = field.name
-        field_type = field.type
+        tp = field.type
         arg_val = getattr(args, field_name)
 
         # Handle bool | int type
-        if 'bool | int' in str(field_type) or 'int | bool' in str(field_type):
+        if 'bool | int' in str(tp) or 'int | bool' in str(tp):
             if arg_val.lower() in ('true', '1', 'yes'):
                 overrides[field_name] = True
             elif arg_val.lower() in ('false', '0', 'no'):
@@ -1628,39 +1612,27 @@ def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfi
 
 
 if __name__ == "__main__":
-    import sys
-
-    # Parse CLI arguments
     config = parse_args_to_config(config)
-
-    # Check if running with torchrun
-    config.use_ddp = 'RANK' in os.environ or config.use_ddp
-
     pipeline = FinalPipeline(config)
+    is_root = not config.use_ddp or pipeline.is_main_process()
 
     if config.use_ddp:
         pipeline.setup_ddp()
-        if pipeline.is_main_process():
-            print(f"Running DDP training on {pipeline.world_size} GPUs")
-            print(f"Rank: {pipeline.rank}, Local Rank: {pipeline.local_rank}")
+        if is_root:
+            print(f"{pipeline.world_size} GPUs")\
 
-    # Prepare data
-    if not config.use_ddp or pipeline.is_main_process():
+    if is_root:
         print("Preparing data...")
     pipeline.prepare_data()
 
-    # Synchronize after data preparation
     if config.use_ddp:
         pipeline.barrier()
 
-    # Train
-    if not config.use_ddp or pipeline.is_main_process():
+    if is_root:
         print("Starting training...")
     pipeline.fit()
 
-    # Cleanup
     if config.use_ddp:
         pipeline.cleanup_ddp()
-
-    if not config.use_ddp or pipeline.is_main_process():
+    if is_root:
         breakpoint()
