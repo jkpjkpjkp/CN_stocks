@@ -399,11 +399,6 @@ class FinalPipeline(dummyLightning):
         self.backbone = tm(config)
         self.readout = MultiReadout(config)
 
-        # Loss functions
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.huber_loss = nn.HuberLoss()
-        self.mse_loss = nn.MSELoss()
-
     def setup_ddp(self, rank: Optional[int] = None,
                   world_size: Optional[int] = None):
         """Initialize DDP from environment or provided rank/world_size"""
@@ -1201,126 +1196,73 @@ class FinalPipeline(dummyLightning):
         target_quantized = torch.bucketize(y, quantiles_tensor)  # (batch, pred_len, num_horizons)
         target_quantized = torch.clamp(target_quantized, 0, self.config.n_quantize - 1)
 
-        if self.config.debug_horizons:
-            # Compute per-horizon losses
-            losses['quantized'] = 0.0
-            for h_idx, h_name in enumerate(horizon_names):
-                h_loss = self.ce_loss(
-                    pred_quantized[:, :, h_idx, :].reshape(-1, self.config.n_quantize),
-                    target_quantized[:, :, h_idx].reshape(-1)
-                )
-                losses[f'quantized_{h_name}'] = h_loss
-                losses['quantized'] += h_loss / len(horizon_names)
-        else:
-            losses['quantized'] = self.ce_loss(
-                pred_quantized.reshape(-1, self.config.n_quantize),
-                target_quantized.reshape(-1)
+        losses['quantized'] = 0.0
+        for h_idx, h_name in enumerate(horizon_names):
+            h_loss = F.cross_entropy(
+                pred_quantized[:, :, h_idx, :].reshape(-1, self.config.n_quantize),
+                target_quantized[:, :, h_idx].reshape(-1)
             )
-
-        # Mean prediction loss (Huber)
-        pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
-
-        if self.config.debug_horizons:
-            # Compute per-horizon losses
-            losses['mean'] = 0.0
-            for h_idx, h_name in enumerate(horizon_names):
-                h_loss = self.huber_loss(pred_mean[:, :, h_idx], y[:, :, h_idx])
-                losses[f'mean_{h_name}'] = h_loss
-                losses['mean'] += h_loss / len(horizon_names)
-        else:
-            losses['mean'] = self.huber_loss(pred_mean, y)
+            losses[f'quantized_{h_name}'] = h_loss
+            losses['quantized'] += h_loss / len(horizon_names)
 
         # Mean + Variance prediction loss (NLL)
+        pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
         pred_var = self.readout(features, 'var')  # (batch, pred_len, num_horizons)
         pred_var += 1e-8  # (batch, pred_len, num_horizons)
 
-        if self.config.debug_horizons:
-            # Compute per-horizon losses
-            losses['nll'] = 0.0
-            for h_idx, h_name in enumerate(horizon_names):
-                # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
-                nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
-                             (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
-                h_loss = nll.mean()
-                losses[f'nll_{h_name}'] = h_loss
-                losses['nll'] += h_loss / len(horizon_names)
-        else:
+        losses['nll'] = 0.0
+        for h_idx, h_name in enumerate(horizon_names):
             # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
-            nll = 1/2 * (torch.log(2 * torch.pi * pred_var) +
-                         (y - pred_mean) ** 2 / pred_var)
-            losses['nll'] = nll.mean()
+            nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
+                            (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
+            h_loss = nll.mean()
+            losses[f'nll_{h_name}'] = h_loss
+            losses['nll'] += h_loss / len(horizon_names)
 
         # Quantile prediction loss
         pred_quantiles = self.readout(features, 'quantile')
 
-        if self.config.debug_horizons:
-            # Compute per-horizon losses
-            losses['quantile'] = 0.0
-            for h_idx, h_name in enumerate(horizon_names):
-                h_loss = self._quantile_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
-                losses[f'quantile_{h_name}'] = h_loss
-                losses['quantile'] += h_loss / len(horizon_names)
-        else:
-            losses['quantile'] = self._quantile_loss(pred_quantiles, y)
+        losses['quantile'] = 0.0
+        for h_idx, h_name in enumerate(horizon_names):
+            h_loss = self._quantile_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
+            losses[f'quantile_{h_name}'] = h_loss
+            losses['quantile'] += h_loss / len(horizon_names)
 
         # ===== Return prediction losses =====
         y_returns = y_returns.to(pred_mean.dtype)
 
-        # Return mean prediction loss (Huber)
-        pred_return_mean = self.readout(features, 'return_mean')  # (batch, pred_len, num_horizons)
-
-        if self.config.debug_horizons:
-            losses['return_mean'] = 0.0
-            for h_idx, h_name in enumerate(horizon_names):
-                h_loss = self.huber_loss(pred_return_mean[:, :, h_idx], y_returns[:, :, h_idx])
-                losses[f'return_mean_{h_name}'] = h_loss
-                losses['return_mean'] += h_loss / len(horizon_names)
-        else:
-            losses['return_mean'] = self.huber_loss(pred_return_mean, y_returns)
-
         # Return variance prediction loss (NLL)
+        pred_return_mean = self.readout(features, 'return_mean')  # (batch, pred_len, num_horizons)
         pred_return_var = self.readout(features, 'return_var')  # (batch, pred_len, num_horizons)
         pred_return_var += 1e-8
 
-        if self.config.debug_horizons:
-            losses['return_nll'] = 0.0
-            for h_idx, h_name in enumerate(horizon_names):
-                nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var[:, :, h_idx]) +
-                             (y_returns[:, :, h_idx] - pred_return_mean[:, :, h_idx]) ** 2 / pred_return_var[:, :, h_idx])
-                h_loss = nll.mean()
-                losses[f'return_nll_{h_name}'] = h_loss
-                losses['return_nll'] += h_loss / len(horizon_names)
-        else:
-            nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var) +
-                         (y_returns - pred_return_mean) ** 2 / pred_return_var)
-            losses['return_nll'] = nll.mean()
+        losses['return_nll'] = 0.0
+        for h_idx, h_name in enumerate(horizon_names):
+            nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var[:, :, h_idx]) +
+                         (y_returns[:, :, h_idx] - pred_return_mean[:, :, h_idx]) ** 2 / pred_return_var[:, :, h_idx])
+            h_loss = nll.mean()
+            losses[f'return_nll_{h_name}'] = h_loss
+            losses['return_nll'] += h_loss / len(horizon_names)
 
         # Return quantile prediction loss
         pred_return_quantiles = self.readout(features, 'return_quantile')
 
-        if self.config.debug_horizons:
-            losses['return_quantile'] = 0.0
-            for h_idx, h_name in enumerate(horizon_names):
-                h_loss = self._quantile_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
-                losses[f'return_quantile_{h_name}'] = h_loss
-                losses['return_quantile'] += h_loss / len(horizon_names)
-        else:
-            losses['return_quantile'] = self._quantile_loss(pred_return_quantiles, y_returns)
-
+        losses['return_quantile'] = 0.0
+        for h_idx, h_name in enumerate(horizon_names):
+            h_loss = self._quantile_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
+            losses[f'return_quantile_{h_name}'] = h_loss
+            losses['return_quantile'] += h_loss / len(horizon_names)
+        
         assert (
             losses['quantized'] >= 0 and
-            losses['mean'] >= 0 and
             losses['quantile'] >= 0 and
-            losses['return_mean'] >= 0 and
             losses['return_quantile'] >= 0
         ), losses
         # Combine losses
         total_loss = (
             0.15 * losses['quantized'] +
-            0.15 * losses['mean'] +
             0.15 * losses['nll'] +
             0.15 * losses['quantile'] +
-            0.15 * losses['return_mean'] +
             0.15 * losses['return_nll'] +
             0.10 * losses['return_quantile']
         )
@@ -1328,12 +1270,10 @@ class FinalPipeline(dummyLightning):
         # Log aggregate losses with hierarchical grouping
         # Price prediction losses
         self.log('price_prediction/quantized', losses['quantized'])
-        self.log('price_prediction/mean', losses['mean'])
         self.log('price_prediction/nll', losses['nll'])
         self.log('price_prediction/quantile', losses['quantile'])
 
         # Return prediction losses
-        self.log('return_prediction/mean', losses['return_mean'])
         self.log('return_prediction/nll', losses['return_nll'])
         self.log('return_prediction/quantile', losses['return_quantile'])
 
