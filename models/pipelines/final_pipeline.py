@@ -40,6 +40,7 @@ import psutil
 import time
 
 from ..prelude.model import dummyLightning, Rope, tm
+from ..pola import SortedDS
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -654,7 +655,7 @@ class FinalPipeline(dummyLightning):
 
     def _prepare_data_chunked(self, path: Path, seq_len: int, n_quantize: int,
                                train_frac: float, chunk_size: int = 300):
-        """Prepare data in chunks to avoid OOM for full dataset.
+        """Prepare data in chunks using SortedDS for efficient iteration.
 
         Args:
             path: Path to parquet file
@@ -670,7 +671,7 @@ class FinalPipeline(dummyLightning):
         if self.is_root():
             print(f"Processing data in chunks of {chunk_size} stocks...")
 
-        # Step 1: Get time-based cutoff for train/val split (lightweight)
+        # Step 1: Get time-based cutoff for train/val split
         if self.is_root():
             print("Computing train/val cutoff...")
         cutoff = (pl.scan_parquet(str(path))
@@ -683,182 +684,70 @@ class FinalPipeline(dummyLightning):
 
         if self.is_root():
             print(f"Train/val cutoff timestamp: {cutoff}")
-        gc.collect()
 
-        # Step 2: Get all unique stock IDs (lightweight)
-        if self.is_root():
-            print("Getting stock IDs...")
-        all_stock_ids = (pl.scan_parquet(str(path))
-                        .select('id')
-                        .unique()
-                        .collect()['id']
-                        .to_list())
-        total_stocks = len(all_stock_ids)
-
-        if self.is_root():
-            print(f"Total stocks to process: {total_stocks}")
-        gc.collect()
-
-        # Step 3: Compute quantiles from first chunk only
-        # (avoids loading all data)
-        if self.is_root():
-            print("Computing quantiles from first chunk...")
-
-        first_chunk_ids = all_stock_ids[:chunk_size]
-        df_sample = (pl.scan_parquet(str(path))
-                    .filter(pl.col('id').is_in(first_chunk_ids)))
-        df_sample = self._compute_features(df_sample)
-        df_sample = df_sample.with_columns(
+        # Step 2: Build full pipeline as lazy frame, sorted by id for SortedDS
+        df = (pl.scan_parquet(str(path))
+              .sort('id', 'datetime'))
+        df = self._compute_features(df)
+        df = df.with_columns(
             is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff)
         )
 
-        # Compute stats for normalization from training data
-        stats = df_sample.filter(pl.col('is_train')).group_by('id').agg([
+        # Compute per-stock normalization stats from training data
+        stats = df.filter(pl.col('is_train')).group_by('id').agg([
             pl.col('close').mean().alias('mean_close'),
             pl.col('close').std().alias('std_close'),
             pl.col('volume').mean().alias('mean_volume'),
             pl.col('volume').std().alias('std_volume')
         ])
-
-        df_sample = df_sample.join(stats, on='id', how='left')
-        df_sample = df_sample.with_columns(
+        df = df.join(stats, on='id', how='left')
+        df = df.with_columns(
             ((pl.col('close') - pl.col('mean_close'))
              / (pl.col('std_close') + 1e-8)).alias('close_norm'),
             ((pl.col('volume') - pl.col('mean_volume'))
              / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
         )
 
-        # Compute quantiles
-        self.quantiles = self._compute_quantiles(df_sample, n_quantize)
+        # Step 3: Compute quantiles from sample
+        if self.is_root():
+            print("Computing quantiles...")
+        self.quantiles = self._compute_quantiles(df, n_quantize)
         self.encoder.quantiles = self.quantiles
-        del df_sample, stats
         gc.collect()
 
-        # Step 4: Process stocks in chunks
+        # Step 4: Create SortedDS for efficient chunking
+        if self.is_root():
+            print("Building SortedDS breakpoints...")
+        sorted_ds = SortedDS(df, id='id')
+        total_stocks = sorted_ds.bp.shape[0]
+
+        if self.is_root():
+            print(f"Total stocks: {total_stocks}")
+
+        # Step 5: Process stocks in chunks using breakpoints
         train_stock_data = {}
         train_stock_targets = {}
         val_stock_data = {}
         val_stock_targets = {}
-
         mmap_dir = self._get_mmap_dir()
-        num_chunks = (total_stocks + chunk_size - 1) // chunk_size
 
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, total_stocks)
-            chunk_stock_ids = all_stock_ids[start_idx:end_idx]
+        for chunk_idx, chunk_df in enumerate(sorted_ds.chunks(chunk_size)):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(chunk_start + chunk_size, total_stocks)
 
             if self.is_root():
-                print(f"\nChunk {chunk_idx + 1}/{num_chunks} "
-                      f"(stocks {start_idx}-{end_idx}, "
-                      f"{len(chunk_stock_ids)} stocks)")
+                print(f"\nChunk {chunk_idx + 1} "
+                      f"(stocks {chunk_start}-{chunk_end})")
 
-            # Load only this chunk of stocks
-            df_chunk = (pl.scan_parquet(str(path))
-                       .filter(pl.col('id').is_in(chunk_stock_ids)))
+            chunk_df = chunk_df.collect()
+            chunk_stock_ids = chunk_df['id'].unique().to_list()
 
-            # Compute features for this chunk
-            df_chunk = self._compute_features(df_chunk)
-
-            # Apply train/val split using the global cutoff
-            df_chunk = df_chunk.with_columns(
-                is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff)
+            self._process_stock_chunk(
+                chunk_df, chunk_stock_ids, seq_len, mmap_dir,
+                train_stock_data, train_stock_targets,
+                val_stock_data, val_stock_targets
             )
 
-            # Compute per-stock normalization stats from training data
-            stats = df_chunk.filter(pl.col('is_train')).group_by('id').agg([
-                pl.col('close').mean().alias('mean_close'),
-                pl.col('close').std().alias('std_close'),
-                pl.col('volume').mean().alias('mean_volume'),
-                pl.col('volume').std().alias('std_volume')
-            ])
-
-            df_chunk = df_chunk.join(stats, on='id', how='left')
-            df_chunk = df_chunk.with_columns(
-                ((pl.col('close') - pl.col('mean_close'))
-                 / (pl.col('std_close') + 1e-8)).alias('close_norm'),
-                ((pl.col('volume') - pl.col('mean_volume'))
-                 / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
-            )
-
-            # Compute time-based stats for this chunk
-            time_stats = df_chunk.group_by('datetime').agg(
-                time_mean_close=pl.col('close').mean(),
-                time_std_close=pl.col('close').std(),
-            )
-            df_chunk = df_chunk.join(time_stats, on='datetime')
-            df_chunk = df_chunk.with_columns(
-                close_time_norm=((pl.col('close')
-                                  - pl.col('time_mean_close'))
-                                 / (pl.col('time_std_close') + 1e-8))
-            )
-
-            # Collect chunk
-            chunk_df = df_chunk.collect()
-            del df_chunk, stats, time_stats
-            gc.collect()
-
-            # Process each stock in the chunk
-            for stock_id in chunk_stock_ids:
-                stock_df = chunk_df.filter(pl.col('id') == stock_id)
-
-                if len(stock_df) <= seq_len + 1:
-                    continue
-
-                # Convert to numpy
-                features = (stock_df.select(self.features)
-                           .to_numpy()
-                           .astype(np.float32))
-                is_train = stock_df['is_train'].to_numpy()
-                close = stock_df['close_norm'].to_numpy().astype(np.float32)
-
-                # Split by time
-                train_mask = is_train.astype(bool)
-                val_mask = ~train_mask
-
-                # Save training data
-                if train_mask.sum() > seq_len + 1:
-                    train_features_path = (mmap_dir
-                                          / f"train_data_{stock_id}.npy")
-                    train_targets_path = (mmap_dir
-                                         / f"train_target_{stock_id}.npy")
-
-                    train_features = features[train_mask]
-                    train_targets = close[train_mask]
-
-                    np.save(train_features_path, train_features)
-                    np.save(train_targets_path, train_targets)
-
-                    train_stock_data[stock_id] = np.load(
-                        train_features_path, mmap_mode='r')
-                    train_stock_targets[stock_id] = np.load(
-                        train_targets_path, mmap_mode='r')
-
-                    del train_features, train_targets
-
-                # Save validation data
-                if val_mask.sum() > seq_len + 1:
-                    val_features_path = (mmap_dir
-                                        / f"val_data_{stock_id}.npy")
-                    val_targets_path = (mmap_dir
-                                       / f"val_target_{stock_id}.npy")
-
-                    val_features = features[val_mask]
-                    val_targets = close[val_mask]
-
-                    np.save(val_features_path, val_features)
-                    np.save(val_targets_path, val_targets)
-
-                    val_stock_data[stock_id] = np.load(
-                        val_features_path, mmap_mode='r')
-                    val_stock_targets[stock_id] = np.load(
-                        val_targets_path, mmap_mode='r')
-
-                    del val_features, val_targets
-
-                del stock_df, features, is_train, close
-
-            # Clean up chunk completely
             del chunk_df
             gc.collect()
 
@@ -871,13 +760,58 @@ class FinalPipeline(dummyLightning):
                       f"val: {len(val_stock_data)}")
 
         if self.is_root():
-            print(f"\nCompleted {total_stocks} stocks in "
-                  f"{num_chunks} chunks")
+            print(f"\nCompleted {total_stocks} stocks")
             print(f"Final: {len(train_stock_data)} train stocks, "
                   f"{len(val_stock_data)} val stocks")
 
         return (train_stock_data, train_stock_targets,
                 val_stock_data, val_stock_targets)
+
+    def _process_stock_chunk(self, chunk_df: pl.DataFrame,
+                              stock_ids: list, seq_len: int, mmap_dir: Path,
+                              train_stock_data: dict, train_stock_targets: dict,
+                              val_stock_data: dict, val_stock_targets: dict):
+        """Process a chunk of stocks and save to mmap files."""
+        for stock_id in stock_ids:
+            stock_df = chunk_df.filter(pl.col('id') == stock_id)
+
+            if len(stock_df) <= seq_len + 1:
+                continue
+
+            features = (stock_df.select(self.features)
+                        .to_numpy()
+                        .astype(np.float32))
+            is_train = stock_df['is_train'].to_numpy()
+            close = stock_df['close_norm'].to_numpy().astype(np.float32)
+
+            train_mask = is_train.astype(bool)
+            val_mask = ~train_mask
+
+            # Save training data
+            if train_mask.sum() > seq_len + 1:
+                train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
+                train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
+
+                np.save(train_features_path, features[train_mask])
+                np.save(train_targets_path, close[train_mask])
+
+                train_stock_data[stock_id] = np.load(
+                    train_features_path, mmap_mode='r')
+                train_stock_targets[stock_id] = np.load(
+                    train_targets_path, mmap_mode='r')
+
+            # Save validation data
+            if val_mask.sum() > seq_len + 1:
+                val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
+                val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
+
+                np.save(val_features_path, features[val_mask])
+                np.save(val_targets_path, close[val_mask])
+
+                val_stock_data[stock_id] = np.load(
+                    val_features_path, mmap_mode='r')
+                val_stock_targets[stock_id] = np.load(
+                    val_targets_path, mmap_mode='r')
 
     def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
         """Create dataloader with DDP support via DistributedSampler"""
@@ -1401,7 +1335,7 @@ class FinalPipelineConfig:
         self.pred_len = self.seq_len // 2
 
         # Dataloader
-        self.batch_size = self.vram_gb * 2 ** 26 // self.seq_len // self.num_layers // self.interim_dim
+        self.batch_size = self.vram_gb * 2 ** 20 // self.seq_len // self.num_layers // self.interim_dim
         self.num_workers = self.num_workers or os.cpu_count() // 2
         self.cache_dir = self.cache_dir or str(Path.home() / 'h' / 'cache' / 'pipeline_data' / f'debug_{self.debug_data}')
         Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
