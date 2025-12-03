@@ -29,48 +29,17 @@ from torch.utils.data import Dataset, DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
-import polars as pl
+import duckdb
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 import os
 import gc
 import psutil
-import time
 
 from ..prelude.model import dummyLightning, Rope, tm
-from ..pola import SortedDS
 
 torch.autograd.set_detect_anomaly(True)
-
-
-def check_memory_usage(max_gb: float = 320.0, backoff_delay: float = 1.0)\
-         -> float:
-    """Check memory usage and wait with exponential backoff.
-
-    Args:
-        max_gb: Maximum memory in GB before triggering garbage collection
-        backoff_delay: Current backoff delay in seconds
-
-    Returns:
-        Updated backoff delay (doubled if GC was triggered, reset to 1.0)
-    """
-    process = psutil.Process()
-    mem_info = process.memory_info()
-    current_gb = mem_info.rss / (1024 ** 3)  # Convert bytes to GB
-
-    if current_gb > max_gb:
-        print(f"Memory usage {current_gb:.2f} GB exceeds limit {max_gb} GB. "
-              f"Running GC and backing off for {backoff_delay:.2f}s...")
-        gc.collect()
-        time.sleep(backoff_delay)
-        # Check again after GC
-        mem_info = process.memory_info()
-        current_gb = mem_info.rss / (1024 ** 3)
-        print(f"After GC: {current_gb:.2f} GB")
-        return backoff_delay * 2  # Exponential backoff
-
-    return 1.0  # Reset backoff delay
 
 
 class PriceHistoryDataset(Dataset):
@@ -637,7 +606,7 @@ class FinalPipeline(dummyLightning):
 
     def _prepare_data_chunked(self, path: Path, seq_len: int, n_quantize: int,
                                train_frac: float, chunk_size: int = 300):
-        """Prepare data in chunks using SortedDS for efficient iteration.
+        """Prepare data in chunks using DuckDB for efficient iteration.
 
         Args:
             path: Path to parquet file
@@ -647,89 +616,123 @@ class FinalPipeline(dummyLightning):
             chunk_size: Number of stocks to process per chunk (default 300)
 
         Returns:
-            train_x, train_y, val_x,
-            val_y
+            train_x, train_y, val_x, val_y
         """
         if self.is_root():
             print(f"Processing data in chunks of {chunk_size} stocks...")
 
-        # Step 1: Get time-based cutoff for train/val split
+        con = duckdb.connect()
+        con.execute("SET memory_limit='350GB'")
+        con.execute("SET max_memory='350GB'")
+        con.execute("SET threads=16")
+
+        # Step 1: Load parquet and compute features
+        if self.is_root():
+            print("Loading parquet and computing features...")
+
+        con.execute(f"""
+            CREATE VIEW raw_data AS
+            SELECT * FROM read_parquet('{path}')
+        """)
+
+        # Create view with computed features
+        con.execute(f"""
+            CREATE VIEW df AS
+            {self._compute_features_sql().replace('FROM df', 'FROM raw_data')}
+        """)
+
+        # Step 2: Compute train/val cutoff (90th percentile of datetime)
         if self.is_root():
             print("Computing train/val cutoff...")
-        
+
+        cutoff = con.execute("""
+            SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
+            FROM (SELECT DISTINCT datetime FROM raw_data USING SAMPLE 1000000)
+        """).fetchone()[0]
+
         if self.is_root():
             print(f"Train/val cutoff timestamp: {cutoff}")
 
-        # Step 2: Build full pipeline as lazy frame, sorted by id for SortedDS
-        df = pl.scan_parquet(str(path))
-        df = self._compute_features(df)
+        # Step 3: Create view with is_train flag
+        con.execute(f"""
+            CREATE VIEW df_split AS
+            SELECT *, epoch_ns(datetime) <= {cutoff} AS is_train
+            FROM df
+        """)
 
-        cutoff = (
-            df
-            .select(pl.col('datetime')
-                    .sample(1000000)
-                    .unique()
-                    .cast(pl.Int64)
-                    .quantile(0.9))
-            .collect()['datetime'][0])
+        # Step 4: Compute per-stock normalization stats from training data
+        con.execute("""
+            CREATE VIEW stats AS
+            SELECT
+                id,
+                AVG(close) AS mean_close,
+                STDDEV(close) AS std_close,
+                AVG(volume) AS mean_volume,
+                STDDEV(volume) AS std_volume
+            FROM df_split
+            WHERE is_train = true
+            GROUP BY id
+        """)
 
-        df = df.with_columns(
-            is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff)
-        )
+        # Step 5: Create normalized view
+        con.execute("""
+            CREATE VIEW df_norm AS
+            SELECT
+                d.*,
+                (d.close - COALESCE(s.mean_close, 0)) / (COALESCE(s.std_close, 1e-8) + 1e-8) AS close_norm,
+                (d.volume - COALESCE(s.mean_volume, 0)) / (COALESCE(s.std_volume, 1e-8) + 1e-8) AS volume_norm
+            FROM df_split d
+            LEFT JOIN stats s ON d.id = s.id
+        """)
 
-        # Compute per-stock normalization stats from training data
-        stats = df.filter(pl.col('is_train')).group_by('id').agg([
-            pl.col('close').mean().alias('mean_close'),
-            pl.col('close').std().alias('std_close'),
-            pl.col('volume').mean().alias('mean_volume'),
-            pl.col('volume').std().alias('std_volume')
-        ])
-        df = df.join(stats, on='id', how='left')
-        df = df.with_columns(
-            ((pl.col('close') - pl.col('mean_close'))
-             / (pl.col('std_close') + 1e-8)).alias('close_norm'),
-            ((pl.col('volume') - pl.col('mean_volume'))
-             / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
-        )
-
-        # Step 3: Compute quantiles from sample
+        # Step 6: Compute quantiles from sample
         if self.is_root():
             print("Computing quantiles...")
-        self.quantiles = self._compute_quantiles(df, n_quantize)
+        self.quantiles = self._compute_quantiles_duckdb(con, n_quantize)
         self.encoder.quantiles = self.quantiles
         gc.collect()
 
-        # Step 4: Create SortedDS for efficient chunking
+        # Step 7: Get all unique stock ids
         if self.is_root():
-            print("Building SortedDS breakpoints...")
-        sorted_ds = SortedDS(df, id='id')
-        total_stocks = sorted_ds.bp.shape[0]
+            print("Getting stock ids...")
+        stock_ids = con.execute("""
+            SELECT DISTINCT id FROM df_norm ORDER BY id
+        """).fetchall()
+        stock_ids = [row[0] for row in stock_ids]
+        total_stocks = len(stock_ids)
 
         if self.is_root():
             print(f"Total stocks: {total_stocks}")
 
-        # Step 5: Process stocks in chunks using breakpoints
+        # Step 8: Process stocks in chunks
         train_x = {}
         train_y = {}
         val_x = {}
         val_y = {}
         mmap_dir = self._get_mmap_dir()
 
-        for chunk_idx, chunk_df in enumerate(sorted_ds.chunks(chunk_size)):
-            chunk_start = chunk_idx * chunk_size
-            chunk_end = min(chunk_start + chunk_size, total_stocks)
+        features_cols = ', '.join(self.features)
+
+        for chunk_idx in range(0, total_stocks, chunk_size):
+            chunk_end = min(chunk_idx + chunk_size, total_stocks)
+            chunk_stock_ids = stock_ids[chunk_idx:chunk_end]
 
             if self.is_root():
-                print(f"\nChunk {chunk_idx + 1} "
-                      f"(stocks {chunk_start}-{chunk_end})")
+                print(f"\nChunk {chunk_idx // chunk_size + 1} "
+                      f"(stocks {chunk_idx}-{chunk_end})")
 
-            chunk_df = chunk_df.collect()
-            chunk_stock_ids = chunk_df['id'].unique().to_list()
+            # Fetch chunk data
+            placeholders = ', '.join([f"'{sid}'" for sid in chunk_stock_ids])
+            chunk_df = con.execute(f"""
+                SELECT id, is_train, close_norm, {features_cols}
+                FROM df_norm
+                WHERE id IN ({placeholders})
+                ORDER BY id, datetime
+            """).fetchnumpy()
 
-            self._process_stock_chunk(
+            self._process_stock_chunk_numpy(
                 chunk_df, chunk_stock_ids, seq_len, mmap_dir,
-                train_x, train_y,
-                val_x, val_y
+                train_x, train_y, val_x, val_y
             )
 
             del chunk_df
@@ -743,32 +746,38 @@ class FinalPipeline(dummyLightning):
                       f"train: {len(train_x)}, "
                       f"val: {len(val_x)}")
 
+        con.close()
+
         if self.is_root():
             print(f"\nCompleted {total_stocks} stocks")
             print(f"Final: {len(train_x)} train stocks, "
                   f"{len(val_x)} val stocks")
 
-        return (train_x, train_y,
-                val_x, val_y)
+        return (train_x, train_y, val_x, val_y)
 
-    def _process_stock_chunk(self, chunk_df: pl.DataFrame,
-                              stock_ids: list, seq_len: int, mmap_dir: Path,
-                              train_x: dict, train_y: dict,
-                              val_x: dict, val_y: dict):
-        """Process a chunk of stocks and save to mmap files."""
+    def _process_stock_chunk_numpy(self, chunk_df: Dict[str, np.ndarray],
+                                     stock_ids: list, seq_len: int, mmap_dir: Path,
+                                     train_x: dict, train_y: dict,
+                                     val_x: dict, val_y: dict):
+        """Process a chunk of stocks from numpy arrays and save to mmap files."""
+        ids = chunk_df['id']
+        is_train = chunk_df['is_train']
+        close_norm = chunk_df['close_norm']
+
+        # Build features array from columns
+        features_data = np.column_stack([chunk_df[f] for f in self.features])
+
         for stock_id in stock_ids:
-            stock_df = chunk_df.filter(pl.col('id') == stock_id)
+            stock_mask = ids == stock_id
 
-            if len(stock_df) <= seq_len + 1:
+            if stock_mask.sum() <= seq_len + 1:
                 continue
 
-            features = (stock_df.select(self.features)
-                        .to_numpy()
-                        .astype(np.float32))
-            is_train = stock_df['is_train'].to_numpy()
-            close = stock_df['close_norm'].to_numpy().astype(np.float32)
+            stock_features = features_data[stock_mask].astype(np.float32)
+            stock_is_train = is_train[stock_mask]
+            stock_close = close_norm[stock_mask].astype(np.float32)
 
-            train_mask = is_train.astype(bool)
+            train_mask = stock_is_train.astype(bool)
             val_mask = ~train_mask
 
             # Save training data
@@ -776,8 +785,8 @@ class FinalPipeline(dummyLightning):
                 train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
                 train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
 
-                np.save(train_features_path, features[train_mask])
-                np.save(train_targets_path, close[train_mask])
+                np.save(train_features_path, stock_features[train_mask])
+                np.save(train_targets_path, stock_close[train_mask])
 
                 train_x[stock_id] = np.load(
                     train_features_path, mmap_mode='r')
@@ -789,8 +798,8 @@ class FinalPipeline(dummyLightning):
                 val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
                 val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
 
-                np.save(val_features_path, features[val_mask])
-                np.save(val_targets_path, close[val_mask])
+                np.save(val_features_path, stock_features[val_mask])
+                np.save(val_targets_path, stock_close[val_mask])
 
                 val_x[stock_id] = np.load(
                     val_features_path, mmap_mode='r')
@@ -840,108 +849,63 @@ class FinalPipeline(dummyLightning):
     def val_dataloader(self):
         return self.get_dataloader(self.val_dataset, shuffle=False)
 
-    def _compute_features(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Compute all feature types"""
+    def _compute_features_sql(self) -> str:
+        """Return SQL to compute all feature types"""
+        return """
+            SELECT *,
+                -- Returns at different time scales (1min, 30min, 1day, 2days)
+                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_1min,
+                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_30min,
+                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1min,
+                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_30min,
+                COALESCE(LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1day,
+                COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_2day,
+                -- Intra-minute relative features
+                COALESCE(close / NULLIF(open, 0), 1) AS close_open,
+                COALESCE(high / NULLIF(open, 0), 1) AS high_open,
+                COALESCE(low / NULLIF(open, 0), 1) AS low_open,
+                COALESCE(high / NULLIF(low, 0), 1) AS high_low
+            FROM df
+        """
 
-        # Returns at different time scales (1min, 30min, 1day, 2days)
-        df = df.with_columns(
-            delta_1min=pl.col('close').shift(-1).over('id') - pl.col('close'),
-            delta_30min=pl.col('close').shift(-30).over('id') - pl.col('close'),
-            ret_1min=(pl.col('close').shift(-1).over('id') / pl.col('close') - 1),
-            ret_30min=(pl.col('close').shift(-30).over('id') / pl.col('close') - 1),
-            ret_1day=(pl.col('close').shift(-240).over('id') / pl.col('close') - 1),
-            ret_2day=(pl.col('close').shift(-480).over('id') / pl.col('close') - 1),  # 2 days
-        )
+    def _compute_quantiles_duckdb(self, con: duckdb.DuckDBPyConnection,
+                                   n_quantize: int) -> torch.Tensor:
+        """Compute quantiles for all features using DuckDB
 
-        # Intra-minute relative features
-        df = df.with_columns([
-            (pl.col('close') / pl.col('open')).alias('close_open'),
-            (pl.col('high') / pl.col('open')).alias('high_open'),
-            (pl.col('low') / pl.col('open')).alias('low_open'),
-            (pl.col('high') / pl.col('low')).alias('high_low')
-        ])
-
-        # Fill NaN values
-        df = df.with_columns([
-            pl.col('delta_1min').fill_null(0.),
-            pl.col('delta_30min').fill_null(0.),
-            pl.col('ret_1min').fill_null(0.),
-            pl.col('ret_30min').fill_null(0.),
-            pl.col('ret_1day').fill_null(0.),
-            pl.col('ret_2day').fill_null(0.),
-            pl.col('close_open').fill_null(1.),
-            pl.col('high_open').fill_null(1.),
-            pl.col('low_open').fill_null(1.),
-            pl.col('high_low').fill_null(1.)
-        ])
-
-        return df
-
-    def _split_data(self, df: pl.DataFrame, train_frac: float) -> pl.DataFrame:
-        cutoff = df.select(
-            pl.col('datetime').sample(1000000).unique().cast(pl.Int64).quantile(0.9)
-        ).collect()['datetime'][0]
-
-        df = df.with_columns(
-            is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff)
-        )
-        if self.debug_data:
-            assert len(df.collect().filter('is_train'))
-            assert len(df.collect().filter(~pl.col('is_train')))
-
-        stats = df.filter(pl.col('is_train')).group_by('id').agg([
-            pl.col('close').mean().alias('mean_close'),
-            pl.col('close').std().alias('std_close'),
-            pl.col('volume').mean().alias('mean_volume'),
-            pl.col('volume').std().alias('std_volume')
-        ])
-
-        df = df.join(stats, on='id', how='left')
-
-        # normalize
-        df = df.with_columns(
-            ((pl.col('close') - pl.col('mean_close')) / (pl.col('std_close') + 1e-8)).alias('close_norm'),
-            ((pl.col('volume') - pl.col('mean_volume')) / (pl.col('std_volume') + 1e-8)).alias('volume_norm'),
-        )
-
-        return df
-
-    def _compute_quantiles(self, df: pl.DataFrame, n_quantize: int)\
-            -> torch.Tensor:
-        """Compute quantiles for all features using sorting and indexing
+        Args:
+            con: DuckDB connection with df_norm view available
+            n_quantize: Number of quantile bins
 
         Returns:
             torch.Tensor: (n_quantize+1, num_features) quantile boundaries
         """
-        train_df = df.filter(pl.col('is_train'))
         q_positions = [i / n_quantize for i in range(n_quantize + 1)]
 
-        # Sample rows once, then select all columns from those rows
-        sampled = (train_df
-                   .select(self.features)
-                   .collect()
-                   .sample(n=1000000))
-
-        # Build quantiles by sorting and indexing
+        # Build quantiles using DuckDB's QUANTILE_CONT
         quantiles_list = []
+        features_cols = ', '.join(self.features)
+
+        # Sample 1M rows from training data
+        sampled = con.execute(f"""
+            SELECT {features_cols}
+            FROM df_norm
+            WHERE is_train = true
+            USING SAMPLE 1000000
+        """).fetchnumpy()
+
         for col in self.features:
-            # Get the column data and sort it
-            col_data = sampled[col].sort()
+            col_data = np.sort(sampled[col])
             n = len(col_data)
 
-            # Compute index positions for each quantile
             col_quantiles = []
             for q in q_positions:
-                # Linear interpolation index: q * (n - 1)
                 idx = q * (n - 1)
                 idx_lower = int(np.floor(idx))
-                idx_upper = int(np.ceil(idx))
+                idx_upper = min(int(np.ceil(idx)), n - 1)
 
                 if idx_lower == idx_upper:
-                    # Exact index
                     quantile_val = col_data[idx_lower]
                 else:
-                    # Linear interpolation between adjacent values
                     weight = idx - idx_lower
                     quantile_val = (1 - weight) * col_data[idx_lower] + weight * col_data[idx_upper]
 
@@ -952,134 +916,8 @@ class FinalPipeline(dummyLightning):
         del sampled
         gc.collect()
 
-        # Stack to (n_quantize+1, num_features)
         quantiles = torch.stack(quantiles_list, dim=1)
         return quantiles
-
-    def _detect_trading_gaps(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Detect trading gaps and mark with special tokens:
-        - lunch: short intraday gaps (~1 hour)
-        - dinner: overnight gaps between trading days (~15-18 hours)
-        - skipped_day: weekend/holiday gaps (24+ hours, can have multiple)
-        """
-        # Calculate time gaps in seconds between consecutive rows per stock
-        df = df.with_columns([
-            pl.col('datetime').diff().over('id').dt.total_seconds().alias('time_gap_seconds')
-        ])
-
-        return df
-
-    def _bs(self, df, seq_len) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray],
-                                         Dict[str, np.ndarray]]:
-        """
-        Build sequences and return the data dictionaries with memory-mapped arrays.
-
-        Returns:
-            train_x, train_y,
-            val_x, val_y
-        """
-
-        time_stats = df.group_by('datetime').agg(
-            time_mean_close=pl.col('close').mean(),
-            time_std_close=pl.col('close').std(),
-        )
-
-        df = df.join(time_stats, on='datetime')
-        df = df.with_columns(
-            close_time_norm=((pl.col('close') - pl.col('time_mean_close'))
-                             / (pl.col('time_std_close') + 1e-8))
-        )
-
-        train_x = {}
-        train_y = {}
-
-        val_x = {}
-        val_y = {}
-
-        # Get memory-mapped directory
-        mmap_dir = self._get_mmap_dir()
-
-        # Initialize backoff delay
-        backoff_delay = 1.0
-
-        # TODO: align for cross attention
-        stock_ids = df.select('id').unique().collect()['id']
-        total_stocks = len(stock_ids)
-
-        for idx, (stock_df, stockid) in enumerate(df.chunks(1, with_name=True)):
-            if self.is_root() and idx % 100 == 0:
-                print(f"Processing stock {idx}/{total_stocks}: {stock_id}")
-
-            stock_df = stock_df.collect()
-            if len(stock_df) <= seq_len + 1:
-                continue
-
-            # Check memory before conversion and apply backoff if needed
-            backoff_delay = check_memory_usage(max_gb=300.0, backoff_delay=backoff_delay)
-
-            # Convert to numpy
-            features = stock_df.select(self.features).to_numpy().astype(np.float32)
-            is_train = stock_df['is_train'].to_numpy()
-            close = stock_df['close_norm'].to_numpy().astype(np.float32)
-
-            # Split each stock's data by time - train data and val data
-            train_mask = is_train.astype(bool)
-            val_mask = ~train_mask
-
-            # Only add to train set if we have enough train data
-            if train_mask.sum() > seq_len + 1:
-                # Create memory-mapped files for this stock's training data
-                train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
-                train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
-
-                # Save to disk as memory-mapped array
-                train_features = features[train_mask]
-                train_targets = close[train_mask]
-
-                # Write to disk
-                np.save(train_features_path, train_features)
-                np.save(train_targets_path, train_targets)
-
-                # Load as memory-mapped (read-only for efficiency)
-                train_x[stock_id] = np.load(train_features_path, mmap_mode='r')
-                train_y[stock_id] = np.load(train_targets_path, mmap_mode='r')
-
-                # Immediately flush to disk (though np.save already does this)
-                del train_features, train_targets
-
-            # Only add to val set if we have enough val data
-            if val_mask.sum() > seq_len + 1:
-                # Create memory-mapped files for this stock's validation data
-                val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
-                val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
-
-                # Save to disk as memory-mapped array
-                val_features = features[val_mask]
-                val_targets = close[val_mask]
-
-                # Write to disk
-                np.save(val_features_path, val_features)
-                np.save(val_targets_path, val_targets)
-
-                # Load as memory-mapped (read-only for efficiency)
-                val_x[stock_id] = np.load(val_features_path, mmap_mode='r')
-                val_y[stock_id] = np.load(val_targets_path, mmap_mode='r')
-
-                # Immediately flush to disk
-                del val_features, val_targets
-
-            # Clean up intermediate arrays
-            del stock_df, features, is_train, close
-
-            # Periodic garbage collection to prevent memory buildup
-            if idx % 100 == 0:
-                gc.collect()
-
-        if self.is_root():
-            print(f"Completed processing {total_stocks} stocks with memory-mapped arrays")
-
-        return train_x, train_y, val_x, val_y
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)

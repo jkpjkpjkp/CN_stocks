@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "arrow>=1.4.0",
+    "duckdb>=1.4.2",
     "einops>=0.8.1",
     "h5py>=3.15.1",
     "ipykernel>=7.0.0",
