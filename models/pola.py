@@ -16,7 +16,10 @@ class SortedDS(pl.LazyFrame):
     def __len__(self):
         return self.select(pl.len()).collect().item()
 
-    def chunks(self, size):
+    def chunks(self, size, with_name=False):
         for i in range(0, self.bp.shape[0], size):
-            yield self.slice_fl(self.bp['index'][i * size],
+            ret = self.slice_fl(self.bp['index'][i * size],
                                 self.bp['index'][(i + 1) * size] if (i + 1) * size < len(self.bp) else len(self))
+            if with_name:
+                ret = (ret, self.bp['id'][i * size])
+            yield ret

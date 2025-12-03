@@ -1,27 +1,26 @@
 """
 1. Multiple encoding strategies:
-   - Quantize: 1/256 percentile-based token encoding
-   - Cent quantize: cent-level delta encoding for small values
-   - Sin encoding: Sinusoidal encoding for continuous values
+   - Quantize: percentile
+   - Cent: delta in cents
+   - Sinusoidal
    - TODO: CNN: Image encoding over K-line graphs (from draw.py)
 
 2. Multiple preprocessing approaches:
-   - Raw values (close, open, high, low, volume)
-   - Per-stock normalized values (using training set statistics)
-   - Returns at varied time scales (1min, 30min, 6hr, 1day, 2day)
-   - Intra-minute relative features (close/open, high/open, etc.)
-   - Time-normalized values (cross-stock normalized per timestep)
+   - Raw (ohlc + volume)
+   - Per-stock normalized
+   - Returns (1min, 30min, 6hr, 1day, 2day)
+   - Intra-minute (close divided by open, etc.)
+   - Cross-normalized (normalized per timestep)
 
 4. Multiple prediction types and encodings:
-   - Quantized predictions (cross-entropy loss)
-   - Cent-based predictions
-   - Mean predictions (Huber loss)
+   - Quantized predictions (cross-entropy)
+   - Cent-based predictions (cross-entropy)
    - Mean + Variance predictions (NLL loss)
-   - Quantile predictions (10th, 25th, 50th, 75th, 90th with sided loss)
+   - Quantile predictions (sided Huber loss)
 
 5. Multiple prediction horizons:
    - 1min, 30min, 1day, 2day ahead
-   - TODO: Next day OHLC predictions
+   - TODO: Next day's OHLC
 """
 import torch
 import torch.nn as nn
@@ -497,10 +496,10 @@ class FinalPipeline(dummyLightning):
         mmap_dir.mkdir(parents=True, exist_ok=True)
         return mmap_dir
 
-    def _save_cache(self, train_stock_data: Dict[str, np.ndarray],
-                    train_stock_targets: Dict[str, np.ndarray],
-                    val_stock_data: Dict[str, np.ndarray],
-                    val_stock_targets: Dict[str, np.ndarray],
+    def _save_cache(self, train_x: Dict[str, np.ndarray],
+                    train_y: Dict[str, np.ndarray],
+                    val_x: Dict[str, np.ndarray],
+                    val_y: Dict[str, np.ndarray],
                     quantiles: torch.Tensor):
         """Save dataset metadata to disk cache.
 
@@ -518,8 +517,8 @@ class FinalPipeline(dummyLightning):
             save_dict['quantiles'] = quantiles.cpu().numpy()
 
             # Save stock IDs as metadata (arrays are already on disk)
-            train_ids = list(train_stock_data.keys())
-            val_ids = list(val_stock_data.keys())
+            train_ids = list(train_x.keys())
+            val_ids = list(val_x.keys())
             save_dict['_train_ids'] = np.array(train_ids, dtype=object)
             save_dict['_val_ids'] = np.array(val_ids, dtype=object)
 
@@ -552,10 +551,10 @@ class FinalPipeline(dummyLightning):
         data = np.load(cache_path, allow_pickle=True)
 
         # Reconstruct dictionaries
-        train_stock_data = {}
-        train_stock_targets = {}
-        val_stock_data = {}
-        val_stock_targets = {}
+        train_x = {}
+        train_y = {}
+        val_x = {}
+        val_y = {}
 
         # Load metadata (these are small, so load into memory)
         train_ids = data['_train_ids'].copy()
@@ -570,8 +569,8 @@ class FinalPipeline(dummyLightning):
             train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
 
             if train_features_path.exists() and train_targets_path.exists():
-                train_stock_data[stock_id] = np.load(train_features_path, mmap_mode='r')
-                train_stock_targets[stock_id] = np.load(train_targets_path, mmap_mode='r')
+                train_x[stock_id] = np.load(train_features_path, mmap_mode='r')
+                train_y[stock_id] = np.load(train_targets_path, mmap_mode='r')
             else:
                 if self.is_root():
                     print(f"Warning: Missing memory-mapped files for train stock {stock_id}")
@@ -582,8 +581,8 @@ class FinalPipeline(dummyLightning):
             val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
 
             if val_features_path.exists() and val_targets_path.exists():
-                val_stock_data[stock_id] = np.load(val_features_path, mmap_mode='r')
-                val_stock_targets[stock_id] = np.load(val_targets_path, mmap_mode='r')
+                val_x[stock_id] = np.load(val_features_path, mmap_mode='r')
+                val_y[stock_id] = np.load(val_targets_path, mmap_mode='r')
             else:
                 if self.is_root():
                     print(f"Warning: Missing memory-mapped files for val stock {stock_id}")
@@ -592,22 +591,22 @@ class FinalPipeline(dummyLightning):
             print(f"Cache loaded successfully (memory-mapped)! "
                   f"{len(train_ids)} train stocks, {len(val_ids)} val stocks")
 
-        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles
+        return train_x, train_y, val_x, val_y, quantiles
 
     def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
                      n_quantize: int = 256, train_frac: float = 0.9):
         if not self.config.debug_data:
             cached = self._load_cache()
             if cached is not None:
-                train_stock_data, train_stock_targets, val_stock_data, val_stock_targets, quantiles = cached
+                train_x, train_y, val_x, val_y, quantiles = cached
                 self.quantiles = quantiles
                 self.encoder.quantiles = quantiles
 
                 self.train_dataset = PriceHistoryDataset(
-                    self.config, train_stock_data, train_stock_targets,
+                    self.config, train_x, train_y,
                 )
                 self.val_dataset = PriceHistoryDataset(
-                    self.config, val_stock_data, val_stock_targets,
+                    self.config, val_x, val_y,
                 )
                 return
 
@@ -619,37 +618,20 @@ class FinalPipeline(dummyLightning):
             path = Path.home() / 'h' / 'data' / 'a_1min.pq'
         path = Path(path)
 
-        if self.config.debug_data:
-            df = pl.scan_parquet(str(path))
-            n = self.config.debug_data if isinstance(self.config.debug_data,
-                                                     int) else 5
-            df = df.head(n * 300 * 20 * 240)
-            ids = df.select('id').unique().head(n).collect()['id']
-            df = df.filter(pl.col('id').is_in(ids.implode()))
-
-            df = self._compute_features(df)
-            df = self._split_data(df, train_frac)
-            self.quantiles = self._compute_quantiles(df, n_quantize)
-            self.encoder.quantiles = self.quantiles
-
-            # Build sequences
-            train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = self._bs(df, seq_len)
-        else:
-            # Full dataset - process in chunks to avoid OOM
-            train_stock_data, train_stock_targets, val_stock_data, val_stock_targets = \
-                self._prepare_data_chunked(path, seq_len, n_quantize, train_frac)
+        train_x, train_y, val_x, val_y = \
+            self._prepare_data_chunked(path, seq_len, n_quantize, train_frac)
 
         self._save_cache(
-            train_stock_data, train_stock_targets,
-            val_stock_data, val_stock_targets,
+            train_x, train_y,
+            val_x, val_y,
             self.quantiles
         )
 
         self.train_dataset = PriceHistoryDataset(
-            self.config, train_stock_data, train_stock_targets,
+            self.config, train_x, train_y,
         )
         self.val_dataset = PriceHistoryDataset(
-            self.config, val_stock_data, val_stock_targets,
+            self.config, val_x, val_y,
         )
         return
 
@@ -665,8 +647,8 @@ class FinalPipeline(dummyLightning):
             chunk_size: Number of stocks to process per chunk (default 300)
 
         Returns:
-            train_stock_data, train_stock_targets, val_stock_data,
-            val_stock_targets
+            train_x, train_y, val_x,
+            val_y
         """
         if self.is_root():
             print(f"Processing data in chunks of {chunk_size} stocks...")
@@ -674,21 +656,23 @@ class FinalPipeline(dummyLightning):
         # Step 1: Get time-based cutoff for train/val split
         if self.is_root():
             print("Computing train/val cutoff...")
-        cutoff = (pl.scan_parquet(str(path))
-                  .select(pl.col('datetime')
-                          .sample(1000000)
-                          .unique()
-                          .cast(pl.Int64)
-                          .quantile(0.9))
-                  .collect()['datetime'][0])
-
+        
         if self.is_root():
             print(f"Train/val cutoff timestamp: {cutoff}")
 
         # Step 2: Build full pipeline as lazy frame, sorted by id for SortedDS
-        df = (pl.scan_parquet(str(path))
-              .sort('id', 'datetime'))
+        df = pl.scan_parquet(str(path))
         df = self._compute_features(df)
+
+        cutoff = (
+            df
+            .select(pl.col('datetime')
+                    .sample(1000000)
+                    .unique()
+                    .cast(pl.Int64)
+                    .quantile(0.9))
+            .collect()['datetime'][0])
+
         df = df.with_columns(
             is_train=(pl.col('datetime').cast(pl.Int64) <= cutoff)
         )
@@ -725,10 +709,10 @@ class FinalPipeline(dummyLightning):
             print(f"Total stocks: {total_stocks}")
 
         # Step 5: Process stocks in chunks using breakpoints
-        train_stock_data = {}
-        train_stock_targets = {}
-        val_stock_data = {}
-        val_stock_targets = {}
+        train_x = {}
+        train_y = {}
+        val_x = {}
+        val_y = {}
         mmap_dir = self._get_mmap_dir()
 
         for chunk_idx, chunk_df in enumerate(sorted_ds.chunks(chunk_size)):
@@ -744,8 +728,8 @@ class FinalPipeline(dummyLightning):
 
             self._process_stock_chunk(
                 chunk_df, chunk_stock_ids, seq_len, mmap_dir,
-                train_stock_data, train_stock_targets,
-                val_stock_data, val_stock_targets
+                train_x, train_y,
+                val_x, val_y
             )
 
             del chunk_df
@@ -756,21 +740,21 @@ class FinalPipeline(dummyLightning):
             mem_gb = process.memory_info().rss / (1024 ** 3)
             if self.is_root():
                 print(f"  Memory: {mem_gb:.2f} GB, "
-                      f"train: {len(train_stock_data)}, "
-                      f"val: {len(val_stock_data)}")
+                      f"train: {len(train_x)}, "
+                      f"val: {len(val_x)}")
 
         if self.is_root():
             print(f"\nCompleted {total_stocks} stocks")
-            print(f"Final: {len(train_stock_data)} train stocks, "
-                  f"{len(val_stock_data)} val stocks")
+            print(f"Final: {len(train_x)} train stocks, "
+                  f"{len(val_x)} val stocks")
 
-        return (train_stock_data, train_stock_targets,
-                val_stock_data, val_stock_targets)
+        return (train_x, train_y,
+                val_x, val_y)
 
     def _process_stock_chunk(self, chunk_df: pl.DataFrame,
                               stock_ids: list, seq_len: int, mmap_dir: Path,
-                              train_stock_data: dict, train_stock_targets: dict,
-                              val_stock_data: dict, val_stock_targets: dict):
+                              train_x: dict, train_y: dict,
+                              val_x: dict, val_y: dict):
         """Process a chunk of stocks and save to mmap files."""
         for stock_id in stock_ids:
             stock_df = chunk_df.filter(pl.col('id') == stock_id)
@@ -795,9 +779,9 @@ class FinalPipeline(dummyLightning):
                 np.save(train_features_path, features[train_mask])
                 np.save(train_targets_path, close[train_mask])
 
-                train_stock_data[stock_id] = np.load(
+                train_x[stock_id] = np.load(
                     train_features_path, mmap_mode='r')
-                train_stock_targets[stock_id] = np.load(
+                train_y[stock_id] = np.load(
                     train_targets_path, mmap_mode='r')
 
             # Save validation data
@@ -808,9 +792,9 @@ class FinalPipeline(dummyLightning):
                 np.save(val_features_path, features[val_mask])
                 np.save(val_targets_path, close[val_mask])
 
-                val_stock_data[stock_id] = np.load(
+                val_x[stock_id] = np.load(
                     val_features_path, mmap_mode='r')
-                val_stock_targets[stock_id] = np.load(
+                val_y[stock_id] = np.load(
                     val_targets_path, mmap_mode='r')
 
     def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
@@ -992,8 +976,8 @@ class FinalPipeline(dummyLightning):
         Build sequences and return the data dictionaries with memory-mapped arrays.
 
         Returns:
-            train_stock_data, train_stock_targets,
-            val_stock_data, val_stock_targets
+            train_x, train_y,
+            val_x, val_y
         """
 
         time_stats = df.group_by('datetime').agg(
@@ -1007,11 +991,11 @@ class FinalPipeline(dummyLightning):
                              / (pl.col('time_std_close') + 1e-8))
         )
 
-        train_stock_data = {}
-        train_stock_targets = {}
+        train_x = {}
+        train_y = {}
 
-        val_stock_data = {}
-        val_stock_targets = {}
+        val_x = {}
+        val_y = {}
 
         # Get memory-mapped directory
         mmap_dir = self._get_mmap_dir()
@@ -1023,12 +1007,11 @@ class FinalPipeline(dummyLightning):
         stock_ids = df.select('id').unique().collect()['id']
         total_stocks = len(stock_ids)
 
-        for idx, stock_id in enumerate(stock_ids):
+        for idx, (stock_df, stockid) in enumerate(df.chunks(1, with_name=True)):
             if self.is_root() and idx % 100 == 0:
                 print(f"Processing stock {idx}/{total_stocks}: {stock_id}")
 
-            stock_df = df.filter(pl.col('id') == stock_id).collect()
-
+            stock_df = stock_df.collect()
             if len(stock_df) <= seq_len + 1:
                 continue
 
@@ -1059,8 +1042,8 @@ class FinalPipeline(dummyLightning):
                 np.save(train_targets_path, train_targets)
 
                 # Load as memory-mapped (read-only for efficiency)
-                train_stock_data[stock_id] = np.load(train_features_path, mmap_mode='r')
-                train_stock_targets[stock_id] = np.load(train_targets_path, mmap_mode='r')
+                train_x[stock_id] = np.load(train_features_path, mmap_mode='r')
+                train_y[stock_id] = np.load(train_targets_path, mmap_mode='r')
 
                 # Immediately flush to disk (though np.save already does this)
                 del train_features, train_targets
@@ -1080,8 +1063,8 @@ class FinalPipeline(dummyLightning):
                 np.save(val_targets_path, val_targets)
 
                 # Load as memory-mapped (read-only for efficiency)
-                val_stock_data[stock_id] = np.load(val_features_path, mmap_mode='r')
-                val_stock_targets[stock_id] = np.load(val_targets_path, mmap_mode='r')
+                val_x[stock_id] = np.load(val_features_path, mmap_mode='r')
+                val_y[stock_id] = np.load(val_targets_path, mmap_mode='r')
 
                 # Immediately flush to disk
                 del val_features, val_targets
@@ -1096,7 +1079,7 @@ class FinalPipeline(dummyLightning):
         if self.is_root():
             print(f"Completed processing {total_stocks} stocks with memory-mapped arrays")
 
-        return train_stock_data, train_stock_targets, val_stock_data, val_stock_targets
+        return train_x, train_y, val_x, val_y
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
