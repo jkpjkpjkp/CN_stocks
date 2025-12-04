@@ -1000,7 +1000,6 @@ class FinalPipelineConfig(dummyConfig):
 
 config = FinalPipelineConfig(
     shrink_model=True,
-    debug_data=10,
     debug_model=True,
 )
 
