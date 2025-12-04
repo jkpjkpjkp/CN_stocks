@@ -540,7 +540,7 @@ class FinalPipeline(dummyLightning):
         con = duckdb.connect(':memory:')
         con.execute("SET memory_limit='64GB'")
         con.execute("SET preserve_insertion_order=false")
-        con.execute("SET threads=4")
+        con.execute(f"SET threads={os.cpu_count()}")
 
         print("Step 1: Loading parquet and computing features...")
         con.execute(f"""
