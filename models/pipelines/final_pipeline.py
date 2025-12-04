@@ -528,12 +528,16 @@ class FinalPipeline(dummyLightning):
         self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
 
     def _build_duckdb(self, parquet_path: Path, db_path: Path, chunk_size: int = 100):
-        """Build DuckDB database with all preprocessed data, processing in chunks."""
+        """Build DuckDB database with all preprocessed data, processing in chunks.
+
+        Uses in-memory database during processing, then persists to disk at the end.
+        """
         # Remove existing DB if present
         if db_path.exists():
             db_path.unlink()
 
-        con = duckdb.connect(str(db_path))
+        # Use in-memory database for faster processing
+        con = duckdb.connect(':memory:')
         con.execute("SET memory_limit='64GB'")
         con.execute("SET preserve_insertion_order=false")
         con.execute("SET threads=4")
@@ -707,7 +711,20 @@ class FinalPipeline(dummyLightning):
         val_count = con.execute("SELECT COUNT(*) FROM val_index").fetchone()[0]
         print(f"  Train samples: {train_count}, Val samples: {val_count}")
 
+        # Persist in-memory database to disk
+        print("Step 10: Persisting database to disk...")
+        con.execute(f"EXPORT DATABASE '{db_path.parent / 'export_tmp'}' (FORMAT PARQUET)")
         con.close()
+
+        # Create the final on-disk database from exported data
+        disk_con = duckdb.connect(str(db_path))
+        disk_con.execute(f"IMPORT DATABASE '{db_path.parent / 'export_tmp'}'")
+        disk_con.close()
+
+        # Clean up temporary export directory
+        import shutil
+        shutil.rmtree(db_path.parent / 'export_tmp')
+
         print(f"DuckDB database built at {db_path}")
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
