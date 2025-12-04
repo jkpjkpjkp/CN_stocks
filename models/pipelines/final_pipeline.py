@@ -698,7 +698,7 @@ class FinalPipeline(dummyLightning):
 
         # Quantized prediction loss - predicting returns
         # Use close feature quantiles (index 0)
-        quantiles_tensor = self.quantiles.squeeze(-1)[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)
+        quantiles_tensor = self.encoder_quantiles[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)
         target_quantized = torch.bucketize(y_returns_typed, quantiles_tensor)  # (batch, pred_len, num_horizons)
         target_quantized = torch.clamp(target_quantized, 0, self.n_quantize - 1)
 
