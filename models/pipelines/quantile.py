@@ -251,11 +251,11 @@ class quantile_30min(dummyLightning):
 
 if __name__ == '__main__':
     from ..prelude.model.config import transformerConfig
-    from ..prelude.tm import tm
+    from ..prelude.TM import TM
     config = transformerConfig(
         batch_size=1024
     )
-    model = quantile_30min(config, tm(config))
+    model = quantile_30min(config, TM(config))
     
     model.fit()
     breakpoint()

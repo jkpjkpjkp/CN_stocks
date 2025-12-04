@@ -36,7 +36,7 @@ from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 import os
 
-from ..prelude.model import dummyLightning, Rope, tm
+from ..prelude.model import dummyLightning, TM
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -133,70 +133,6 @@ class PriceHistoryDataset(Dataset):
             torch.from_numpy(return_targets).float(),
         )
 
-
-class TransformerBlock(dummyLightning):
-    def __init__(self, config):
-        super().__init__(config)
-        self.hidden_dim = config.hidden_dim
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-
-        attn_dim = self.num_heads * self.head_dim
-        self.attn_dim = attn_dim
-        self.q_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
-        self.o_proj = nn.Linear(attn_dim, self.hidden_dim, bias=False)
-        self.rope = Rope(config)
-        if config.qk_norm:
-            self.q_norm = nn.LayerNorm(attn_dim)
-            self.k_norm = nn.LayerNorm(attn_dim)
-
-        self.norm1 = nn.LayerNorm(self.hidden_dim)
-        self.norm2 = nn.LayerNorm(self.hidden_dim)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(self.hidden_dim, config.interim_dim),
-            nn.SiLU(),
-            nn.Linear(config.interim_dim, self.hidden_dim),
-        )
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        """
-        x: (batch, seq_len, hidden_dim)
-        mask: (batch, seq_len) or (batch, seq_len, seq_len)
-        """
-        batch_size, seq_len, _ = x.shape
-
-        residual = x
-
-        x = self.norm1(x)
-        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        if self.qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        if not self.standard_rope:
-            q = self.rope(q)
-            k = self.rope(k)
-
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        if self.standard_rope:
-            q = self.rope(q)
-            k = self.rope(k)
-
-        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)\
-                       .transpose(1, 2).contiguous()\
-                       .view(batch_size, seq_len, self.attn_dim)
-
-        x = residual + self.o_proj(attn_output)
-
-        x = x + self.ffn(self.norm2(x))
-
-        return x
 
 
 class QuantizeEncoder(dummyLightning):
@@ -386,29 +322,8 @@ class FinalPipeline(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.encoder = MultiEncoder(config)
-        self.backbone = tm(config)
+        self.backbone = TM(config)
         self.readout = MultiReadout(config)
-
-    def _init_distributed(self):
-        """Initialize distributed with custom master addr/port from config."""
-        os.environ['MASTER_ADDR'] = self.master_addr
-        os.environ['MASTER_PORT'] = self.master_port
-        super()._init_distributed()
-
-    def all_reduce(self, tensor: torch.Tensor, op=None) -> torch.Tensor:
-        """All-reduce operation across all processes"""
-        if op is None:
-            op = dist.ReduceOp.SUM
-
-        tensor = tensor.clone()
-        dist.all_reduce(tensor, op=op)
-        return tensor
-
-    def all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Gather tensors from all processes"""
-        tensor_list = [torch.zeros_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(tensor_list, tensor)
-        return torch.cat(tensor_list, dim=0)
 
     def _get_db_path(self) -> Path:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -486,7 +401,7 @@ class FinalPipeline(dummyLightning):
 
         # Use in-memory database for faster processing
         con = duckdb.connect(':memory:')
-        con.execute(f"SET memory_limit='{self.ram_limit}GB'")
+        con.execute(f"SET memory_limit='{self.ram}GB'")
 
         con.execute(f"""
             CREATE VIEW raw_data AS
@@ -923,103 +838,8 @@ class FinalPipeline(dummyLightning):
         return (huber * weight).mean()
 
 
-@dataclass
-class FinalPipelineConfig:
-    # Model
-    embed_dim: int = 256
-    hidden_dim: int = 256
-    expand: float = 2.
-    num_layers: int = 6
-    num_heads: int = 8
-    attn: float = 1.
-    max_freq: float = 10000.
-    standard_rope: bool = False  # use fine-grained rope
-    qk_norm: bool = False
-
-    # Training
-    vram_gb: int = 16
-    batch_size: int | None = None
-    lr: float = 3e-4
-    epochs: int = 100
-    warmup_steps: int = 1000
-    grad_clip: float = 1.0
-
-    # Data
-    seq_len: int = 4096
-    n_quantize: int = 128
-    max_cent_abs: int = 64
-    db_path: str | None = None  # Path to DuckDB database file
-
-    features: tuple = ('close', 'close_norm', 'delta_1min', 'delta_30min',
-                       'ret_1min', 'ret_30min', 'ret_1day',
-                       'ret_2day', 'close_open', 'high_open',
-                       'low_open', 'high_low', 'volume', 'volume_norm')
-    cent_feats: tuple = ('delta_1min', 'delta_30min')
-    horizons: tuple = (1, 30, 240, 480)
-    quantiles: tuple = (10, 25, 50, 75, 90)
-
-    debug_data: int | None = None
-    debug_model: bool = False
-
-    # DDP settings
-    world_size: int = 1
-    ddp_backend: str = 'nccl'
-    master_addr: str = 'localhost'
-    master_port: str = '12355'
-
-    debug_ddp: bool = False
-    num_workers: int | None = None
-    shrink_model: bool = False
-    device: str = 'cuda'
-    
-    ram_limit: int = 368
-
-    def __post_init__(self):
-        # Handle shrink_model before other calculations
-        if self.shrink_model:
-            self.hidden_dim //= 4
-            self.num_heads //= 2
-            self.num_layers //= 2
-            self.embed_dim //= 2
-
-        # Model
-        self.interim_dim = int(self.hidden_dim * self.expand)
-        self.head_dim = int(self.hidden_dim * self.attn / self.num_heads)
-
-        # Embedding
-        self.q_dim = self.sin_dim = self.embed_dim // 2
-        self.num_cents = self.max_cent_abs * 2 + 1
-
-        # Features
-        self.num_features = len(self.features)
-        self.num_quantize_features = self.num_features
-        self.num_cent_feats = len(self.cent_feats)  # number of cent features
-        # Find the starting index of cent features in the features tuple
-        self.cent_feats_start = self.features.index(self.cent_feats[0]) if self.cent_feats else 0
-        self.num_horizons = len(self.horizons)
-        self.num_quantiles = len(self.quantiles)
-        self.pred_len = self.seq_len // 2
-
-        # Dataloader
-        self.batch_size = self.vram_gb * 2 ** 20 // self.seq_len // self.num_layers // self.interim_dim
-        self.num_workers = self.num_workers or os.cpu_count() // 2
-
-        # DuckDB path (in ../data relative to source)
-        if self.db_path is None:
-            db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
-            self.db_path = str(Path(__file__).parent.parent.parent.parent / 'data' / db_name)
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-
-
-config = FinalPipelineConfig(
-    shrink_model=True,
-    debug_data=10,
-    debug_model=True,
-)
-
-
-def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfig:
-    """GENERATED. Parse CLI arguments and override config fields"""
+def parse_args_to_config(base_config):
+    """Parse CLI arguments and override config fields"""
     import argparse
     import sys
     from dataclasses import fields
@@ -1086,6 +906,103 @@ def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfi
 
     return FinalPipelineConfig(**overrides)
 
+
+@dataclass
+class FinalPipelineConfig:
+    # Model
+    embed_dim: int = 256
+    hidden_dim: int = 256
+    expand: float = 2.
+    num_layers: int = 6
+    num_heads: int = 8
+    attn: float = 1.
+    max_freq: float = 10000.
+    standard_rope: bool = False  # use fine-grained rope
+    qk_norm: bool = False
+
+    # Training
+    batch_size: int | None = None
+    lr: float = 3e-4
+    epochs: int = 100
+    warmup_steps: int = 1000
+    grad_clip: float = 1.0
+
+    # Data
+    seq_len: int = 4096
+    n_quantize: int = 128
+    max_cent_abs: int = 64
+    db_path: str | None = None  # Path to DuckDB database file
+
+    features: tuple = ('close', 'close_norm', 'delta_1min', 'delta_30min',
+                       'ret_1min', 'ret_30min', 'ret_1day',
+                       'ret_2day', 'close_open', 'high_open',
+                       'low_open', 'high_low', 'volume', 'volume_norm')
+    cent_feats: tuple = ('delta_1min', 'delta_30min')
+    horizons: tuple = (1, 30, 240, 480)
+    quantiles: tuple = (10, 25, 50, 75, 90)
+
+    debug_data: int | None = None
+    debug_model: bool = False
+
+    # DDP settings
+    world_size: int = 1
+    ddp_backend: str = 'nccl'
+    master_addr: str = 'localhost'
+    master_port: str = '12355'
+
+    debug_ddp: bool = False
+    num_workers: int | None = None
+    shrink_model: bool = False
+    
+    # Hardware
+    device: str = 'cuda'
+    vram: int = 80
+    ram: int = 368
+
+    def __post_init__(self):
+        # Handle shrink_model before other calculations
+        if self.shrink_model:
+            self.hidden_dim //= 4
+            self.num_heads //= 2
+            self.num_layers //= 2
+            self.embed_dim //= 2
+
+        # Model
+        self.interim_dim = int(self.hidden_dim * self.expand)
+        self.head_dim = int(self.hidden_dim * self.attn / self.num_heads)
+
+        # Embedding
+        self.q_dim = self.sin_dim = self.embed_dim // 2
+        self.num_cents = self.max_cent_abs * 2 + 1
+
+        # Features
+        self.num_features = len(self.features)
+        self.num_quantize_features = self.num_features
+        self.num_cent_feats = len(self.cent_feats)  # number of cent features
+        # Find the starting index of cent features in the features tuple
+        self.cent_feats_start = self.features.index(self.cent_feats[0]) if self.cent_feats else 0
+        self.num_horizons = len(self.horizons)
+        self.num_quantiles = len(self.quantiles)
+        self.pred_len = self.seq_len // 2
+
+        # Dataloader
+        self.batch_size = self.vram * 2 ** 19 // self.seq_len // self.num_layers // self.interim_dim
+        self.num_workers = self.num_workers or os.cpu_count()
+
+        # DuckDB (in ../data)
+        if self.db_path is None:
+            db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
+            self.db_path = str(Path(__file__).parent.parent.parent.parent / 'data' / db_name)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        
+
+
+config = FinalPipelineConfig(
+    shrink_model=True,
+    debug_data=10,
+    debug_model=True,
+    vram=16,
+)
 
 if __name__ == "__main__":
     config = parse_args_to_config(config)

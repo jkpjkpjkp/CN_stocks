@@ -13,16 +13,14 @@ from rich.text import Text
 
 
 class BatchesProcessedColumn(ProgressColumn):
-    """Renders completed batches / total batches."""
-
+    """completed batches / total batches."""
     def render(self, task: Task) -> Text:
         total = int(task.total) if task.total is not None else "--"
         return Text(f"{int(task.completed)}/{total}", style="progress.download")
 
 
 class CustomTimeColumn(ProgressColumn):
-    """Renders elapsed time and remaining time as 'HH:MM:SS • HH:MM:SS'."""
-
+    """elapsed time and remaining time as 'HH:MM:SS • HH:MM:SS'."""
     def render(self, task: Task) -> Text:
         elapsed = timedelta(seconds=int(task.elapsed)) if task.elapsed is not None else timedelta(0)
         remaining = timedelta(seconds=int(task.time_remaining)) if task.time_remaining is not None else "--:--:--"
@@ -30,8 +28,7 @@ class CustomTimeColumn(ProgressColumn):
 
 
 class ProcessingSpeedColumn(ProgressColumn):
-    """Renders processing speed (it/s)."""
-
+    """processing speed (it/s)."""
     def render(self, task: Task) -> Text:
         if task.speed is None:
             return Text("?", style="progress.data.speed")
@@ -39,8 +36,7 @@ class ProcessingSpeedColumn(ProgressColumn):
 
 
 class MetricsTextColumn(ProgressColumn):
-    """Renders metrics logged with prog_bar=True."""
-
+    """metrics logged with prog_bar=True."""
     def render(self, task: Task) -> Text:
         metrics = task.fields.get("metrics", {})
         if not metrics:
@@ -76,6 +72,8 @@ class dummyLightning(Module):
         super().__init__()
         assert config
         self.config = config
+        os.environ['MASTER_ADDR'] = config.master_addr
+        os.environ['MASTER_PORT'] = config.master_port
 
     def __getattr__(self, name):
         try:
@@ -280,8 +278,3 @@ class dummyLightning(Module):
         model.load_state_dict(checkpoint['model_state_dict'])
         model.global_step = checkpoint['global_step']
         return model
-
-    def inspect_weight(self):
-        """Print the mean and std of each tensor"""
-        for name, param in self.named_parameters():
-            print(f"{name}: mean={param.mean().item():.4f}, std={param.std().item():.4f}")

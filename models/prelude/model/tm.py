@@ -1,8 +1,10 @@
+"""TODO: decoderLayer vs decoderBlock"""
 import torch
 from torch import nn
 from torch.nn import functional as F, Module
 from einops import rearrange
 from .main import dummyLightning
+from typing import Optional
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -16,7 +18,7 @@ def apply_rotary_emb(x, cos, sin):
     return out
 
 
-class Rope(nn.Module):
+class Rope(Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -95,11 +97,76 @@ class decoderLayer(Module):
         return x
 
 
-class tm(dummyLightning):
+class decoderBlock(dummyLightning):
+    def __init__(self, config):
+        super().__init__(config)
+        self.hidden_dim = config.hidden_dim
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+
+        attn_dim = self.num_heads * self.head_dim
+        self.attn_dim = attn_dim
+        self.q_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_dim, attn_dim, bias=False)
+        self.o_proj = nn.Linear(attn_dim, self.hidden_dim, bias=False)
+        self.rope = Rope(config)
+        if config.qk_norm:
+            self.q_norm = nn.LayerNorm(attn_dim)
+            self.k_norm = nn.LayerNorm(attn_dim)
+
+        self.norm1 = nn.LayerNorm(self.hidden_dim)
+        self.norm2 = nn.LayerNorm(self.hidden_dim)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, config.interim_dim),
+            nn.SiLU(),
+            nn.Linear(config.interim_dim, self.hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        """
+        x: (batch, seq_len, hidden_dim)
+        mask: (batch, seq_len) or (batch, seq_len, seq_len)
+        """
+        batch_size, seq_len, _ = x.shape
+
+        residual = x
+
+        x = self.norm1(x)
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        if not self.standard_rope:
+            q = self.rope(q)
+            k = self.rope(k)
+
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        if self.standard_rope:
+            q = self.rope(q)
+            k = self.rope(k)
+
+        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)\
+                       .transpose(1, 2).contiguous()\
+                       .view(batch_size, seq_len, self.attn_dim)
+
+        x = residual + self.o_proj(attn_output)
+
+        x = x + self.ffn(self.norm2(x))
+
+        return x
+
+
+class TM(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         num_layers = getattr(config, 'layers', getattr(config, 'num_layers', 6))
-        self.layers = nn.ModuleList([decoderLayer(config) for _ in range(num_layers)])
+        self.layers = nn.ModuleList([decoderBlock(config) for _ in range(num_layers)])
         self.optimizers()
 
     def forward(self, x):

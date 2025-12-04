@@ -58,13 +58,13 @@ class chrono(dummyLightning):
     
 if __name__ == '__main__':
     from ..prelude.model.config import transformerConfig
-    from ..prelude.tm import tm
+    from ..prelude.TM import TM
     
     class chronoConfig(transformerConfig):
         patch_size = 1
         vocab_size = 10
     
     config = chronoConfig()
-    model = chrono(config, tm(config))
+    model = chrono(config, TM(config))
     
     model.fit()
