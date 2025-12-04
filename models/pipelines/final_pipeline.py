@@ -27,7 +27,7 @@ All data storage uses on-disk DuckDB in ../data/pipeline.duckdb
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DistributedSampler
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
@@ -391,9 +391,6 @@ class FinalPipeline(dummyLightning):
     def setup_ddp(self, rank: Optional[int] = None,
                   world_size: Optional[int] = None):
         """Initialize DDP from environment or provided rank/world_size"""
-        if not self.config.use_ddp:
-            return
-
         # Get rank and world_size from environment if not provided
         if rank is None:
             rank = int(os.environ.get('RANK', 0))
@@ -436,9 +433,6 @@ class FinalPipeline(dummyLightning):
 
     def all_reduce(self, tensor: torch.Tensor, op=None) -> torch.Tensor:
         """All-reduce operation across all processes"""
-        if not self.use_ddp:
-            return tensor
-
         if op is None:
             op = dist.ReduceOp.SUM
 
@@ -448,9 +442,6 @@ class FinalPipeline(dummyLightning):
 
     def all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
         """Gather tensors from all processes"""
-        if not self.use_ddp:
-            return tensor
-
         tensor_list = [torch.zeros_like(tensor) for _ in range(self.world_size)]
         dist.all_gather(tensor_list, tensor)
         return torch.cat(tensor_list, dim=0)
@@ -789,40 +780,23 @@ class FinalPipeline(dummyLightning):
                     [f_idx, q_idx, float(quantile_val)]
                 )
 
-    def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
-        """Create dataloader with DDP support via DistributedSampler"""
-        from torch.utils.data import DataLoader
-
-        if self.use_ddp:
-            # Use DistributedSampler for DDP
-            sampler = DistributedSampler(
-                dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=shuffle,
-                drop_last=drop_last
-            )
-            # When using DistributedSampler, shuffle must be False in DataLoader
-            dataloader = DataLoader(
-                dataset,
-                batch_size=self.batch_size,
-                sampler=sampler,
-                num_workers=self.num_workers,
-                pin_memory=True,
-                drop_last=drop_last
-            )
-        else:
-            # Standard DataLoader for non-distributed training
-            dataloader = DataLoader(
-                dataset,
-                batch_size=self.batch_size,
-                shuffle=shuffle,
-                num_workers=self.num_workers,
-                pin_memory=True,
-                drop_last=drop_last
-            )
-
-        return dataloader
+    def get_dataloader(self, dataset, shuffle=False):
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True,
+            drop_last=not self.debug_data,
+        )
+        # When using DistributedSampler, shuffle must be False in DataLoader
+        return DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=not self.debug_data,
+        )
 
     @property
     def train_dataloader(self):
@@ -1052,7 +1026,6 @@ class FinalPipelineConfig:
     debug_model: bool = False
 
     # DDP settings
-    use_ddp: bool = False
     ddp_backend: str = 'nccl'
     master_addr: str = 'localhost'
     master_port: str = '12355'
@@ -1105,7 +1078,6 @@ config = FinalPipelineConfig(
     shrink_model=True,
     debug_data=10,
     debug_model=True,
-    use_ddp=False,
 )
 
 
@@ -1180,26 +1152,24 @@ def parse_args_to_config(base_config: FinalPipelineConfig) -> FinalPipelineConfi
 
 if __name__ == "__main__":
     config = parse_args_to_config(config)
-    pipeline = FinalPipeline(config)
-    is_root = not config.use_ddp or pipeline.is_root()
+    p = FinalPipeline(config)
 
-    if config.use_ddp:
-        pipeline.setup_ddp()
-        if is_root:
-            print(f"{pipeline.world_size} GPUs")\
+    p.setup_ddp()
+    if p.is_root():
+        print(f"{p.world_size} GPUs")\
 
-    if is_root:
+    if p.is_root():
         print("Preparing data...")
-    pipeline.prepare_data()
+    p.prepare_data()
+    assert len(p.train_dataset)
+    assert len(p.val_dataset)
 
-    if config.use_ddp:
-        dist.barrier()
+    dist.barrier()
 
-    if is_root:
+    if p.is_root():
         print("Starting training...")
-    pipeline.fit()
-
-    if config.use_ddp:
-        dist.destroy_process_group()
-    if is_root:
+    p.fit()
+    dist.destroy_process_group()
+    
+    if p.is_root():
         breakpoint()

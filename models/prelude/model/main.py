@@ -87,6 +87,7 @@ class dummyLightning(Module):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=True,
+            drop_last=True,
         )
 
     @property
@@ -95,6 +96,7 @@ class dummyLightning(Module):
             self.val_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            drop_last=True,
         )
 
     def optimizers(self):
