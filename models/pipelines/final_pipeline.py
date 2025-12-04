@@ -276,6 +276,11 @@ class MultiReadout(dummyLightning):
         self.return_quantile_head = nn.Linear(config.hidden_dim,
                                               config.num_quantiles*self.num_horizons)
 
+        # TODO: will this be overridden?
+        # TODO: MuP
+        nn.init.trunc_normal_(self.variance_head.weight, std=0.02, a=-0.04, b=0.08)
+        nn.init.trunc_normal_(self.return_variance_head.weight, std=0.02, a=-0.04, b=0.08)
+
     def forward(self, x: torch.Tensor, target_type='mean'):
         """
         x: (batch, seq_len, hidden_dim)
@@ -997,7 +1002,6 @@ config = FinalPipelineConfig(
     shrink_model=True,
     debug_data=10,
     debug_model=True,
-    vram=16,
 )
 
 if __name__ == "__main__":
