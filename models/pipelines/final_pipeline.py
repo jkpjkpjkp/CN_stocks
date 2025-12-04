@@ -587,8 +587,9 @@ class FinalPipeline(dummyLightning):
             path = Path.home() / 'h' / 'data' / 'a_1min.pq'
         path = Path(path)
 
-        train_x, train_y, val_x, val_y = \
-            self._prepare_data_chunked(path, seq_len, n_quantize, train_frac)
+        if self.is_root():
+            train_x, train_y, val_x, val_y = \
+                self._prepare_data_chunked(path, seq_len, n_quantize, train_frac)
 
         self._save_cache(
             train_x, train_y,
@@ -603,7 +604,7 @@ class FinalPipeline(dummyLightning):
             self.config, val_x, val_y,
         )
         return
-
+set_sorted
     def _prepare_data_chunked(self, path: Path, seq_len: int, n_quantize: int,
                                train_frac: float, chunk_size: int = 300):
         """Prepare data in chunks using DuckDB for efficient iteration.
@@ -618,17 +619,13 @@ class FinalPipeline(dummyLightning):
         Returns:
             train_x, train_y, val_x, val_y
         """
-        if self.is_root():
-            print(f"Processing data in chunks of {chunk_size} stocks...")
+        print(f"Processing data in chunks of {chunk_size} stocks...")
 
         con = duckdb.connect()
         con.execute("SET memory_limit='350GB'")
         con.execute("SET max_memory='350GB'")
-        con.execute("SET threads=16")
 
-        # Step 1: Load parquet and compute features
-        if self.is_root():
-            print("Loading parquet and computing features...")
+        print("Step 1: Loading parquet and computing features...")
 
         con.execute(f"""
             CREATE VIEW raw_data AS
@@ -638,29 +635,26 @@ class FinalPipeline(dummyLightning):
         # Create view with computed features
         con.execute(f"""
             CREATE VIEW df AS
-            {self._compute_features_sql().replace('FROM df', 'FROM raw_data')}
+            {self._compute_features_sql()}
         """)
 
-        # Step 2: Compute train/val cutoff (90th percentile of datetime)
-        if self.is_root():
-            print("Computing train/val cutoff...")
+        print("Step 2: Compute train/val cutoff (90th percentile of datetime)...")
 
         cutoff = con.execute("""
             SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
             FROM (SELECT DISTINCT datetime FROM raw_data USING SAMPLE 1000000)
         """).fetchone()[0]
 
-        if self.is_root():
-            print(f"Train/val cutoff timestamp: {cutoff}")
+        print(f"Train/val cutoff timestamp: {cutoff}")
 
-        # Step 3: Create view with is_train flag
+        print("Step 3: Create view with is_train flag...")
         con.execute(f"""
             CREATE VIEW df_split AS
             SELECT *, epoch_ns(datetime) <= {cutoff} AS is_train
             FROM df
         """)
 
-        # Step 4: Compute per-stock normalization stats from training data
+        print("Step 4: Compute per-stock normalization stats from training data...")
         con.execute("""
             CREATE VIEW stats AS
             SELECT
@@ -674,7 +668,7 @@ class FinalPipeline(dummyLightning):
             GROUP BY id
         """)
 
-        # Step 5: Create normalized view
+        print("Step 5: Create normalized view...")
         con.execute("""
             CREATE VIEW df_norm AS
             SELECT
@@ -685,18 +679,19 @@ class FinalPipeline(dummyLightning):
             LEFT JOIN stats s ON d.id = s.id
         """)
 
-        # Step 6: Compute quantiles from sample
-        if self.is_root():
-            print("Computing quantiles...")
-        self.quantiles = self._compute_quantiles_duckdb(con, n_quantize)
+        print("Step 6: Compute quantiles from sample...")
+        # Limit sample size when debug_data is set to avoid OOM
+        sample_size = 10000 if self.config.debug_data else 1000000
+        self.quantiles = self._compute_quantiles_duckdb(con, n_quantize, sample_size)
         self.encoder.quantiles = self.quantiles
         gc.collect()
 
         # Step 7: Get all unique stock ids
         if self.is_root():
             print("Getting stock ids...")
-        stock_ids = con.execute("""
-            SELECT DISTINCT id FROM df_norm ORDER BY id
+        limit_clause = f"LIMIT {self.config.debug_data}" if self.config.debug_data else ""
+        stock_ids = con.execute(f"""
+            SELECT DISTINCT id FROM df_norm ORDER BY id {limit_clause}
         """).fetchall()
         stock_ids = [row[0] for row in stock_ids]
         total_stocks = len(stock_ids)
@@ -759,7 +754,11 @@ class FinalPipeline(dummyLightning):
                                      stock_ids: list, seq_len: int, mmap_dir: Path,
                                      train_x: dict, train_y: dict,
                                      val_x: dict, val_y: dict):
-        """Process a chunk of stocks from numpy arrays and save to mmap files."""
+        """Process a chunk of stocks from numpy arrays and save to mmap files.
+
+        Optimized for data sorted by (id, datetime): uses contiguous slices
+        instead of boolean masks, and exploits datetime sortedness for train/val split.
+        """
         ids = chunk_df['id']
         is_train = chunk_df['is_train']
         close_norm = chunk_df['close_norm']
@@ -767,39 +766,59 @@ class FinalPipeline(dummyLightning):
         # Build features array from columns
         features_data = np.column_stack([chunk_df[f] for f in self.features])
 
-        for stock_id in stock_ids:
-            stock_mask = ids == stock_id
+        # Find stock boundaries using np.unique (exploits sortedness)
+        unique_ids, first_indices = np.unique(ids, return_index=True)
+        id_to_idx = {sid: i for i, sid in enumerate(unique_ids)}
+        end_indices = np.append(first_indices[1:], len(ids))
 
-            if stock_mask.sum() <= seq_len + 1:
+        for stock_id in stock_ids:
+            if stock_id not in id_to_idx:
                 continue
 
-            stock_features = features_data[stock_mask].astype(np.float32)
-            stock_is_train = is_train[stock_mask]
-            stock_close = close_norm[stock_mask].astype(np.float32)
+            idx = id_to_idx[stock_id]
+            start, end = first_indices[idx], end_indices[idx]
+            stock_len = end - start
 
-            train_mask = stock_is_train.astype(bool)
-            val_mask = ~train_mask
+            if stock_len <= seq_len + 1:
+                continue
 
-            # Save training data
-            if train_mask.sum() > seq_len + 1:
+            # Contiguous slices - no boolean indexing
+            stock_features = features_data[start:end].astype(np.float32)
+            stock_is_train = is_train[start:end]
+            stock_close = close_norm[start:end].astype(np.float32)
+
+            # Since datetime is sorted, is_train transitions True->False at most once
+            train_vals = stock_is_train.astype(bool)
+
+            if train_vals.all():
+                train_end, val_start = stock_len, stock_len
+            elif not train_vals.any():
+                train_end, val_start = 0, 0
+            else:
+                # Find transition: first False index via searchsorted
+                train_end = np.searchsorted(~train_vals, True)
+                val_start = train_end
+
+            # Save training data using contiguous slice
+            if train_end > seq_len + 1:
                 train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
                 train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
 
-                np.save(train_features_path, stock_features[train_mask])
-                np.save(train_targets_path, stock_close[train_mask])
+                np.save(train_features_path, stock_features[:train_end])
+                np.save(train_targets_path, stock_close[:train_end])
 
                 train_x[stock_id] = np.load(
                     train_features_path, mmap_mode='r')
                 train_y[stock_id] = np.load(
                     train_targets_path, mmap_mode='r')
 
-            # Save validation data
-            if val_mask.sum() > seq_len + 1:
+            # Save validation data using contiguous slice
+            if stock_len - val_start > seq_len + 1:
                 val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
                 val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
 
-                np.save(val_features_path, stock_features[val_mask])
-                np.save(val_targets_path, stock_close[val_mask])
+                np.save(val_features_path, stock_features[val_start:])
+                np.save(val_targets_path, stock_close[val_start:])
 
                 val_x[stock_id] = np.load(
                     val_features_path, mmap_mode='r')
@@ -865,16 +884,17 @@ class FinalPipeline(dummyLightning):
                 COALESCE(high / NULLIF(open, 0), 1) AS high_open,
                 COALESCE(low / NULLIF(open, 0), 1) AS low_open,
                 COALESCE(high / NULLIF(low, 0), 1) AS high_low
-            FROM df
+            FROM raw_data
         """
 
     def _compute_quantiles_duckdb(self, con: duckdb.DuckDBPyConnection,
-                                   n_quantize: int) -> torch.Tensor:
+                                   n_quantize: int, sample_size: int = 1000000) -> torch.Tensor:
         """Compute quantiles for all features using DuckDB
 
         Args:
             con: DuckDB connection with df_norm view available
             n_quantize: Number of quantile bins
+            sample_size: Number of rows to sample for quantile estimation
 
         Returns:
             torch.Tensor: (n_quantize+1, num_features) quantile boundaries
@@ -885,12 +905,12 @@ class FinalPipeline(dummyLightning):
         quantiles_list = []
         features_cols = ', '.join(self.features)
 
-        # Sample 1M rows from training data
+        # Sample rows from training data
         sampled = con.execute(f"""
             SELECT {features_cols}
             FROM df_norm
             WHERE is_train = true
-            USING SAMPLE 1000000
+            USING SAMPLE {sample_size}
         """).fetchnumpy()
 
         for col in self.features:
