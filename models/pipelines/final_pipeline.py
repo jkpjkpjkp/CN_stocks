@@ -247,13 +247,9 @@ class MultiEncoder(dummyLightning):
         batch_size, seq_len, feat_dim = x.shape
 
         x_flat = x.view(-1, feat_dim)
-        # Quantize encoder uses all features with per-feature quantiles
-        # Cent encoder uses delta features (delta_1min, delta_30min)
-        cent_start = self.cent_feats_start
-        cent_end = cent_start + self.num_cent_feats
         embeddings = [
-            self.quantize_encoder(x_flat, self.quantiles),
-            self.cent_encoder(x_flat[:, cent_start:cent_end]),
+            self.quantize_encoder(x_flat, self.encoder_quantiles),
+            self.cent_encoder(x_flat[:, self.cent_feat_idx]),
             self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
@@ -324,6 +320,9 @@ class FinalPipeline(dummyLightning):
         self.encoder = MultiEncoder(config)
         self.backbone = TM(config)
         self.readout = MultiReadout(config)
+        # Prediction quantiles as fractions (config has percentiles like 10, 25, 50, 75, 90)
+        self.register_buffer('pred_quantiles',
+                             torch.tensor(config.quantiles, dtype=torch.float32) / 100.0)
 
     def _get_db_path(self) -> Path:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -373,8 +372,8 @@ class FinalPipeline(dummyLightning):
         if not self.debug_data and self._check_db_ready():
             if self.is_root():
                 print(f"Loading from existing DuckDB: {db_path}")
-            self.quantiles = self._load_quantiles_from_db()
-            self.encoder.quantiles = self.quantiles
+            self.encoder_quantiles = self._load_quantiles_from_db()
+            self.encoder.encoder_quantiles = self.encoder_quantiles
             self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
             self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
             return
@@ -390,8 +389,8 @@ class FinalPipeline(dummyLightning):
         if self.is_root():
             self._build_duckdb(path, db_path)
 
-        self.quantiles = self._load_quantiles_from_db()
-        self.encoder.quantiles = self.quantiles
+        self.encoder_quantiles = self._load_quantiles_from_db()
+        self.encoder.encoder_quantiles = self.encoder_quantiles
         self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
         self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
 
@@ -406,11 +405,6 @@ class FinalPipeline(dummyLightning):
         con.execute(f"""
             CREATE VIEW raw_data AS
             SELECT * FROM read_parquet('{parquet_path}')
-        """)
-
-        con.execute(f"""
-            CREATE VIEW df AS
-            {self._compute_features_sql()}
         """)
 
         print("Step 2-4: Load cached cutoff and stats, or compute them...")
@@ -444,7 +438,11 @@ class FinalPipeline(dummyLightning):
             print(f"  Train/val cutoff timestamp: {cutoff}")
             cutoff_cache_path.write_text(str(cutoff))
 
-        # Compute stats - use cache only for full runs, always recompute for debug
+        # Compute stats
+        con.execute(f"""
+            CREATE VIEW df AS
+            {self._compute_features_sql()}
+        """)
         if not self.debug_data and stats_cache_path.exists():
             con.execute(f"""
                 CREATE TABLE stats AS
@@ -814,14 +812,12 @@ class FinalPipeline(dummyLightning):
         return result
 
     def _quantile_loss(self, pred, target):
-        """ pred: (b, l, num_horizons, num_quantiles)
-          target: (b, l, num_horizons)
+        """ pred: (b, l, num_quantiles)
+          target: (b, l)
         """
-        quantiles = torch.tensor(self.quantiles, dtype=pred.dtype, device=pred.device)
-        quantiles = quantiles.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-
-        quantiles = quantiles.expand(pred.shape)
-        target = target.unsqueeze(-1)
+        quantiles = self.pred_quantiles.to(dtype=pred.dtype)  # (num_quantiles,)
+        quantiles = quantiles.view(1, 1, -1).expand_as(pred)  # (b, l, num_quantiles)
+        target = target.unsqueeze(-1)  # (b, l, 1)
 
         weight = torch.where(
             pred > target,
@@ -975,12 +971,13 @@ class FinalPipelineConfig(dummyConfig):
         self.q_dim = self.sin_dim = self.embed_dim // 2
         self.num_cents = self.max_cent_abs * 2 + 1
 
-        # Features
+        # Features - named index for clean access
+        self.feat_idx = {name: i for i, name in enumerate(self.features)}
         self.num_features = len(self.features)
         self.num_quantize_features = self.num_features
-        self.num_cent_feats = len(self.cent_feats)  # number of cent features
-        # Find the starting index of cent features in the features tuple
-        self.cent_feats_start = self.features.index(self.cent_feats[0]) if self.cent_feats else 0
+        self.num_cent_feats = len(self.cent_feats)
+        self.cent_feat_idx = [self.feat_idx[f] for f in self.cent_feats]
+
         self.num_horizons = len(self.horizons)
         self.num_quantiles = len(self.quantiles)
         self.pred_len = self.seq_len // 2
@@ -995,7 +992,6 @@ class FinalPipelineConfig(dummyConfig):
         
         super().__post_init__()
         
-
 
 config = FinalPipelineConfig(
     shrink_model=True,
