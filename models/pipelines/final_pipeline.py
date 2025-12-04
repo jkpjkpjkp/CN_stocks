@@ -21,6 +21,8 @@
 5. Multiple prediction horizons:
    - 1min, 30min, 1day, 2day ahead
    - TODO: Next day's OHLC
+
+All data storage uses on-disk DuckDB in ../data/pipeline.duckdb
 """
 import torch
 import torch.nn as nn
@@ -31,11 +33,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import duckdb
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 import os
-import gc
-import psutil
 
 from ..prelude.model import dummyLightning, Rope, tm
 
@@ -43,31 +43,32 @@ torch.autograd.set_detect_anomaly(True)
 
 
 class PriceHistoryDataset(Dataset):
-    def __init__(self, config, stock_data: Dict[str, np.ndarray],
-                 stock_targets: Dict[str, np.ndarray]):
+    """Dataset that fetches data directly from DuckDB on-disk storage."""
+
+    def __init__(self, config, db_path: Path, split: str):
         """
         Args:
-            stock_data: Dict mapping stock_id to full feature array (T, F)
-            stock_targets: Dict mapping stock_id to full target array (T,)
-              - normalized prices
+            config: FinalPipelineConfig
+            db_path: Path to DuckDB database file
+            split: 'train' or 'val'
         """
-        self.stock_data = stock_data
-        self.targets = stock_targets
+        self.db_path = str(db_path)
+        self.split = split
         self.seq_len = config.seq_len
         self.pred_len = config.pred_len
-
         self.horizons = config.horizons
         self.num_horizons = len(self.horizons)
+        self.features = config.features
 
-        # Build index: list of (stock_id, start_idx) tuples
-        # Ensure we have enough future data for the longest horizon (480 min)
-        self.index = []
-        for stock_id, data in stock_data.items():
-            max_horizon = max(self.horizons)
-            num_windows = len(data) - self.seq_len - max_horizon  # for all horizons
-            if num_windows > 0:
-                for start_idx in range(num_windows):
-                    self.index.append((stock_id, start_idx))
+        # Build index from DuckDB
+        con = duckdb.connect(self.db_path, read_only=True)
+        try:
+            # Get all (stock_id, start_idx) pairs from the index table
+            self.index = con.execute(f"""
+                SELECT stock_id, start_idx FROM {split}_index ORDER BY rowid
+            """).fetchall()
+        finally:
+            con.close()
 
     def __len__(self):
         return len(self.index)
@@ -76,34 +77,47 @@ class PriceHistoryDataset(Dataset):
         stock_id, start_idx = self.index[idx]
         end_idx = start_idx + self.seq_len
 
-        # Copy data from memory-mapped array to ensure thread-safety
-        # and avoid holding references to the mmap
-        features = self.stock_data[stock_id][start_idx:end_idx].copy()
+        # Each worker gets its own connection
+        con = duckdb.connect(self.db_path, read_only=True)
+        try:
+            # Fetch features for this window
+            features_cols = ', '.join(self.features)
+            features_result = con.execute(f"""
+                SELECT {features_cols}
+                FROM {self.split}_data
+                WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
+                ORDER BY row_idx
+            """, [stock_id, start_idx, end_idx]).fetchnumpy()
 
-        # Get prediction positions' targets (latter half)
-        # For each position in the latter half, get targets at all horizons
-        target_start = start_idx + self.seq_len // 2
+            features = np.column_stack([features_result[f] for f in self.features]).astype(np.float32)
 
-        # targets shape: (pred_len, num_horizons)
-        targets = np.zeros((self.pred_len, self.num_horizons),
-                           dtype=np.float32)
+            # Get prediction positions' targets (latter half)
+            target_start = start_idx + self.seq_len // 2
+            max_horizon = max(self.horizons)
+            target_end = target_start + self.pred_len + max_horizon
 
-        # return_targets shape: (pred_len, num_horizons)
-        # Return = future_close / current_close
-        return_targets = np.zeros((self.pred_len, self.num_horizons),
-                                  dtype=np.float32)
+            # Fetch close_norm for targets
+            targets_result = con.execute(f"""
+                SELECT row_idx, close_norm
+                FROM {self.split}_data
+                WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
+                ORDER BY row_idx
+            """, [stock_id, target_start, target_end]).fetchnumpy()
 
-        # Vectorize outer loop using slicing
-        current_positions = target_start + np.arange(self.pred_len)
-        # Copy from memory-mapped array
-        current_prices = self.targets[stock_id][current_positions].copy()
+            close_norm = targets_result['close_norm'].astype(np.float32)
+
+        finally:
+            con.close()
+
+        # Build targets and return_targets
+        targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
+        return_targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
+
+        current_prices = close_norm[:self.pred_len]
 
         for h_idx, horizon in enumerate(self.horizons):
-            future_positions = current_positions + horizon
-            # Copy from memory-mapped array
-            targets[:, h_idx] = self.targets[stock_id][future_positions]
-            future_prices = self.targets[stock_id][future_positions].copy()
-
+            future_prices = close_norm[horizon:horizon + self.pred_len]
+            targets[:, h_idx] = future_prices
             return_targets[:, h_idx] = future_prices / current_prices
 
         return (
@@ -441,210 +455,105 @@ class FinalPipeline(dummyLightning):
         dist.all_gather(tensor_list, tensor)
         return torch.cat(tensor_list, dim=0)
 
-    def reduce_dict(self, metrics: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Reduce a dictionary of metrics across all processes"""
-        if not self.use_ddp:
-            return metrics
+    def _get_db_path(self) -> Path:
+        """Get path to DuckDB database file in ../data"""
+        db_dir = Path(self.config.db_path).parent
+        db_dir.mkdir(parents=True, exist_ok=True)
+        return Path(self.config.db_path)
 
-        reduced = {}
-        for key, value in metrics.items():
-            if isinstance(value, torch.Tensor):
-                reduced[key] = self.all_reduce(value) / self.world_size
-            else:
-                reduced[key] = value
+    def _check_db_ready(self) -> bool:
+        """Check if DuckDB database exists and has required tables"""
+        db_path = self._get_db_path()
+        if not db_path.exists():
+            return False
 
-        return reduced
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            tables = con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+            ).fetchall()
+            table_names = {t[0] for t in tables}
+            required = {'train_data', 'val_data', 'train_index', 'val_index', 'quantiles'}
+            return required.issubset(table_names)
+        except Exception:
+            return False
+        finally:
+            con.close()
 
-    def _get_cache_path(self) -> Path:
-        """Get the path to the cache file"""
-        return Path(self.config.cache_dir) / 'dataset_cache.npz'
+    def _load_quantiles_from_db(self) -> torch.Tensor:
+        """Load quantiles from DuckDB"""
+        db_path = self._get_db_path()
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            result = con.execute("""
+                SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
+            """).fetchnumpy()
 
-    def _get_mmap_dir(self) -> Path:
-        """Get the directory for memory-mapped arrays"""
-        mmap_dir = Path(self.config.cache_dir) / 'mmap_arrays'
-        mmap_dir.mkdir(parents=True, exist_ok=True)
-        return mmap_dir
+            n_features = result['feature_idx'].max() + 1
+            n_quantiles = result['q_idx'].max() + 1
+            quantiles = np.zeros((n_quantiles, n_features), dtype=np.float32)
+            quantiles[result['q_idx'], result['feature_idx']] = result['value']
+            return torch.from_numpy(quantiles).float()
+        finally:
+            con.close()
 
-    def _save_cache(self, train_x: Dict[str, np.ndarray],
-                    train_y: Dict[str, np.ndarray],
-                    val_x: Dict[str, np.ndarray],
-                    val_y: Dict[str, np.ndarray],
-                    quantiles: torch.Tensor):
-        """Save dataset metadata to disk cache.
+    def prepare_data(self, path: Optional[str] = None):
+        """Prepare data using on-disk DuckDB storage."""
+        db_path = self._get_db_path()
 
-        Note: Individual stock arrays are already saved as memory-mapped files by _bs.
-        This method only saves quantiles and metadata.
-        """
-        cache_path = self._get_cache_path()
-
-        if self.is_root():
-            print(f"Saving cache metadata to {cache_path}...")
-
-            save_dict = {}
-
-            # Save quantiles as single tensor (n_quantize+1, num_features)
-            save_dict['quantiles'] = quantiles.cpu().numpy()
-
-            # Save stock IDs as metadata (arrays are already on disk)
-            train_ids = list(train_x.keys())
-            val_ids = list(val_x.keys())
-            save_dict['_train_ids'] = np.array(train_ids, dtype=object)
-            save_dict['_val_ids'] = np.array(val_ids, dtype=object)
-
-            np.savez_compressed(cache_path, **save_dict)
-            print(f"Cache metadata saved successfully!")
-            print(f"Memory-mapped arrays are in {self._get_mmap_dir()}")
-
-    def _load_cache(self) -> Optional[Tuple[Dict[str, np.ndarray],
-                                             Dict[str, np.ndarray],
-                                             Dict[str, np.ndarray],
-                                             Dict[str, np.ndarray],
-                                             torch.Tensor]]:
-        """Load dataset dictionaries from disk cache using memory-mapped arrays"""
-        cache_path = self._get_cache_path()
-        mmap_dir = self._get_mmap_dir()
-
-        if not cache_path.exists():
-            return None
-
-        # Check if mmap directory exists and has files
-        if not mmap_dir.exists() or not any(mmap_dir.iterdir()):
+        # Check if DB already exists with required tables
+        if not self.config.debug_data and self._check_db_ready():
             if self.is_root():
-                print(f"Cache metadata found but mmap directory is missing or empty. Recomputing...")
-            return None
+                print(f"Loading from existing DuckDB: {db_path}")
+            self.quantiles = self._load_quantiles_from_db()
+            self.encoder.quantiles = self.quantiles
+            self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
+            self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
+            return
 
+        # Need to build DB from scratch
         if self.is_root():
-            print(f"Loading cache from {cache_path} (memory-mapped mode)...")
-
-        # Load metadata
-        data = np.load(cache_path, allow_pickle=True)
-
-        # Reconstruct dictionaries
-        train_x = {}
-        train_y = {}
-        val_x = {}
-        val_y = {}
-
-        # Load metadata (these are small, so load into memory)
-        train_ids = data['_train_ids'].copy()
-        val_ids = data['_val_ids'].copy()
-
-        # Load quantiles as single tensor (n_quantize+1, num_features)
-        quantiles = torch.from_numpy(data['quantiles'].copy()).float()
-
-        # Load memory-mapped arrays for train data
-        for stock_id in train_ids:
-            train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
-            train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
-
-            if train_features_path.exists() and train_targets_path.exists():
-                train_x[stock_id] = np.load(train_features_path, mmap_mode='r')
-                train_y[stock_id] = np.load(train_targets_path, mmap_mode='r')
-            else:
-                if self.is_root():
-                    print(f"Warning: Missing memory-mapped files for train stock {stock_id}")
-
-        # Load memory-mapped arrays for val data
-        for stock_id in val_ids:
-            val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
-            val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
-
-            if val_features_path.exists() and val_targets_path.exists():
-                val_x[stock_id] = np.load(val_features_path, mmap_mode='r')
-                val_y[stock_id] = np.load(val_targets_path, mmap_mode='r')
-            else:
-                if self.is_root():
-                    print(f"Warning: Missing memory-mapped files for val stock {stock_id}")
-
-        if self.is_root():
-            print(f"Cache loaded successfully (memory-mapped)! "
-                  f"{len(train_ids)} train stocks, {len(val_ids)} val stocks")
-
-        return train_x, train_y, val_x, val_y, quantiles
-
-    def prepare_data(self, path: Optional[str] = None, seq_len: int = 64,
-                     n_quantize: int = 256, train_frac: float = 0.9):
-        if not self.config.debug_data:
-            cached = self._load_cache()
-            if cached is not None:
-                train_x, train_y, val_x, val_y, quantiles = cached
-                self.quantiles = quantiles
-                self.encoder.quantiles = quantiles
-
-                self.train_dataset = PriceHistoryDataset(
-                    self.config, train_x, train_y,
-                )
-                self.val_dataset = PriceHistoryDataset(
-                    self.config, val_x, val_y,
-                )
-                return
-
-        # Cache miss or force recalculation - compute from scratch
-        if self.is_root():
-            print("Computing data from scratch...")
+            print("Building DuckDB from scratch...")
 
         if path is None:
             path = Path.home() / 'h' / 'data' / 'a_1min.pq'
         path = Path(path)
 
         if self.is_root():
-            train_x, train_y, val_x, val_y = \
-                self._prepare_data_chunked(path, seq_len, n_quantize, train_frac)
+            self._build_duckdb(path, db_path)
 
-        self._save_cache(
-            train_x, train_y,
-            val_x, val_y,
-            self.quantiles
-        )
+        self.quantiles = self._load_quantiles_from_db()
+        self.encoder.quantiles = self.quantiles
+        self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
+        self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
 
-        self.train_dataset = PriceHistoryDataset(
-            self.config, train_x, train_y,
-        )
-        self.val_dataset = PriceHistoryDataset(
-            self.config, val_x, val_y,
-        )
-        return
-set_sorted
-    def _prepare_data_chunked(self, path: Path, seq_len: int, n_quantize: int,
-                               train_frac: float, chunk_size: int = 300):
-        """Prepare data in chunks using DuckDB for efficient iteration.
+    def _build_duckdb(self, parquet_path: Path, db_path: Path):
+        """Build DuckDB database with all preprocessed data."""
+        # Remove existing DB if present
+        if db_path.exists():
+            db_path.unlink()
 
-        Args:
-            path: Path to parquet file
-            seq_len: Sequence length
-            n_quantize: Number of quantile bins
-            train_frac: Fraction of data for training
-            chunk_size: Number of stocks to process per chunk (default 300)
-
-        Returns:
-            train_x, train_y, val_x, val_y
-        """
-        print(f"Processing data in chunks of {chunk_size} stocks...")
-
-        con = duckdb.connect()
+        con = duckdb.connect(str(db_path))
         con.execute("SET memory_limit='350GB'")
         con.execute("SET max_memory='350GB'")
+        con.execute("SET preserve_insertion_order=false")
 
         print("Step 1: Loading parquet and computing features...")
-
         con.execute(f"""
             CREATE VIEW raw_data AS
-            SELECT * FROM read_parquet('{path}')
+            SELECT * FROM read_parquet('{parquet_path}')
         """)
 
-        # Create view with computed features
         con.execute(f"""
             CREATE VIEW df AS
             {self._compute_features_sql()}
         """)
 
         print("Step 2: Compute train/val cutoff (90th percentile of datetime)...")
-
         cutoff = con.execute("""
             SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
             FROM (SELECT DISTINCT datetime FROM raw_data USING SAMPLE 1000000)
         """).fetchone()[0]
-
         print(f"Train/val cutoff timestamp: {cutoff}")
 
         print("Step 3: Create view with is_train flag...")
@@ -679,151 +588,150 @@ set_sorted
             LEFT JOIN stats s ON d.id = s.id
         """)
 
-        print("Step 6: Compute quantiles from sample...")
-        # Limit sample size when debug_data is set to avoid OOM
-        sample_size = 10000 if self.config.debug_data else 1000000
-        self.quantiles = self._compute_quantiles_duckdb(con, n_quantize, sample_size)
-        self.encoder.quantiles = self.quantiles
-        gc.collect()
-
-        # Step 7: Get all unique stock ids
-        if self.is_root():
-            print("Getting stock ids...")
-        limit_clause = f"LIMIT {self.config.debug_data}" if self.config.debug_data else ""
-        stock_ids = con.execute(f"""
-            SELECT DISTINCT id FROM df_norm ORDER BY id {limit_clause}
-        """).fetchall()
-        stock_ids = [row[0] for row in stock_ids]
-        total_stocks = len(stock_ids)
-
-        if self.is_root():
-            print(f"Total stocks: {total_stocks}")
-
-        # Step 8: Process stocks in chunks
-        train_x = {}
-        train_y = {}
-        val_x = {}
-        val_y = {}
-        mmap_dir = self._get_mmap_dir()
-
+        print("Step 6: Create data tables with row indices...")
         features_cols = ', '.join(self.features)
+        limit_clause = f"LIMIT {self.config.debug_data}" if self.config.debug_data else ""
 
-        for chunk_idx in range(0, total_stocks, chunk_size):
-            chunk_end = min(chunk_idx + chunk_size, total_stocks)
-            chunk_stock_ids = stock_ids[chunk_idx:chunk_end]
+        # Create train_data table first
+        print("  Creating train_data table...")
+        con.execute(f"""
+            CREATE TABLE train_data AS
+            SELECT
+                id AS stock_id,
+                ROW_NUMBER() OVER (PARTITION BY id ORDER BY datetime) - 1 AS row_idx,
+                close_norm,
+                {features_cols}
+            FROM df_norm
+            WHERE is_train = true
+            AND id IN (SELECT DISTINCT id FROM df_norm ORDER BY id {limit_clause})
+            ORDER BY id, datetime
+        """)
 
-            if self.is_root():
-                print(f"\nChunk {chunk_idx // chunk_size + 1} "
-                      f"(stocks {chunk_idx}-{chunk_end})")
+        # Create val_data table
+        print("  Creating val_data table...")
+        con.execute(f"""
+            CREATE TABLE val_data AS
+            SELECT
+                id AS stock_id,
+                ROW_NUMBER() OVER (PARTITION BY id ORDER BY datetime) - 1 AS row_idx,
+                close_norm,
+                {features_cols}
+            FROM df_norm
+            WHERE is_train = false
+            AND id IN (SELECT DISTINCT id FROM df_norm ORDER BY id {limit_clause})
+            ORDER BY id, datetime
+        """)
 
-            # Fetch chunk data
-            placeholders = ', '.join([f"'{sid}'" for sid in chunk_stock_ids])
-            chunk_df = con.execute(f"""
-                SELECT id, is_train, close_norm, {features_cols}
-                FROM df_norm
-                WHERE id IN ({placeholders})
-                ORDER BY id, datetime
-            """).fetchnumpy()
+        # Create indexes for fast lookups
+        print("  Creating indexes...")
+        con.execute("CREATE INDEX train_data_idx ON train_data(stock_id, row_idx)")
+        con.execute("CREATE INDEX val_data_idx ON val_data(stock_id, row_idx)")
 
-            self._process_stock_chunk_numpy(
-                chunk_df, chunk_stock_ids, seq_len, mmap_dir,
-                train_x, train_y, val_x, val_y
+        print("Step 7: Compute and store quantiles from train_data...")
+        sample_size = 10000 if self.config.debug_data else 1000000
+        self._compute_and_store_quantiles(con, sample_size)
+
+        print("Step 8: Build index tables for dataset iteration...")
+        seq_len = self.config.seq_len
+        max_horizon = max(self.horizons)
+
+        # Build train_index
+        print("  Building train_index...")
+        con.execute(f"""
+            CREATE TABLE train_index AS
+            WITH stock_lengths AS (
+                SELECT stock_id, MAX(row_idx) + 1 AS stock_len
+                FROM train_data
+                GROUP BY stock_id
+            ),
+            valid_stocks AS (
+                SELECT stock_id, stock_len
+                FROM stock_lengths
+                WHERE stock_len > {seq_len} + {max_horizon}
+            ),
+            indices AS (
+                SELECT
+                    stock_id,
+                    generate_series(0, stock_len - {seq_len} - {max_horizon} - 1) AS start_idx
+                FROM valid_stocks
             )
+            SELECT stock_id, start_idx FROM indices
+        """)
 
-            del chunk_df
-            gc.collect()
+        # Build val_index
+        print("  Building val_index...")
+        con.execute(f"""
+            CREATE TABLE val_index AS
+            WITH stock_lengths AS (
+                SELECT stock_id, MAX(row_idx) + 1 AS stock_len
+                FROM val_data
+                GROUP BY stock_id
+            ),
+            valid_stocks AS (
+                SELECT stock_id, stock_len
+                FROM stock_lengths
+                WHERE stock_len > {seq_len} + {max_horizon}
+            ),
+            indices AS (
+                SELECT
+                    stock_id,
+                    generate_series(0, stock_len - {seq_len} - {max_horizon} - 1) AS start_idx
+                FROM valid_stocks
+            )
+            SELECT stock_id, start_idx FROM indices
+        """)
 
-            # Check memory after each chunk
-            process = psutil.Process()
-            mem_gb = process.memory_info().rss / (1024 ** 3)
-            if self.is_root():
-                print(f"  Memory: {mem_gb:.2f} GB, "
-                      f"train: {len(train_x)}, "
-                      f"val: {len(val_x)}")
+        # Get counts
+        train_count = con.execute("SELECT COUNT(*) FROM train_index").fetchone()[0]
+        val_count = con.execute("SELECT COUNT(*) FROM val_index").fetchone()[0]
+        print(f"  Train samples: {train_count}, Val samples: {val_count}")
 
         con.close()
+        print(f"DuckDB database built at {db_path}")
 
-        if self.is_root():
-            print(f"\nCompleted {total_stocks} stocks")
-            print(f"Final: {len(train_x)} train stocks, "
-                  f"{len(val_x)} val stocks")
+    def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
+        """Compute quantiles from train_data table and store in DuckDB table."""
+        n_quantize = self.config.n_quantize
+        q_positions = [i / n_quantize for i in range(n_quantize + 1)]
+        features_cols = ', '.join(self.features)
 
-        return (train_x, train_y, val_x, val_y)
+        # Sample rows from the already-created train_data table
+        sampled = con.execute(f"""
+            SELECT {features_cols}
+            FROM train_data
+            USING SAMPLE {sample_size}
+        """).fetchnumpy()
 
-    def _process_stock_chunk_numpy(self, chunk_df: Dict[str, np.ndarray],
-                                     stock_ids: list, seq_len: int, mmap_dir: Path,
-                                     train_x: dict, train_y: dict,
-                                     val_x: dict, val_y: dict):
-        """Process a chunk of stocks from numpy arrays and save to mmap files.
+        # Create quantiles table
+        con.execute("""
+            CREATE TABLE quantiles (
+                feature_idx INTEGER,
+                q_idx INTEGER,
+                value DOUBLE,
+                PRIMARY KEY (feature_idx, q_idx)
+            )
+        """)
 
-        Optimized for data sorted by (id, datetime): uses contiguous slices
-        instead of boolean masks, and exploits datetime sortedness for train/val split.
-        """
-        ids = chunk_df['id']
-        is_train = chunk_df['is_train']
-        close_norm = chunk_df['close_norm']
+        # Compute and insert quantiles for each feature
+        for f_idx, col in enumerate(self.features):
+            col_data = np.sort(sampled[col])
+            n = len(col_data)
 
-        # Build features array from columns
-        features_data = np.column_stack([chunk_df[f] for f in self.features])
+            for q_idx, q in enumerate(q_positions):
+                idx = q * (n - 1)
+                idx_lower = int(np.floor(idx))
+                idx_upper = min(int(np.ceil(idx)), n - 1)
 
-        # Find stock boundaries using np.unique (exploits sortedness)
-        unique_ids, first_indices = np.unique(ids, return_index=True)
-        id_to_idx = {sid: i for i, sid in enumerate(unique_ids)}
-        end_indices = np.append(first_indices[1:], len(ids))
+                if idx_lower == idx_upper:
+                    quantile_val = col_data[idx_lower]
+                else:
+                    weight = idx - idx_lower
+                    quantile_val = (1 - weight) * col_data[idx_lower] + weight * col_data[idx_upper]
 
-        for stock_id in stock_ids:
-            if stock_id not in id_to_idx:
-                continue
-
-            idx = id_to_idx[stock_id]
-            start, end = first_indices[idx], end_indices[idx]
-            stock_len = end - start
-
-            if stock_len <= seq_len + 1:
-                continue
-
-            # Contiguous slices - no boolean indexing
-            stock_features = features_data[start:end].astype(np.float32)
-            stock_is_train = is_train[start:end]
-            stock_close = close_norm[start:end].astype(np.float32)
-
-            # Since datetime is sorted, is_train transitions True->False at most once
-            train_vals = stock_is_train.astype(bool)
-
-            if train_vals.all():
-                train_end, val_start = stock_len, stock_len
-            elif not train_vals.any():
-                train_end, val_start = 0, 0
-            else:
-                # Find transition: first False index via searchsorted
-                train_end = np.searchsorted(~train_vals, True)
-                val_start = train_end
-
-            # Save training data using contiguous slice
-            if train_end > seq_len + 1:
-                train_features_path = mmap_dir / f"train_data_{stock_id}.npy"
-                train_targets_path = mmap_dir / f"train_target_{stock_id}.npy"
-
-                np.save(train_features_path, stock_features[:train_end])
-                np.save(train_targets_path, stock_close[:train_end])
-
-                train_x[stock_id] = np.load(
-                    train_features_path, mmap_mode='r')
-                train_y[stock_id] = np.load(
-                    train_targets_path, mmap_mode='r')
-
-            # Save validation data using contiguous slice
-            if stock_len - val_start > seq_len + 1:
-                val_features_path = mmap_dir / f"val_data_{stock_id}.npy"
-                val_targets_path = mmap_dir / f"val_target_{stock_id}.npy"
-
-                np.save(val_features_path, stock_features[val_start:])
-                np.save(val_targets_path, stock_close[val_start:])
-
-                val_x[stock_id] = np.load(
-                    val_features_path, mmap_mode='r')
-                val_y[stock_id] = np.load(
-                    val_targets_path, mmap_mode='r')
+                con.execute(
+                    "INSERT INTO quantiles VALUES (?, ?, ?)",
+                    [f_idx, q_idx, float(quantile_val)]
+                )
 
     def get_dataloader(self, dataset, shuffle: bool = True, drop_last: bool = True):
         """Create dataloader with DDP support via DistributedSampler"""
@@ -887,57 +795,6 @@ set_sorted
             FROM raw_data
         """
 
-    def _compute_quantiles_duckdb(self, con: duckdb.DuckDBPyConnection,
-                                   n_quantize: int, sample_size: int = 1000000) -> torch.Tensor:
-        """Compute quantiles for all features using DuckDB
-
-        Args:
-            con: DuckDB connection with df_norm view available
-            n_quantize: Number of quantile bins
-            sample_size: Number of rows to sample for quantile estimation
-
-        Returns:
-            torch.Tensor: (n_quantize+1, num_features) quantile boundaries
-        """
-        q_positions = [i / n_quantize for i in range(n_quantize + 1)]
-
-        # Build quantiles using DuckDB's QUANTILE_CONT
-        quantiles_list = []
-        features_cols = ', '.join(self.features)
-
-        # Sample rows from training data
-        sampled = con.execute(f"""
-            SELECT {features_cols}
-            FROM df_norm
-            WHERE is_train = true
-            USING SAMPLE {sample_size}
-        """).fetchnumpy()
-
-        for col in self.features:
-            col_data = np.sort(sampled[col])
-            n = len(col_data)
-
-            col_quantiles = []
-            for q in q_positions:
-                idx = q * (n - 1)
-                idx_lower = int(np.floor(idx))
-                idx_upper = min(int(np.ceil(idx)), n - 1)
-
-                if idx_lower == idx_upper:
-                    quantile_val = col_data[idx_lower]
-                else:
-                    weight = idx - idx_lower
-                    quantile_val = (1 - weight) * col_data[idx_lower] + weight * col_data[idx_upper]
-
-                col_quantiles.append(quantile_val)
-
-            quantiles_list.append(torch.tensor(col_quantiles, dtype=torch.float32))
-
-        del sampled
-        gc.collect()
-
-        quantiles = torch.stack(quantiles_list, dim=1)
-        return quantiles
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
@@ -1125,7 +982,7 @@ class FinalPipelineConfig:
     seq_len: int = 4096
     n_quantize: int = 128
     max_cent_abs: int = 64
-    cache_dir: str | None = None
+    db_path: str | None = None  # Path to DuckDB database file
 
     features: tuple = ('close', 'close_norm', 'delta_1min', 'delta_30min',
                        'ret_1min', 'ret_30min', 'ret_1day',
@@ -1178,8 +1035,12 @@ class FinalPipelineConfig:
         # Dataloader
         self.batch_size = self.vram_gb * 2 ** 20 // self.seq_len // self.num_layers // self.interim_dim
         self.num_workers = self.num_workers or os.cpu_count() // 2
-        self.cache_dir = self.cache_dir or str(Path.home() / 'h' / 'cache' / 'pipeline_data' / f'debug_{self.debug_data}')
-        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+
+        # DuckDB path (in ../data relative to source)
+        if self.db_path is None:
+            db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
+            self.db_path = str(Path(__file__).parent.parent.parent.parent / 'data' / db_name)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
 
 config = FinalPipelineConfig(
