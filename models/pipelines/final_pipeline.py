@@ -527,16 +527,16 @@ class FinalPipeline(dummyLightning):
         self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
         self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
 
-    def _build_duckdb(self, parquet_path: Path, db_path: Path):
-        """Build DuckDB database with all preprocessed data."""
+    def _build_duckdb(self, parquet_path: Path, db_path: Path, chunk_size: int = 100):
+        """Build DuckDB database with all preprocessed data, processing in chunks."""
         # Remove existing DB if present
         if db_path.exists():
             db_path.unlink()
 
         con = duckdb.connect(str(db_path))
-        con.execute("SET memory_limit='350GB'")
-        con.execute("SET max_memory='350GB'")
+        con.execute("SET memory_limit='64GB'")
         con.execute("SET preserve_insertion_order=false")
+        con.execute("SET threads=4")
 
         print("Step 1: Loading parquet and computing features...")
         con.execute(f"""
@@ -564,8 +564,9 @@ class FinalPipeline(dummyLightning):
         """)
 
         print("Step 4: Compute per-stock normalization stats from training data...")
+        # Materialize stats as a table (small)
         con.execute("""
-            CREATE VIEW stats AS
+            CREATE TABLE stats AS
             SELECT
                 id,
                 AVG(close) AS mean_close,
@@ -577,61 +578,81 @@ class FinalPipeline(dummyLightning):
             GROUP BY id
         """)
 
-        print("Step 5: Create normalized view...")
-        con.execute("""
-            CREATE VIEW df_norm AS
-            SELECT
-                d.*,
-                (d.close - COALESCE(s.mean_close, 0)) / (COALESCE(s.std_close, 1e-8) + 1e-8) AS close_norm,
-                (d.volume - COALESCE(s.mean_volume, 0)) / (COALESCE(s.std_volume, 1e-8) + 1e-8) AS volume_norm
-            FROM df_split d
-            LEFT JOIN stats s ON d.id = s.id
-        """)
-
-        print("Step 6: Create data tables with row indices...")
-        features_cols = ', '.join(self.features)
+        print("Step 5: Get stock IDs to process...")
         limit_clause = f"LIMIT {self.config.debug_data}" if self.config.debug_data else ""
+        stock_ids = con.execute(f"""
+            SELECT DISTINCT id FROM df_split ORDER BY id {limit_clause}
+        """).fetchall()
+        stock_ids = [row[0] for row in stock_ids]
+        total_stocks = len(stock_ids)
+        print(f"  Total stocks: {total_stocks}")
 
-        # Create train_data table first
-        print("  Creating train_data table...")
+        print("Step 6: Create data tables...")
+        features_cols = ', '.join(self.features)
+
+        # Create empty tables with schema
         con.execute(f"""
-            CREATE TABLE train_data AS
-            SELECT
-                id AS stock_id,
-                ROW_NUMBER() OVER (PARTITION BY id ORDER BY datetime) - 1 AS row_idx,
-                close_norm,
-                {features_cols}
-            FROM df_norm
-            WHERE is_train = true
-            AND id IN (SELECT DISTINCT id FROM df_norm ORDER BY id {limit_clause})
-            ORDER BY id, datetime
+            CREATE TABLE train_data (
+                stock_id VARCHAR,
+                row_idx BIGINT,
+                close_norm DOUBLE,
+                {', '.join(f'{f} DOUBLE' for f in self.features)}
+            )
+        """)
+        con.execute(f"""
+            CREATE TABLE val_data (
+                stock_id VARCHAR,
+                row_idx BIGINT,
+                close_norm DOUBLE,
+                {', '.join(f'{f} DOUBLE' for f in self.features)}
+            )
         """)
 
-        # Create val_data table
-        print("  Creating val_data table...")
-        con.execute(f"""
-            CREATE TABLE val_data AS
-            SELECT
-                id AS stock_id,
-                ROW_NUMBER() OVER (PARTITION BY id ORDER BY datetime) - 1 AS row_idx,
-                close_norm,
-                {features_cols}
-            FROM df_norm
-            WHERE is_train = false
-            AND id IN (SELECT DISTINCT id FROM df_norm ORDER BY id {limit_clause})
-            ORDER BY id, datetime
-        """)
+        # Process stocks in chunks
+        for chunk_idx in range(0, total_stocks, chunk_size):
+            chunk_end = min(chunk_idx + chunk_size, total_stocks)
+            chunk_stock_ids = stock_ids[chunk_idx:chunk_end]
+            placeholders = ', '.join([f"'{sid}'" for sid in chunk_stock_ids])
+
+            print(f"  Processing chunk {chunk_idx // chunk_size + 1}/{(total_stocks + chunk_size - 1) // chunk_size} "
+                  f"(stocks {chunk_idx+1}-{chunk_end})")
+
+            # Insert train data for this chunk
+            con.execute(f"""
+                INSERT INTO train_data
+                SELECT
+                    d.id AS stock_id,
+                    ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
+                    (d.close - COALESCE(s.mean_close, 0)) / (COALESCE(s.std_close, 1e-8) + 1e-8) AS close_norm,
+                    {features_cols}
+                FROM df_split d
+                LEFT JOIN stats s ON d.id = s.id
+                WHERE d.is_train = true AND d.id IN ({placeholders})
+            """)
+
+            # Insert val data for this chunk
+            con.execute(f"""
+                INSERT INTO val_data
+                SELECT
+                    d.id AS stock_id,
+                    ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
+                    (d.close - COALESCE(s.mean_close, 0)) / (COALESCE(s.std_close, 1e-8) + 1e-8) AS close_norm,
+                    {features_cols}
+                FROM df_split d
+                LEFT JOIN stats s ON d.id = s.id
+                WHERE d.is_train = false AND d.id IN ({placeholders})
+            """)
 
         # Create indexes for fast lookups
-        print("  Creating indexes...")
+        print("Step 7: Creating indexes...")
         con.execute("CREATE INDEX train_data_idx ON train_data(stock_id, row_idx)")
         con.execute("CREATE INDEX val_data_idx ON val_data(stock_id, row_idx)")
 
-        print("Step 7: Compute and store quantiles from train_data...")
+        print("Step 8: Compute and store quantiles from train_data...")
         sample_size = 10000 if self.config.debug_data else 1000000
         self._compute_and_store_quantiles(con, sample_size)
 
-        print("Step 8: Build index tables for dataset iteration...")
+        print("Step 9: Build index tables for dataset iteration...")
         seq_len = self.config.seq_len
         max_horizon = max(self.horizons)
 
@@ -809,7 +830,7 @@ class FinalPipeline(dummyLightning):
 
         seq_len = x.shape[1]
         losses = {}
-        
+
         features = self.forward(x)[:, seq_len//2:, :]
         # Get predictions for all sequence positions
         # But we only care about predictions from positions seq_len//2 onwards
@@ -879,7 +900,7 @@ class FinalPipeline(dummyLightning):
             h_loss = self._quantile_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
             losses[f'return_quantile_{h_name}'] = h_loss
             losses['return_quantile'] += h_loss / len(self.horizons)
-        
+
         assert (
             losses['quantized'] >= 0 and
             losses['quantile'] >= 0 and
