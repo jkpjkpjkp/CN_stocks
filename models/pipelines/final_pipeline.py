@@ -556,7 +556,7 @@ class FinalPipeline(dummyLightning):
         print("Step 2: Compute train/val cutoff (90th percentile of datetime)...")
         cutoff = con.execute("""
             SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
-            FROM (SELECT DISTINCT datetime FROM raw_data USING SAMPLE 1000000)
+            FROM (SELECT datetime FROM raw_data USING SAMPLE 1000000)
         """).fetchone()[0]
         print(f"Train/val cutoff timestamp: {cutoff}")
 
