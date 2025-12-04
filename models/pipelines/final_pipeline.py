@@ -25,10 +25,10 @@
 All data storage uses on-disk DuckDB in ../data/pipeline.duckdb
 """
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import Dataset, DistributedSampler
-import torch.distributed as dist
+from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import duckdb
@@ -553,51 +553,76 @@ class FinalPipeline(dummyLightning):
             {self._compute_features_sql()}
         """)
 
-        print("Step 2: Compute train/val cutoff (90th percentile of datetime)...")
-        cutoff = con.execute("""
-            SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
-            FROM (SELECT datetime FROM raw_data USING SAMPLE 1000000)
-        """).fetchone()[0]
-        print(f"Train/val cutoff timestamp: {cutoff}")
+        print("Step 2-4: Load cached cutoff and stats, or compute them...")
+        stats_cache_path = db_path.parent / 'stats_cache.parquet'
+        cutoff_cache_path = db_path.parent / 'cutoff_cache.txt'
 
-        print("Step 3: Create view with is_train flag...")
-        con.execute(f"""
-            CREATE VIEW df_split AS
-            SELECT *, epoch_ns(datetime) <= {cutoff} AS is_train
-            FROM df
-        """)
+        # Get stock IDs first (needed for debug filtering)
+        print("Step 2a: Get stock IDs to process...")
+        if self.config.debug_data:
+            # Exploit sorted order: scan until we find debug_data distinct IDs
+            stock_ids = con.execute(f"""
+                SELECT DISTINCT id FROM raw_data LIMIT {self.config.debug_data}
+            """).fetchall()
+            stock_ids = [row[0] for row in stock_ids]
+            stock_ids_str = ", ".join(f"'{s}'" for s in stock_ids)
+            stock_filter = f"WHERE id IN ({stock_ids_str})"
+        else:
+            stock_ids = None  # Will be set from stats table later
+            stock_filter = ""
 
-        print("Step 4: Compute per-stock normalization stats from training data...")
-        # Materialize stats as a table (small)
-        con.execute("""
-            CREATE TABLE stats AS
-            SELECT
-                id,
-                AVG(close) AS mean_close,
-                STDDEV(close) AS std_close,
-                AVG(volume) AS mean_volume,
-                STDDEV(volume) AS std_volume
-            FROM df_split
-            WHERE is_train = true
-            GROUP BY id
-        """)
+        # Load or compute cutoff
+        if cutoff_cache_path.exists():
+            cutoff = int(cutoff_cache_path.read_text().strip())
+            print(f"  Loaded cached cutoff: {cutoff}")
+        else:
+            print("  Computing train/val cutoff (90th percentile of datetime)...")
+            cutoff = con.execute("""
+                SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
+                FROM (SELECT datetime FROM raw_data USING SAMPLE 1000000)
+            """).fetchone()[0]
+            print(f"  Train/val cutoff timestamp: {cutoff}")
+            cutoff_cache_path.write_text(str(cutoff))
 
-        print("Step 5: Get stock IDs to process...")
-        limit_clause = f"LIMIT {self.config.debug_data}" if self.config.debug_data else ""
-        # Use stats table (already materialized) instead of scanning df_split again
-        stock_ids = con.execute(f"""
-            SELECT id FROM stats ORDER BY id {limit_clause}
-        """).fetchall()
-        stock_ids = [row[0] for row in stock_ids]
+        # Compute stats - use cache only for full runs, always recompute for debug
+        if not self.config.debug_data and stats_cache_path.exists():
+            con.execute(f"""
+                CREATE TABLE stats AS
+                SELECT * FROM read_parquet('{stats_cache_path}')
+            """)
+            print(f"  Loaded cached stats from {stats_cache_path}")
+            stock_ids = con.execute("SELECT id FROM stats ORDER BY id").fetchall()
+            stock_ids = [row[0] for row in stock_ids]
+        else:
+            print("  Computing per-stock normalization stats...")
+            con.execute(f"""
+                CREATE TABLE stats AS
+                SELECT
+                    id,
+                    AVG(close) AS mean_close,
+                    STDDEV(close) AS std_close,
+                    AVG(volume) AS mean_volume,
+                    STDDEV(volume) AS std_volume
+                FROM raw_data
+                {stock_filter}
+                {"AND" if stock_filter else "WHERE"} epoch_ns(datetime) <= {cutoff}
+                GROUP BY id
+            """)
+            # Only cache full stats
+            if not self.config.debug_data:
+                con.execute(f"""
+                    COPY stats TO '{stats_cache_path}' (FORMAT PARQUET)
+                """)
+                print(f"  Cached stats to {stats_cache_path}")
+                stock_ids = con.execute("SELECT id FROM stats ORDER BY id").fetchall()
+                stock_ids = [row[0] for row in stock_ids]
+
         total_stocks = len(stock_ids)
         print(f"  Total stocks: {total_stocks}")
 
         print("Step 6: Create data tables...")
         # Features that need normalization with per-stock stats
         norm_features = {'close_norm', 'volume_norm'}
-        # Features that come directly from df_split
-        direct_features = [f for f in self.features if f not in norm_features]
-        direct_cols = ', '.join(f'd.{f}' for f in direct_features)
 
         # Build SELECT columns: normalized features computed inline, direct features from df_split
         def build_select_cols():
@@ -613,7 +638,22 @@ class FinalPipeline(dummyLightning):
 
         select_cols = build_select_cols()
 
-        # Create train_data table directly with INSERT
+        # Build stock filter for debug mode
+        if self.config.debug_data:
+            stock_ids_str = ", ".join(f"'{s}'" for s in stock_ids)
+            stock_filter = f"WHERE id IN ({stock_ids_str})"
+        else:
+            stock_filter = ""
+
+        # First, materialize df with features (the expensive window function computation)
+        print("  Materializing features (window functions)...")
+        con.execute(f"""
+            CREATE TABLE df_materialized AS
+            SELECT * FROM df {stock_filter}
+        """)
+        con.execute("CREATE INDEX df_mat_id_idx ON df_materialized(id)")
+
+        # Now train/val split and normalization is fast since features are pre-computed
         print("  Building train_data...")
         con.execute(f"""
             CREATE TABLE train_data AS
@@ -621,9 +661,9 @@ class FinalPipeline(dummyLightning):
                 d.id AS stock_id,
                 ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
                 {select_cols}
-            FROM df_split d
+            FROM df_materialized d
             LEFT JOIN stats s ON d.id = s.id
-            WHERE d.is_train = true
+            WHERE epoch_ns(d.datetime) <= {cutoff}
         """)
 
         # Create val_data table directly
@@ -634,10 +674,13 @@ class FinalPipeline(dummyLightning):
                 d.id AS stock_id,
                 ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
                 {select_cols}
-            FROM df_split d
+            FROM df_materialized d
             LEFT JOIN stats s ON d.id = s.id
-            WHERE d.is_train = false
+            WHERE epoch_ns(d.datetime) > {cutoff}
         """)
+
+        # Drop materialized table to free memory
+        con.execute("DROP TABLE df_materialized")
 
         # Create indexes for fast lookups
         print("Step 7: Creating indexes...")
