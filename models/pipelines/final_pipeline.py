@@ -29,7 +29,6 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch import distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import duckdb
 from pathlib import Path
@@ -382,54 +381,11 @@ class FinalPipeline(dummyLightning):
         self.backbone = tm(config)
         self.readout = MultiReadout(config)
 
-        # Initialize DDP attributes
-        self.rank = 0
-        self.world_size = 1
-        self.local_rank = 0
-        self._ddp_model = None
-
-    def setup_ddp(self, rank: Optional[int] = None,
-                  world_size: Optional[int] = None):
-        """Initialize DDP from environment or provided rank/world_size"""
-        # Get rank and world_size from environment if not provided
-        if rank is None:
-            rank = int(os.environ.get('RANK', 0))
-        if world_size is None:
-            world_size = int(os.environ.get('WORLD_SIZE', 1))
-
-        self.rank = rank
-        self.world_size = world_size
-        self.local_rank = int(os.environ.get('LOCAL_RANK', rank))
-
-        torch.cuda.set_device(self.local_rank)
-        self.device = f'cuda:{self.local_rank}'
-
-        # Initialize process group
-        if not dist.is_initialized():
-            os.environ['MASTER_ADDR'] = self.config.master_addr
-            os.environ['MASTER_PORT'] = self.config.master_port
-            dist.init_process_group(
-                backend=self.config.ddp_backend,
-                rank=self.rank,
-                world_size=self.world_size
-            )
-
-        # Move model to device before wrapping with DDP
-        self.to(self.device)
-
-        # Wrap model with DDP
-        self._ddp_model = DDP(
-            self,
-            device_ids=[self.local_rank],
-            output_device=self.local_rank,
-        )
-
-    def get_model(self):
-        """Return the underlying model (unwrapped from DDP if necessary)"""
-        return self._ddp_model.module if self._ddp_model is not None else self
-
-    def is_root(self):
-        return self.rank == 0
+    def _init_distributed(self):
+        """Initialize distributed with custom master addr/port from config."""
+        os.environ['MASTER_ADDR'] = self.master_addr
+        os.environ['MASTER_PORT'] = self.master_port
+        super()._init_distributed()
 
     def all_reduce(self, tensor: torch.Tensor, op=None) -> torch.Tensor:
         """All-reduce operation across all processes"""
@@ -447,8 +403,8 @@ class FinalPipeline(dummyLightning):
         return torch.cat(tensor_list, dim=0)
 
     def _get_db_path(self) -> Path:
-        Path(self.config.db_path).parent.mkdir(parents=True, exist_ok=True)
-        return Path(self.config.db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        return Path(self.db_path)
 
     def _check_db_ready(self) -> bool:
         """Check if DuckDB database exists and has required tables"""
@@ -491,7 +447,7 @@ class FinalPipeline(dummyLightning):
         db_path = self._get_db_path()
 
         # Check if DB already exists with required tables
-        if not self.config.debug_data and self._check_db_ready():
+        if not self.debug_data and self._check_db_ready():
             if self.is_root():
                 print(f"Loading from existing DuckDB: {db_path}")
             self.quantiles = self._load_quantiles_from_db()
@@ -540,10 +496,10 @@ class FinalPipeline(dummyLightning):
 
         # Get stock IDs first (needed for debug filtering)
         print("Step 2a: Get stock IDs to process...")
-        if self.config.debug_data:
+        if self.debug_data:
             # Exploit sorted order: scan until we find debug_data distinct IDs
             stock_ids = con.execute(f"""
-                SELECT DISTINCT id FROM raw_data LIMIT {self.config.debug_data}
+                SELECT DISTINCT id FROM raw_data LIMIT {self.debug_data}
             """).fetchall()
             stock_ids = [row[0] for row in stock_ids]
             stock_ids_str = ", ".join(f"'{s}'" for s in stock_ids)
@@ -566,7 +522,7 @@ class FinalPipeline(dummyLightning):
             cutoff_cache_path.write_text(str(cutoff))
 
         # Compute stats - use cache only for full runs, always recompute for debug
-        if not self.config.debug_data and stats_cache_path.exists():
+        if not self.debug_data and stats_cache_path.exists():
             con.execute(f"""
                 CREATE TABLE stats AS
                 SELECT * FROM read_parquet('{stats_cache_path}')
@@ -590,7 +546,7 @@ class FinalPipeline(dummyLightning):
                 GROUP BY id
             """)
             # Only cache full stats
-            if not self.config.debug_data:
+            if not self.debug_data:
                 con.execute(f"""
                     COPY stats TO '{stats_cache_path}' (FORMAT PARQUET)
                 """)
@@ -620,7 +576,7 @@ class FinalPipeline(dummyLightning):
         select_cols = build_select_cols()
 
         # Build stock filter for debug mode
-        if self.config.debug_data:
+        if self.debug_data:
             stock_ids_str = ", ".join(f"'{s}'" for s in stock_ids)
             stock_filter = f"WHERE id IN ({stock_ids_str})"
         else:
@@ -669,11 +625,11 @@ class FinalPipeline(dummyLightning):
         con.execute("CREATE INDEX val_data_idx ON val_data(stock_id, row_idx)")
 
         print("Step 8: Compute and store quantiles from train_data...")
-        sample_size = 10000 if self.config.debug_data else 1000000
+        sample_size = 10000 if self.debug_data else 1000000
         self._compute_and_store_quantiles(con, sample_size)
 
         print("Step 9: Build index tables for dataset iteration...")
-        seq_len = self.config.seq_len
+        seq_len = self.seq_len
         max_horizon = max(self.horizons)
 
         # Build train_index
@@ -738,7 +694,7 @@ class FinalPipeline(dummyLightning):
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
         """Compute quantiles from train_data table and store in DuckDB table."""
-        n_quantize = self.config.n_quantize
+        n_quantize = self.n_quantize
         q_positions = [i / n_quantize for i in range(n_quantize + 1)]
         features_cols = ', '.join(self.features)
 
@@ -851,12 +807,12 @@ class FinalPipeline(dummyLightning):
         # Use close feature quantiles (index 0)
         quantiles_tensor = self.quantiles.squeeze(-1)[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)
         target_quantized = torch.bucketize(y_returns_typed, quantiles_tensor)  # (batch, pred_len, num_horizons)
-        target_quantized = torch.clamp(target_quantized, 0, self.config.n_quantize - 1)
+        target_quantized = torch.clamp(target_quantized, 0, self.n_quantize - 1)
 
         losses['quantized'] = 0.0
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = F.cross_entropy(
-                pred_quantized[:, :, h_idx, :].reshape(-1, self.config.n_quantize),
+                pred_quantized[:, :, h_idx, :].reshape(-1, self.n_quantize),
                 target_quantized[:, :, h_idx].reshape(-1)
             )
             losses[f'quantized_{h_name}'] = h_loss
@@ -1026,6 +982,7 @@ class FinalPipelineConfig:
     debug_model: bool = False
 
     # DDP settings
+    world_size: int = 1
     ddp_backend: str = 'nccl'
     master_addr: str = 'localhost'
     master_port: str = '12355'
@@ -1154,9 +1111,9 @@ if __name__ == "__main__":
     config = parse_args_to_config(config)
     p = FinalPipeline(config)
 
-    p.setup_ddp()
+    p._init_distributed()
     if p.is_root():
-        print(f"{p.world_size} GPUs")\
+        print(f"{p.world_size} GPUs")
 
     if p.is_root():
         print("Preparing data...")
@@ -1169,7 +1126,3 @@ if __name__ == "__main__":
     if p.is_root():
         print("Starting training...")
     p.fit()
-    dist.destroy_process_group()
-    
-    if p.is_root():
-        breakpoint()

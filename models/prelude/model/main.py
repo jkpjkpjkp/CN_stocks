@@ -1,9 +1,12 @@
 import torch
+import torch.distributed as dist
 from torch.nn import Module
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 import mlflow
 import random
+import os
 from datetime import timedelta
 from rich.progress import Progress, TextColumn, BarColumn, ProgressColumn, Task
 from rich.text import Text
@@ -72,37 +75,48 @@ def create_progress_bar():
 class dummyLightning(Module):
     def __init__(self, config):
         super().__init__()
+        assert config
         self.config = config
-    
+
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)
         except AttributeError:
-            return getattr(self.config, name)
-
-    @property
-    def training_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=True,
-            drop_last=True,
-        )
-
-    @property
-    def validation_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            drop_last=True,
-        )
+            try:
+                return vars(self.config)[name]
+            except KeyError:
+                raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
     def optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, step / (1e-10 + self.warmup_steps)))
         return {'optimizer': optimizer, 'scheduler': scheduler}
+
+    def setup_ddp(self):
+        """Initialize DDP - always use DDP even for single GPU."""
+        if not dist.is_initialized():
+            self._init_distributed()
+        self.to(self.device)
+        return DDP(self, device_ids=[self.local_rank], output_device=self.local_rank)
+
+    def _init_distributed(self):
+        """Initialize distributed environment without DDP wrapper."""
+        self.rank = int(os.environ.get('RANK', 0))
+        self.world_size = int(os.environ.get('WORLD_SIZE', 1))
+        self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        torch.cuda.set_device(self.local_rank)
+        self.device = f'cuda:{self.local_rank}'
+
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend='nccl',
+                rank=self.rank,
+                world_size=self.world_size
+            )
+
+    def is_root(self):
+        return self.rank == 0
 
     def optimizer_step(self):
         self.optimizer.step()
@@ -136,7 +150,7 @@ class dummyLightning(Module):
                 device_type=self.device, dtype=torch.bfloat16
             )(torch.compile(self.forward))
 
-    def _iteration(self, dataloader, progress, epoch):
+    def _iteration(self, ddp_model, dataloader, progress, epoch):
         train = self.is_train
         num_epochs = self.epochs
         if train:
@@ -162,7 +176,7 @@ class dummyLightning(Module):
                 batch = batch.to(self.device)
 
             self.optimizer.zero_grad()
-            outputs = self.step(batch)
+            outputs = ddp_model.module.step(batch) if hasattr(ddp_model, 'module') else self.step(batch)
             loss = outputs['loss'] if isinstance(outputs, dict) else outputs
 
             if train:
@@ -184,7 +198,7 @@ class dummyLightning(Module):
 
     def fit(self):
         mlflow.set_experiment(self.__class__.__name__)
-        self.to(self.device)
+        ddp_model = self.setup_ddp()
         self.activate()
         torch.set_float32_matmul_precision('medium')
 
@@ -199,11 +213,11 @@ class dummyLightning(Module):
             for epoch in range(self.epochs):
                 self.prog_bar_metrics = {}
                 self.is_train = True
-                train_epoch_loss = self._iteration(td, progress, epoch)
+                train_epoch_loss = self._iteration(ddp_model, td, progress, epoch)
                 self.log('epoch_loss', train_epoch_loss)
                 self.prog_bar_metrics = {}
                 self.is_train = False
-                val_epoch_loss = self._iteration(vd, progress, epoch)
+                val_epoch_loss = self._iteration(ddp_model, vd, progress, epoch)
                 self.log('epoch_loss', val_epoch_loss)
 
                 if val_epoch_loss < best_val_loss:
@@ -211,6 +225,8 @@ class dummyLightning(Module):
                     self.save_checkpoint(f'./.checkpoints/{self.__class__.__name__}/_epoch={epoch}_step={self.global_step}_loss={val_epoch_loss:.4f}.pt', epoch, val_epoch_loss, train_epoch_loss)
 
                 progress.console.print(f"Epoch {epoch + 1}/{self.epochs} completed - Train Loss: {train_epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}")
+
+        dist.destroy_process_group()
 
     def log(self, name, value):
         name = ('train' if self.is_train else 'val') + '/' + name
