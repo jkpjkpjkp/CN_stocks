@@ -36,7 +36,7 @@ from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 import os
 
-from ..prelude.model import dummyLightning, TM
+from ..prelude.model import dummyLightning, dummyConfig, TM
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -817,7 +817,7 @@ class FinalPipeline(dummyLightning):
         """ pred: (b, l, num_horizons, num_quantiles)
           target: (b, l, num_horizons)
         """
-        quantiles = torch.tensor(self.quantiles, device=pred.device)
+        quantiles = torch.tensor(self.quantiles, dtype=pred.dtype, device=pred.device)
         quantiles = quantiles.unsqueeze(0).unsqueeze(0).unsqueeze(0)
 
         quantiles = quantiles.expand(pred.shape)
@@ -908,7 +908,7 @@ def parse_args_to_config(base_config):
 
 
 @dataclass
-class FinalPipelineConfig:
+class FinalPipelineConfig(dummyConfig):
     # Model
     embed_dim: int = 256
     hidden_dim: int = 256
@@ -984,16 +984,16 @@ class FinalPipelineConfig:
         self.num_horizons = len(self.horizons)
         self.num_quantiles = len(self.quantiles)
         self.pred_len = self.seq_len // 2
-
-        # Dataloader
+        
         self.batch_size = self.vram * 2 ** 19 // self.seq_len // self.num_layers // self.interim_dim
-        self.num_workers = self.num_workers or os.cpu_count()
 
         # DuckDB (in ../data)
         if self.db_path is None:
             db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
             self.db_path = str(Path(__file__).parent.parent.parent.parent / 'data' / db_name)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        super().__post_init__()
         
 
 
@@ -1017,8 +1017,6 @@ if __name__ == "__main__":
     p.prepare_data()
     assert len(p.train_dataset)
     assert len(p.val_dataset)
-
-    dist.barrier()
 
     if p.is_root():
         print("Starting training...")

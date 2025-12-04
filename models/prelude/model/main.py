@@ -10,6 +10,7 @@ import os
 from datetime import timedelta
 from rich.progress import Progress, TextColumn, BarColumn, ProgressColumn, Task
 from rich.text import Text
+from dataclasses import dataclass
 
 
 class BatchesProcessedColumn(ProgressColumn):
@@ -135,7 +136,8 @@ class dummyLightning(Module):
             dist.init_process_group(
                 backend='nccl',
                 rank=self.rank,
-                world_size=self.world_size
+                world_size=self.world_size,
+                device_id=torch.device(f'cuda:{self.local_rank}')
             )
 
     def is_root(self):
@@ -278,3 +280,10 @@ class dummyLightning(Module):
         model.load_state_dict(checkpoint['model_state_dict'])
         model.global_step = checkpoint['global_step']
         return model
+
+
+@dataclass
+class dummyConfig:
+    def __post_init__(self):
+        # Dataloader
+        self.num_workers = self.num_workers or os.cpu_count()

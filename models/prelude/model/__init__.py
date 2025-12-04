@@ -1,3 +1,2 @@
-from .main import dummyLightning
+from .main import dummyLightning, dummyConfig
 from .tm import TM
-from .config import transformerConfig
