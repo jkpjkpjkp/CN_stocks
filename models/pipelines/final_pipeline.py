@@ -987,7 +987,7 @@ class FinalPipelineConfig(dummyConfig):
         self.num_quantiles = len(self.quantiles)
         self.pred_len = self.seq_len // 2
         
-        self.batch_size = self.vram * 2 ** 19 // self.seq_len // self.num_layers // self.interim_dim
+        self.batch_size = self.vram * 2 ** 20 // self.seq_len // self.num_layers // self.interim_dim
 
         # DuckDB (in ../data)
         if self.db_path is None:
@@ -996,7 +996,7 @@ class FinalPipelineConfig(dummyConfig):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         
         super().__post_init__()
-        
+
 
 config = FinalPipelineConfig(
     shrink_model=True,
