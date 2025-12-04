@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 from torch.nn import Module
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 import mlflow
 import random
@@ -10,7 +10,6 @@ import os
 from datetime import timedelta
 from rich.progress import Progress, TextColumn, BarColumn, ProgressColumn, Task
 from rich.text import Text
-import time
 
 
 class BatchesProcessedColumn(ProgressColumn):
@@ -91,6 +90,32 @@ class dummyLightning(Module):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, step / (1e-10 + self.warmup_steps)))
         return {'optimizer': optimizer, 'scheduler': scheduler}
+
+    def get_dataloader(self, dataset, shuffle=False):
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True,
+            drop_last=not self.debug_data,
+        )
+        # When using DistributedSampler, shuffle must be False in DataLoader
+        return DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=not self.debug_data,
+        )
+
+    @property
+    def train_dataloader(self):
+        return self.get_dataloader(self.train_dataset, shuffle=True)
+
+    @property
+    def val_dataloader(self):
+        return self.get_dataloader(self.val_dataset, shuffle=False)
 
     def setup_ddp(self):
         """Initialize DDP - always use DDP even for single GPU."""

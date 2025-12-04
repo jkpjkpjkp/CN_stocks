@@ -59,21 +59,29 @@ class PriceHistoryDataset(Dataset):
         self.num_horizons = len(self.horizons)
         self.features = config.features
 
-        # Build index from DuckDB
+        # Load cumulative index for efficient indexing
         con = duckdb.connect(self.db_path, read_only=True)
         try:
-            # Get all (stock_id, start_idx) pairs from the index table
-            self.index = con.execute(f"""
-                SELECT stock_id, start_idx FROM {split}_index ORDER BY rowid
+            # Get (stock_id, cumsum) pairs - cumsum is exclusive end for each stock
+            result = con.execute(f"""
+                SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
             """).fetchall()
+            self.stock_ids = np.array([r[0] for r in result], dtype=np.int64)
+            self.cumsums = np.array([r[1] for r in result], dtype=np.int64)
+            self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
         finally:
             con.close()
 
     def __len__(self):
-        return len(self.index)
+        return self.total_samples
 
     def __getitem__(self, idx):
-        stock_id, start_idx = self.index[idx]
+        # Binary search to find which stock this index belongs to
+        stock_pos = np.searchsorted(self.cumsums, idx, side='right')
+        stock_id = int(self.stock_ids[stock_pos])
+        # Compute local offset within this stock
+        prev_cumsum = int(self.cumsums[stock_pos - 1]) if stock_pos > 0 else 0
+        start_idx = idx - prev_cumsum
         end_idx = start_idx + self.seq_len
 
         # Each worker gets its own connection
@@ -595,7 +603,7 @@ class FinalPipeline(dummyLightning):
         con.execute(f"""
             CREATE TABLE train_data AS
             SELECT
-                d.id AS stock_id,
+                CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
                 ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
                 {select_cols}
             FROM df_materialized d
@@ -608,7 +616,7 @@ class FinalPipeline(dummyLightning):
         con.execute(f"""
             CREATE TABLE val_data AS
             SELECT
-                d.id AS stock_id,
+                CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
                 ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
                 {select_cols}
             FROM df_materialized d
@@ -632,7 +640,7 @@ class FinalPipeline(dummyLightning):
         seq_len = self.seq_len
         max_horizon = max(self.horizons)
 
-        # Build train_index
+        # Build train_index with cumulative sums
         print("  Building train_index...")
         con.execute(f"""
             CREATE TABLE train_index AS
@@ -642,20 +650,19 @@ class FinalPipeline(dummyLightning):
                 GROUP BY stock_id
             ),
             valid_stocks AS (
-                SELECT stock_id, stock_len
-                FROM stock_lengths
-                WHERE stock_len > {seq_len} + {max_horizon}
-            ),
-            indices AS (
                 SELECT
                     stock_id,
-                    generate_series(0, stock_len - {seq_len} - {max_horizon} - 1) AS start_idx
-                FROM valid_stocks
+                    GREATEST(0, stock_len - {seq_len} - {max_horizon}) AS valid_samples
+                FROM stock_lengths
             )
-            SELECT stock_id, start_idx FROM indices
+            SELECT
+                stock_id,
+                SUM(valid_samples) OVER (ORDER BY stock_id) AS cumsum
+            FROM valid_stocks
+            WHERE valid_samples > 0
         """)
 
-        # Build val_index
+        # Build val_index with cumulative sums
         print("  Building val_index...")
         con.execute(f"""
             CREATE TABLE val_index AS
@@ -665,22 +672,21 @@ class FinalPipeline(dummyLightning):
                 GROUP BY stock_id
             ),
             valid_stocks AS (
-                SELECT stock_id, stock_len
-                FROM stock_lengths
-                WHERE stock_len > {seq_len} + {max_horizon}
-            ),
-            indices AS (
                 SELECT
                     stock_id,
-                    generate_series(0, stock_len - {seq_len} - {max_horizon} - 1) AS start_idx
-                FROM valid_stocks
+                    GREATEST(0, stock_len - {seq_len} - {max_horizon}) AS valid_samples
+                FROM stock_lengths
             )
-            SELECT stock_id, start_idx FROM indices
+            SELECT
+                stock_id,
+                SUM(valid_samples) OVER (ORDER BY stock_id) AS cumsum
+            FROM valid_stocks
+            WHERE valid_samples > 0
         """)
 
-        # Get counts
-        train_count = con.execute("SELECT COUNT(*) FROM train_index").fetchone()[0]
-        val_count = con.execute("SELECT COUNT(*) FROM val_index").fetchone()[0]
+        # Get counts (last cumsum is total samples)
+        train_count = con.execute("SELECT MAX(cumsum) FROM train_index").fetchone()[0] or 0
+        val_count = con.execute("SELECT MAX(cumsum) FROM val_index").fetchone()[0] or 0
         print(f"  Train samples: {train_count}, Val samples: {val_count}")
 
         # Persist in-memory database to disk
@@ -735,32 +741,6 @@ class FinalPipeline(dummyLightning):
                     "INSERT INTO quantiles VALUES (?, ?, ?)",
                     [f_idx, q_idx, float(quantile_val)]
                 )
-
-    def get_dataloader(self, dataset, shuffle=False):
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True,
-            drop_last=not self.debug_data,
-        )
-        # When using DistributedSampler, shuffle must be False in DataLoader
-        return DataLoader(
-            dataset,
-            sampler=sampler,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=not self.debug_data,
-        )
-
-    @property
-    def train_dataloader(self):
-        return self.get_dataloader(self.train_dataset, shuffle=True)
-
-    @property
-    def val_dataloader(self):
-        return self.get_dataloader(self.val_dataset, shuffle=False)
 
     def _compute_features_sql(self) -> str:
         """Return SQL to compute all feature types"""
