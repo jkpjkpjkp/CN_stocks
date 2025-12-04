@@ -456,9 +456,7 @@ class FinalPipeline(dummyLightning):
         return torch.cat(tensor_list, dim=0)
 
     def _get_db_path(self) -> Path:
-        """Get path to DuckDB database file in ../data"""
-        db_dir = Path(self.config.db_path).parent
-        db_dir.mkdir(parents=True, exist_ok=True)
+        Path(self.config.db_path).parent.mkdir(parents=True, exist_ok=True)
         return Path(self.config.db_path)
 
     def _check_db_ready(self) -> bool:
@@ -528,21 +526,13 @@ class FinalPipeline(dummyLightning):
         self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
 
     def _build_duckdb(self, parquet_path: Path, db_path: Path):
-        """Build DuckDB database with all preprocessed data.
-
-        Uses in-memory database during processing, then persists to disk at the end.
-        """
-        # Remove existing DB if present
         if db_path.exists():
             db_path.unlink()
 
         # Use in-memory database for faster processing
         con = duckdb.connect(':memory:')
-        con.execute("SET memory_limit='64GB'")
-        con.execute("SET preserve_insertion_order=false")
-        con.execute(f"SET threads={os.cpu_count()}")
+        con.execute(f"SET memory_limit='{self.ram_limit}GB'")
 
-        print("Step 1: Loading parquet and computing features...")
         con.execute(f"""
             CREATE VIEW raw_data AS
             SELECT * FROM read_parquet('{parquet_path}')
@@ -573,7 +563,7 @@ class FinalPipeline(dummyLightning):
 
         # Load or compute cutoff
         if cutoff_cache_path.exists():
-            cutoff = int(cutoff_cache_path.read_text().strip())
+            cutoff = int(float(cutoff_cache_path.read_text().strip()))
             print(f"  Loaded cached cutoff: {cutoff}")
         else:
             print("  Computing train/val cutoff (90th percentile of datetime)...")
@@ -748,17 +738,10 @@ class FinalPipeline(dummyLightning):
 
         # Persist in-memory database to disk
         print("Step 10: Persisting database to disk...")
-        con.execute(f"EXPORT DATABASE '{db_path.parent / 'export_tmp'}' (FORMAT PARQUET)")
+        con.execute(f"ATTACH '{db_path}' AS disk_db")
+        for table in ['train_data', 'val_data', 'train_index', 'val_index', 'quantiles']:
+            con.execute(f"CREATE TABLE disk_db.{table} AS SELECT * FROM {table}")
         con.close()
-
-        # Create the final on-disk database from exported data
-        disk_con = duckdb.connect(str(db_path))
-        disk_con.execute(f"IMPORT DATABASE '{db_path.parent / 'export_tmp'}'")
-        disk_con.close()
-
-        # Clean up temporary export directory
-        import shutil
-        shutil.rmtree(db_path.parent / 'export_tmp')
 
         print(f"DuckDB database built at {db_path}")
 
@@ -1078,6 +1061,8 @@ class FinalPipelineConfig:
     num_workers: int | None = None
     shrink_model: bool = False
     device: str = 'cuda'
+    
+    ram_limit: int = 368
 
     def __post_init__(self):
         # Handle shrink_model before other calculations
