@@ -35,40 +35,114 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 import os
+import multiprocessing as mp
+import tempfile
+import shutil
 
 from ..prelude.model import dummyLightning, dummyConfig, TM
 
 torch.autograd.set_detect_anomaly(True)
 
 
-class PriceHistoryDataset(Dataset):
-    """Dataset that fetches data directly from DuckDB on-disk storage."""
+def _persist_db_worker(temp_dir: str, db_path: str, tables: list):
+    """Worker function to persist database in subprocess.
 
-    def __init__(self, config, db_path: Path, split: str):
+    Args:
+        temp_dir: Directory containing temporary parquet files
+        db_path: Target database file path
+        tables: List of table names to persist
+    """
+    try:
+        print(f"[Subprocess] Starting database persistence to {db_path}")
+        temp_path = Path(temp_dir)
+
+        # Create new connection to disk database
+        con = duckdb.connect(str(db_path))
+
+        # Load each parquet file and create table
+        for table in tables:
+            parquet_path = temp_path / f"{table}.parquet"
+            con.execute(f"""
+                CREATE TABLE {table} AS
+                SELECT * FROM read_parquet('{parquet_path}')
+            """)
+            print(f"[Subprocess] Created table {table}")
+
+        con.close()
+
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir)
+        print(f"[Subprocess] Database persistence completed successfully")
+    except Exception as e:
+        print(f"[Subprocess] Error persisting database: {e}")
+        # Clean up temp dir even on error
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+
+class PriceHistoryDataset(Dataset):
+    """Dataset with in-memory prefetched data for maximum GPU utilization."""
+
+    def __init__(self, config, db_path: Path, split: str,
+                 prefetched_data: Optional[Dict] = None):
         """
         Args:
             config: FinalPipelineConfig
             db_path: Path to DuckDB database file
             split: 'train' or 'val'
+            prefetched_data: Optional dict with 'data', 'index' keys from _build_duckdb
         """
-        self.db_path = str(db_path)
         self.split = split
         self.seq_len = config.seq_len
         self.pred_len = config.pred_len
         self.horizons = config.horizons
         self.num_horizons = len(self.horizons)
         self.features = config.features
+        self.close_norm_idx = config.feat_idx['close_norm']
 
-        # Load cumulative index for efficient indexing
-        con = duckdb.connect(self.db_path, read_only=True)
+        if prefetched_data is not None:
+            # Use in-memory data directly (no disk I/O)
+            self._init_from_memory(prefetched_data)
+        else:
+            # Load from disk
+            self._init_from_disk(db_path)
+
+    def _init_from_memory(self, prefetched_data: Dict):
+        """Initialize from in-memory data (used when building DB)."""
+        # prefetched_data: {'data': {stock_id: np.array}, 'index': [(stock_id, cumsum)]}
+        self.stock_data = prefetched_data['data']  # Dict[int, np.ndarray]
+        index = prefetched_data['index']
+        self.stock_ids = np.array([r[0] for r in index], dtype=np.int64)
+        self.cumsums = np.array([r[1] for r in index], dtype=np.int64)
+        self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
+
+    def _init_from_disk(self, db_path: Path):
+        """Load all data into memory from DuckDB on disk."""
+        con = duckdb.connect(str(db_path), read_only=True)
         try:
-            # Get (stock_id, cumsum) pairs - cumsum is exclusive end for each stock
+            # Load index
             result = con.execute(f"""
-                SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
+                SELECT stock_id, cumsum FROM {self.split}_index ORDER BY cumsum
             """).fetchall()
             self.stock_ids = np.array([r[0] for r in result], dtype=np.int64)
             self.cumsums = np.array([r[1] for r in result], dtype=np.int64)
             self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
+
+            # Prefetch all data per stock into memory
+            features_cols = ', '.join(self.features)
+            self.stock_data = {}
+            for stock_id in self.stock_ids:
+                data = con.execute(f"""
+                    SELECT {features_cols}
+                    FROM {self.split}_data
+                    WHERE stock_id = ?
+                    ORDER BY row_idx
+                """, [int(stock_id)]).fetchnumpy()
+                self.stock_data[int(stock_id)] = np.column_stack(
+                    [data[f] for f in self.features]
+                ).astype(np.float32)
         finally:
             con.close()
 
@@ -84,37 +158,16 @@ class PriceHistoryDataset(Dataset):
         start_idx = idx - prev_cumsum
         end_idx = start_idx + self.seq_len
 
-        # Each worker gets its own connection
-        con = duckdb.connect(self.db_path, read_only=True)
-        try:
-            # Fetch features for this window
-            features_cols = ', '.join(self.features)
-            features_result = con.execute(f"""
-                SELECT {features_cols}
-                FROM {self.split}_data
-                WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
-                ORDER BY row_idx
-            """, [stock_id, start_idx, end_idx]).fetchnumpy()
+        # Direct memory access - no I/O
+        stock_arr = self.stock_data[stock_id]
+        features = stock_arr[start_idx:end_idx]
 
-            features = np.column_stack([features_result[f] for f in self.features]).astype(np.float32)
+        # Get prediction positions' targets (latter half)
+        target_start = start_idx + self.seq_len // 2
+        max_horizon = max(self.horizons)
+        target_end = target_start + self.pred_len + max_horizon
 
-            # Get prediction positions' targets (latter half)
-            target_start = start_idx + self.seq_len // 2
-            max_horizon = max(self.horizons)
-            target_end = target_start + self.pred_len + max_horizon
-
-            # Fetch close_norm for targets
-            targets_result = con.execute(f"""
-                SELECT row_idx, close_norm
-                FROM {self.split}_data
-                WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
-                ORDER BY row_idx
-            """, [stock_id, target_start, target_end]).fetchnumpy()
-
-            close_norm = targets_result['close_norm'].astype(np.float32)
-
-        finally:
-            con.close()
+        close_norm = stock_arr[target_start:target_end, self.close_norm_idx]
 
         # Build targets and return_targets
         targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
@@ -128,7 +181,7 @@ class PriceHistoryDataset(Dataset):
             return_targets[:, h_idx] = future_prices / current_prices
 
         return (
-            torch.from_numpy(features).float(),
+            torch.from_numpy(features.copy()).float(),
             torch.from_numpy(targets).float(),
             torch.from_numpy(return_targets).float(),
         )
@@ -392,12 +445,38 @@ class FinalPipeline(dummyLightning):
         path = Path(path)
 
         if self.is_root():
-            self._build_duckdb(path, db_path)
+            in_memory_data = self._build_duckdb(path, db_path)
+        else:
+            in_memory_data = None
 
-        self.encoder_quantiles = self._load_quantiles_from_db()
-        self.encoder.encoder_quantiles = self.encoder_quantiles
-        self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
-        self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
+        # Use in-memory data directly (disk persistence happening in background)
+        if self.is_root():
+            self.encoder_quantiles = torch.from_numpy(in_memory_data['quantiles']).float()
+            self.encoder.encoder_quantiles = self.encoder_quantiles
+            self.train_dataset = PriceHistoryDataset(
+                self.config, db_path, 'train',
+                prefetched_data=in_memory_data['train']
+            )
+            self.val_dataset = PriceHistoryDataset(
+                self.config, db_path, 'val',
+                prefetched_data=in_memory_data['val']
+            )
+        else:
+            # Non-root processes will need to wait for disk persistence or use shared data
+            # For now, let them wait and load from disk
+            import time
+            max_wait = 600  # 10 minutes max
+            wait_interval = 5
+            elapsed = 0
+            while not self._check_db_ready() and elapsed < max_wait:
+                time.sleep(wait_interval)
+                elapsed += wait_interval
+            if not self._check_db_ready():
+                raise RuntimeError(f"Database not ready after {max_wait}s")
+            self.encoder_quantiles = self._load_quantiles_from_db()
+            self.encoder.encoder_quantiles = self.encoder_quantiles
+            self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
+            self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
 
     def _build_duckdb(self, parquet_path: Path, db_path: Path):
         if db_path.exists():
@@ -431,7 +510,7 @@ class FinalPipeline(dummyLightning):
             stock_filter = ""
 
         # Load or compute cutoff
-        if cutoff_cache_path.exists():
+        if not self.no_cache and cutoff_cache_path.exists():
             cutoff = int(float(cutoff_cache_path.read_text().strip()))
             print(f"  Loaded cached cutoff: {cutoff}")
         else:
@@ -441,14 +520,15 @@ class FinalPipeline(dummyLightning):
                 FROM (SELECT datetime FROM raw_data USING SAMPLE 1000000)
             """).fetchone()[0]
             print(f"  Train/val cutoff timestamp: {cutoff}")
-            cutoff_cache_path.write_text(str(cutoff))
+            if not self.no_cache:
+                cutoff_cache_path.write_text(str(cutoff))
 
         # Compute stats
         con.execute(f"""
             CREATE VIEW df AS
             {self._compute_features_sql()}
         """)
-        if not self.debug_data and stats_cache_path.exists():
+        if not self.no_cache and not self.debug_data and stats_cache_path.exists():
             con.execute(f"""
                 CREATE TABLE stats AS
                 SELECT * FROM read_parquet('{stats_cache_path}')
@@ -471,12 +551,14 @@ class FinalPipeline(dummyLightning):
                 {"AND" if stock_filter else "WHERE"} epoch_ns(datetime) <= {cutoff}
                 GROUP BY id
             """)
-            # Only cache full stats
-            if not self.debug_data:
+            # Only cache full stats when not in no_cache mode
+            if not self.no_cache and not self.debug_data:
                 con.execute(f"""
                     COPY stats TO '{stats_cache_path}' (FORMAT PARQUET)
                 """)
                 print(f"  Cached stats to {stats_cache_path}")
+            # Always get stock_ids after computing stats
+            if stock_ids is None:
                 stock_ids = con.execute("SELECT id FROM stats ORDER BY id").fetchall()
                 stock_ids = [row[0] for row in stock_ids]
 
@@ -607,14 +689,78 @@ class FinalPipeline(dummyLightning):
         val_count = con.execute("SELECT MAX(cumsum) FROM val_index").fetchone()[0] or 0
         print(f"  Train samples: {train_count}, Val samples: {val_count}")
 
-        # Persist in-memory database to disk
-        print("Step 10: Persisting database to disk...")
-        con.execute(f"ATTACH '{db_path}' AS disk_db")
-        for table in ['train_data', 'val_data', 'train_index', 'val_index', 'quantiles']:
-            con.execute(f"CREATE TABLE disk_db.{table} AS SELECT * FROM {table}")
+        # Extract data from in-memory database for immediate use
+        print("Step 10a: Extracting data from in-memory database...")
+        in_memory_data = {}
+
+        # Extract quantiles
+        quantiles_result = con.execute("""
+            SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
+        """).fetchnumpy()
+        n_features = quantiles_result['feature_idx'].max() + 1
+        n_quantiles = quantiles_result['q_idx'].max() + 1
+        quantiles_array = np.zeros((n_quantiles, n_features), dtype=np.float32)
+        quantiles_array[quantiles_result['q_idx'], quantiles_result['feature_idx']] = quantiles_result['value']
+        in_memory_data['quantiles'] = quantiles_array
+
+        # Extract train and val data
+        features_cols = ', '.join(self.features)
+        for split in ['train', 'val']:
+            split_data = {}
+
+            # Get index
+            index_result = con.execute(f"""
+                SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
+            """).fetchall()
+            split_data['index'] = index_result
+
+            # Get stock IDs
+            stock_ids_in_split = [r[0] for r in index_result]
+
+            # Load all stock data
+            split_data['data'] = {}
+            for stock_id in stock_ids_in_split:
+                data = con.execute(f"""
+                    SELECT {features_cols}
+                    FROM {split}_data
+                    WHERE stock_id = ?
+                    ORDER BY row_idx
+                """, [int(stock_id)]).fetchnumpy()
+                split_data['data'][int(stock_id)] = np.column_stack(
+                    [data[f] for f in self.features]
+                ).astype(np.float32)
+
+            in_memory_data[split] = split_data
+
+        print("  In-memory data extracted")
+
+
+        # Persist in-memory database to disk in subprocess (non-blocking)
+        print("Step 10: Exporting tables for background persistence...")
+        temp_dir = tempfile.mkdtemp(prefix='duckdb_persist_')
+        tables = ['train_data', 'val_data', 'train_index', 'val_index', 'quantiles']
+
+        # Export tables to temporary parquet files
+        for table in tables:
+            parquet_path = Path(temp_dir) / f"{table}.parquet"
+            con.execute(f"COPY {table} TO '{parquet_path}' (FORMAT PARQUET)")
+            print(f"  Exported {table} to temp storage")
+
         con.close()
 
-        print(f"DuckDB database built at {db_path}")
+        # Start subprocess to persist to disk (non-blocking)
+        print(f"  Starting background process to persist to {db_path}")
+        process = mp.Process(
+            target=_persist_db_worker,
+            args=(temp_dir, str(db_path), tables),
+            daemon=True  # Dies with parent process
+        )
+        process.start()
+        print(f"  Database persistence running in background (PID: {process.pid})")
+
+        print(f"DuckDB in-memory processing complete, disk persistence ongoing in background")
+
+        return in_memory_data
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
         """Compute quantiles from train_data table and store in DuckDB table."""
@@ -944,6 +1090,7 @@ class FinalPipelineConfig(dummyConfig):
 
     debug_data: int | None = None
     debug_model: bool = False
+    no_cache: bool = False  # Skip cache files, force recalc in RAM
 
     # DDP settings
     world_size: int = 1
@@ -954,7 +1101,7 @@ class FinalPipelineConfig(dummyConfig):
     debug_ddp: bool = False
     num_workers: int | None = None
     shrink_model: bool = False
-    
+
     # Hardware
     device: str = 'cuda'
     vram: int = 80
@@ -986,7 +1133,7 @@ class FinalPipelineConfig(dummyConfig):
         self.num_horizons = len(self.horizons)
         self.num_quantiles = len(self.quantiles)
         self.pred_len = self.seq_len // 2
-        
+
         self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim
 
         # DuckDB (in ../data)
@@ -994,7 +1141,7 @@ class FinalPipelineConfig(dummyConfig):
             db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
             self.db_path = str(Path(__file__).parent.parent.parent.parent / 'data' / db_name)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        
+
         super().__post_init__()
 
 
