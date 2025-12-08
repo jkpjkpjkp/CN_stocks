@@ -27,14 +27,12 @@ All data storage uses on-disk DuckDB in ../data/pipeline.duckdb
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from torch import distributed as dist
+from torch.utils.data import Dataset
 import numpy as np
 import duckdb
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
-import os
 import multiprocessing as mp
 import tempfile
 import shutil
