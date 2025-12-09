@@ -499,13 +499,13 @@ class FinalPipeline(dummyLightning):
                 COALESCE(LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1day,
                 COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_2day,
                 -- Intra-minute relative features
-                COALESCE(close / NULLIF(open, 0), 1) AS close_open,
-                COALESCE(high / NULLIF(open, 0), 1) AS high_open,
-                COALESCE(low / NULLIF(open, 0), 1) AS low_open,
-                COALESCE(high / NULLIF(low, 0), 1) AS high_low
+                COALESCE(close / open, 1) AS close_open,
+                COALESCE(high / open, 1) AS high_open,
+                COALESCE(low / open, 1) AS low_open,
+                COALESCE(high / low, 1) AS high_low
             FROM raw_data
         """)
-        if not self.no_cache and not self.debug_data and stats_cache_path.exists():
+        if stats_cache_path.exists():
             con.execute(f"""
                 CREATE TABLE stats AS
                 SELECT * FROM read_parquet('{stats_cache_path}')
@@ -524,73 +524,51 @@ class FinalPipeline(dummyLightning):
                 WHERE epoch_ns(datetime) <= {cutoff}
                 GROUP BY id
             """)
-            if not self.no_cache and not self.debug_data:
-                con.execute(f"""
-                    COPY stats TO '{stats_cache_path}' (FORMAT PARQUET)
-                """)
-                print(f"  Cached stats to {stats_cache_path}")
+            con.execute(f"""
+                COPY stats TO '{stats_cache_path}' (FORMAT PARQUET)
+            """)
+            print(f"  Cached stats to {stats_cache_path}")
         
         stock_ids = [row[0] for row in con.execute("SELECT id FROM stats").fetchall()]
-        print(f"  Total stocks: {len(stock_ids)}")
+        print(f"  Num stocks: {len(stock_ids)}")
 
         print("Step 6: Create data tables...")
-        # Build SELECT columns: normalized features computed inline, direct features from df_split
-        def build_select_cols():
-            cols = []
-            for f in self.features:
-                if f == 'close_norm':
-                    cols.append('(d.close - s.mean_close) / (s.std_close + 1e-8) AS close_norm')
-                elif f == 'volume_norm':
-                    cols.append('(d.volume - s.mean_volume) / (s.std_volume + 1e-8) AS volume_norm')
-                else:
-                    cols.append(f'd.{f}')
-            return ',\n                    '.join(cols)
+        
+        
+        cols = []
+        for f in self.features:
+            if f == 'close_norm':
+                cols.append('(d.close - s.mean_close) / (s.std_close + 1e-8) AS close_norm')
+            elif f == 'volume_norm':
+                cols.append('(d.volume - s.mean_volume) / (s.std_volume + 1e-8) AS volume_norm')
+            else:
+                cols.append(f'd.{f}')
+        select_cols = ',\n  '.join(cols)
 
-        select_cols = build_select_cols()
-
-        # Build stock filter for debug mode
-        if self.debug_data:
-            stock_ids_str = ", ".join(f"'{s}'" for s in stock_ids)
-            stock_filter = f"WHERE id IN ({stock_ids_str})"
-        else:
-            stock_filter = ""
-
-        # First, materialize df with features (the expensive window function computation)
         print("  Materializing features (window functions)...")
         con.execute(f"""
             CREATE TABLE df_materialized AS
-            SELECT * FROM df {stock_filter}
+            SELECT * FROM df
         """)
 
-        print("  Building train_data...")
-        con.execute(f"""
-            CREATE TABLE train_data AS
-            SELECT
-                CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
-                ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
-                {select_cols}
-            FROM df_materialized d
-            LEFT JOIN stats s ON d.id = s.id
-            WHERE epoch_ns(d.datetime) <= {cutoff}
-        """)
+        def build1(split='train'):
+            print(f"  Building {split}_data...")
+            con.execute(f"""
+                CREATE TABLE {split}_data AS
+                SELECT
+                    CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
+                    ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
+                    {select_cols}
+                FROM df_materialized d
+                LEFT JOIN stats s ON d.id = s.id
+                WHERE epoch_ns(d.datetime) <= {cutoff}
+            """)
+        build1('train')
+        build1('val')
 
-        # Create val_data table directly
-        print("  Building val_data...")
-        con.execute(f"""
-            CREATE TABLE val_data AS
-            SELECT
-                CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
-                ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
-                {select_cols}
-            FROM df_materialized d
-            LEFT JOIN stats s ON d.id = s.id
-            WHERE epoch_ns(d.datetime) > {cutoff}
-        """)
-
-        # Drop materialized table to free memory
+        # Free up memory
         con.execute("DROP TABLE df_materialized")
 
-        # Create indexes for fast lookups
         print("Step 7: Creating indexes...")
         con.execute("CREATE INDEX train_data_idx ON train_data(stock_id, row_idx)")
         con.execute("CREATE INDEX val_data_idx ON val_data(stock_id, row_idx)")
@@ -603,54 +581,29 @@ class FinalPipeline(dummyLightning):
         seq_len = self.seq_len
         max_horizon = max(self.horizons)
 
-        # Build train_index with cumulative sums
-        print("  Building train_index...")
-        con.execute(f"""
-            CREATE TABLE train_index AS
-            WITH stock_lengths AS (
-                SELECT stock_id, MAX(row_idx) + 1 AS stock_len
-                FROM train_data
-                GROUP BY stock_id
-            ),
-            valid_stocks AS (
+        def build2(split='train'):
+            print(f"  Building {split}_index...")
+            con.execute(f"""
+                CREATE TABLE {split}_index AS
+                WITH stock_lengths AS (
+                    SELECT stock_id, MAX(row_idx) + 1 AS stock_len
+                    FROM {split}_data
+                    GROUP BY stock_id
+                ),
+                valid_stocks AS (
+                    SELECT
+                        stock_id,
+                        GREATEST(0, stock_len - {seq_len} - {max_horizon}) AS valid_samples
+                    FROM stock_lengths
+                )
                 SELECT
                     stock_id,
-                    GREATEST(0, stock_len - {seq_len} - {max_horizon}) AS valid_samples
-                FROM stock_lengths
-            )
-            SELECT
-                stock_id,
-                SUM(valid_samples) OVER (ORDER BY stock_id) AS cumsum
-            FROM valid_stocks
-            WHERE valid_samples > 0
-        """)
-
-        # Build val_index with cumulative sums
-        print("  Building val_index...")
-        con.execute(f"""
-            CREATE TABLE val_index AS
-            WITH stock_lengths AS (
-                SELECT stock_id, MAX(row_idx) + 1 AS stock_len
-                FROM val_data
-                GROUP BY stock_id
-            ),
-            valid_stocks AS (
-                SELECT
-                    stock_id,
-                    GREATEST(0, stock_len - {seq_len} - {max_horizon}) AS valid_samples
-                FROM stock_lengths
-            )
-            SELECT
-                stock_id,
-                SUM(valid_samples) OVER (ORDER BY stock_id) AS cumsum
-            FROM valid_stocks
-            WHERE valid_samples > 0
-        """)
-
-        # Get counts (last cumsum is total samples)
-        train_count = con.execute("SELECT MAX(cumsum) FROM train_index").fetchone()[0] or 0
-        val_count = con.execute("SELECT MAX(cumsum) FROM val_index").fetchone()[0] or 0
-        print(f"  Train samples: {train_count}, Val samples: {val_count}")
+                    SUM(valid_samples) OVER (ORDER BY stock_id) AS cumsum
+                FROM valid_stocks
+                WHERE valid_samples > 0
+            """)
+        build2('train')
+        build2('val')
 
         # Extract data from in-memory database for immediate use
         print("Step 10a: Extracting data from in-memory database...")
