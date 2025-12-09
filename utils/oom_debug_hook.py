@@ -8,6 +8,10 @@ Usage:
 
 Requirements:
     pip install psutil
+
+Notes:
+    - Tracks all code in the repo (excludes .venv and site-packages)
+    - DDP-aware: only rank 0 prints by default (set OOM_DBG_ALL_RANKS=1 to print from all)
 """
 
 import sys
@@ -15,6 +19,29 @@ import time
 import psutil
 import os
 import runpy
+
+
+def _find_repo_root(start_path):
+    """Find repo root by looking for .git directory."""
+    path = os.path.abspath(start_path)
+    while path != '/':
+        if os.path.isdir(os.path.join(path, '.git')):
+            return path
+        path = os.path.dirname(path)
+    return None
+
+
+def _is_repo_code(filename, repo_root):
+    """Check if file is in repo and not in .venv or site-packages."""
+    if repo_root is None:
+        return False
+    abs_path = os.path.abspath(filename)
+    if not abs_path.startswith(repo_root):
+        return False
+    # Exclude virtual environments and installed packages
+    rel_path = abs_path[len(repo_root):]
+    excluded = ('/.venv/', '/site-packages/', '/__pycache__/')
+    return not any(exc in rel_path for exc in excluded)
 
 
 def main():
@@ -43,35 +70,51 @@ def main():
             print(f"Error: File not found: {target_file}", file=sys.stderr)
             sys.exit(1)
 
+    # Find repo root from target file location
+    repo_root = _find_repo_root(target_file)
+    if repo_root is None:
+        print(f"Warning: Could not find repo root (.git), tracking only target file",
+              file=sys.stderr)
+
     # Setup state
-    seen_lines = set()
+    seen_lines = {}  # (filename, lineno) -> mem_mb at first execution
     process = psutil.Process()
     start_time = time.perf_counter()
-    target_file_abs = os.path.abspath(target_file)
 
     def trace_func(frame, event, arg):
         if event != 'line':
             return trace_func
 
-        filename = os.path.abspath(frame.f_code.co_filename)
+        filename = frame.f_code.co_filename
         lineno = frame.f_lineno
 
-        # Track only the target file
-        if filename != target_file_abs:
+        # Track all repo code (not in .venv)
+        if not _is_repo_code(filename, repo_root):
             return trace_func
 
         key = (filename, lineno)
         if key in seen_lines:
             return trace_func
 
-        seen_lines.add(key)
-
-        # Report
+        # Get memory before marking as seen
         mem_mb = process.memory_info().rss / (1024 * 1024)
         elapsed = time.perf_counter() - start_time
+        seen_lines[key] = mem_mb
 
-        print(f"[OOM_DBG] {os.path.basename(filename)}:{lineno:4d} | "
-              f"RAM: {mem_mb:8.1f} MB | Time: {elapsed:8.3f}s")
+        # DDP: only print from rank 0 unless OOM_DBG_ALL_RANKS is set
+        rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0)))
+        print_all = os.environ.get('OOM_DBG_ALL_RANKS', '0') == '1'
+
+        if rank == 0 or print_all:
+            # Show relative path from repo root for cleaner output
+            if repo_root:
+                rel_path = os.path.relpath(filename, repo_root)
+            else:
+                rel_path = os.path.basename(filename)
+
+            rank_prefix = f"[R{rank}]" if print_all else ""
+            print(f"[OOM_DBG]{rank_prefix} {rel_path}:{lineno:4d} | "
+                  f"RAM: {mem_mb:8.1f} MB | Time: {elapsed:8.3f}s")
 
         return trace_func
 
