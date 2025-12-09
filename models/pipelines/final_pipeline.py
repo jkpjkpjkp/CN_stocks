@@ -67,17 +67,9 @@ def _persist_db_worker(con, db_path: str, tables: list):
         
 
 class PriceHistoryDataset(Dataset):
-    """Dataset with in-memory prefetched data for maximum GPU utilization."""
+    """Dataset backed by in-memory DuckDB, materialized on access."""
 
-    def __init__(self, config, db_path: Path, split: str,
-                 prefetched_data: Optional[Dict] = None):
-        """
-        Args:
-            config: FinalPipelineConfig
-            db_path: Path to DuckDB database file
-            split: 'train' or 'val'
-            prefetched_data: Optional dict with 'data', 'index' keys from _build_duckdb
-        """
+    def __init__(self, config, split: str, con: duckdb.DuckDBPyConnection):
         self.split = split
         self.seq_len = config.seq_len
         self.pred_len = config.pred_len
@@ -85,50 +77,15 @@ class PriceHistoryDataset(Dataset):
         self.num_horizons = len(self.horizons)
         self.features = config.features
         self.close_norm_idx = config.feat_idx['close_norm']
+        self.con = con
 
-        if prefetched_data is not None:
-            # Use in-memory data directly (no disk I/O)
-            self._init_from_memory(prefetched_data)
-        else:
-            # Load from disk
-            self._init_from_disk(db_path)
-
-    def _init_from_memory(self, prefetched_data: Dict):
-        """Initialize from in-memory data (used when building DB)."""
-        # prefetched_data: {'data': {stock_id: np.array}, 'index': [(stock_id, cumsum)]}
-        self.stock_data = prefetched_data['data']  # Dict[int, np.ndarray]
-        index = prefetched_data['index']
-        self.stock_ids = np.array([r[0] for r in index], dtype=np.int64)
-        self.cumsums = np.array([r[1] for r in index], dtype=np.int64)
+        # Load just the index
+        result = con.execute(f"""
+            SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
+        """).fetchall()
+        self.stock_ids = np.array([r[0] for r in result], dtype=np.int64)
+        self.cumsums = np.array([r[1] for r in result], dtype=np.int64)
         self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
-
-    def _init_from_disk(self, db_path: Path):
-        """Load all data into memory from DuckDB on disk."""
-        con = duckdb.connect(str(db_path), read_only=True)
-        try:
-            # Load index
-            result = con.execute(f"""
-                SELECT stock_id, cumsum FROM {self.split}_index ORDER BY cumsum
-            """).fetchall()
-            self.stock_ids = np.array([r[0] for r in result], dtype=np.int64)
-            self.cumsums = np.array([r[1] for r in result], dtype=np.int64)
-            self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
-
-            # Prefetch all data per stock into memory
-            features_cols = ', '.join(self.features)
-            self.stock_data = {}
-            for stock_id in self.stock_ids:
-                data = con.execute(f"""
-                    SELECT {features_cols}
-                    FROM {self.split}_data
-                    WHERE stock_id = ?
-                    ORDER BY row_idx
-                """, [int(stock_id)]).fetchnumpy()
-                self.stock_data[int(stock_id)] = np.column_stack(
-                    [data[f] for f in self.features]
-                ).astype(np.float32)
-        finally:
-            con.close()
 
     def __len__(self):
         return self.total_samples
@@ -140,23 +97,29 @@ class PriceHistoryDataset(Dataset):
         # Compute local offset within this stock
         prev_cumsum = int(self.cumsums[stock_pos - 1]) if stock_pos > 0 else 0
         start_idx = idx - prev_cumsum
-        end_idx = start_idx + self.seq_len
 
-        # Direct memory access - no I/O
-        stock_arr = self.stock_data[stock_id]
-        features = stock_arr[start_idx:end_idx]
-
-        # Get prediction positions' targets (latter half)
-        target_start = start_idx + self.seq_len // 2
+        # Query the slice we need from DuckDB
         max_horizon = max(self.horizons)
+        target_start = start_idx + self.seq_len // 2
         target_end = target_start + self.pred_len + max_horizon
+        end_idx = max(start_idx + self.seq_len, target_end)
 
-        close_norm = stock_arr[target_start:target_end, self.close_norm_idx]
+        features_cols = ', '.join(self.features)
+        data = self.con.execute(f"""
+            SELECT {features_cols}
+            FROM {self.split}_data
+            WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
+            ORDER BY row_idx
+        """, [stock_id, start_idx, end_idx]).fetchnumpy()
+
+        stock_arr = np.column_stack([data[f] for f in self.features]).astype(np.float32)
+
+        features = stock_arr[:self.seq_len]
+        close_norm = stock_arr[self.seq_len // 2:, self.close_norm_idx]
 
         # Build targets and return_targets
         targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
         return_targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
-
         current_prices = close_norm[:self.pred_len]
 
         for h_idx, horizon in enumerate(self.horizons):
@@ -165,7 +128,7 @@ class PriceHistoryDataset(Dataset):
             return_targets[:, h_idx] = future_prices / current_prices
 
         return (
-            torch.from_numpy(features.copy()).float(),
+            torch.from_numpy(features).float(),
             torch.from_numpy(targets).float(),
             torch.from_numpy(return_targets).float(),
         )
@@ -389,23 +352,6 @@ class FinalPipeline(dummyLightning):
         finally:
             con.close()
 
-    def _load_quantiles_from_db(self) -> torch.Tensor:
-        """Load quantiles from DuckDB"""
-        db_path = self._get_db_path()
-        con = duckdb.connect(str(db_path), read_only=True)
-        try:
-            result = con.execute("""
-                SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
-            """).fetchnumpy()
-
-            n_features = result['feature_idx'].max() + 1
-            n_quantiles = result['q_idx'].max() + 1
-            quantiles = np.zeros((n_quantiles, n_features), dtype=np.float32)
-            quantiles[result['q_idx'], result['feature_idx']] = result['value']
-            return torch.from_numpy(quantiles).float()
-        finally:
-            con.close()
-
     def prepare_data(self, path: Optional[str] = None):
         """Prepare data using on-disk DuckDB storage."""
         db_path = self._get_db_path()
@@ -414,10 +360,11 @@ class FinalPipeline(dummyLightning):
         if not self.debug_data and self._check_db_ready():
             if self.is_root():
                 print(f"Loading from existing DuckDB: {db_path}")
-            self.encoder_quantiles = self._load_quantiles_from_db()
+            con = duckdb.connect(str(db_path), read_only=True)
+            self.encoder_quantiles = self._load_quantiles(con)
             self.encoder.encoder_quantiles = self.encoder_quantiles
-            self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
-            self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
+            self.train_dataset = PriceHistoryDataset(self.config, 'train', con)
+            self.val_dataset = PriceHistoryDataset(self.config, 'val', con)
             return
 
         # Need to build DB from scratch
@@ -429,25 +376,13 @@ class FinalPipeline(dummyLightning):
         path = Path(path)
 
         if self.is_root():
-            in_memory_data = self._build_duckdb(path, db_path)
-        else:
-            in_memory_data = None
-
-        # Use in-memory data directly (disk persistence happening in background)
-        if self.is_root():
-            self.encoder_quantiles = torch.from_numpy(in_memory_data['quantiles']).float()
+            con = self._build_duckdb(path, db_path)
+            self.encoder_quantiles = self._load_quantiles(con)
             self.encoder.encoder_quantiles = self.encoder_quantiles
-            self.train_dataset = PriceHistoryDataset(
-                self.config, db_path, 'train',
-                prefetched_data=in_memory_data['train']
-            )
-            self.val_dataset = PriceHistoryDataset(
-                self.config, db_path, 'val',
-                prefetched_data=in_memory_data['val']
-            )
+            self.train_dataset = PriceHistoryDataset(self.config, 'train', con)
+            self.val_dataset = PriceHistoryDataset(self.config, 'val', con)
         else:
-            # Non-root processes will need to wait for disk persistence or use shared data
-            # For now, let them wait and load from disk
+            # Non-root processes will need to wait for disk persistence
             import time
             max_wait = 600  # 10 minutes max
             wait_interval = 5
@@ -457,10 +392,22 @@ class FinalPipeline(dummyLightning):
                 elapsed += wait_interval
             if not self._check_db_ready():
                 raise RuntimeError(f"Database not ready after {max_wait}s")
-            self.encoder_quantiles = self._load_quantiles_from_db()
+            con = duckdb.connect(str(db_path), read_only=True)
+            self.encoder_quantiles = self._load_quantiles(con)
             self.encoder.encoder_quantiles = self.encoder_quantiles
-            self.train_dataset = PriceHistoryDataset(self.config, db_path, 'train')
-            self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
+            self.train_dataset = PriceHistoryDataset(self.config, 'train', con)
+            self.val_dataset = PriceHistoryDataset(self.config, 'val', con)
+
+    def _load_quantiles(self, con: duckdb.DuckDBPyConnection) -> torch.Tensor:
+        """Load quantiles from DuckDB connection."""
+        result = con.execute("""
+            SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
+        """).fetchnumpy()
+        n_features = result['feature_idx'].max() + 1
+        n_quantiles = result['q_idx'].max() + 1
+        quantiles = np.zeros((n_quantiles, n_features), dtype=np.float32)
+        quantiles[result['q_idx'], result['feature_idx']] = result['value']
+        return torch.from_numpy(quantiles).float()
 
     def _build_duckdb(self, parquet_path: Path, db_path: Path):
         con = duckdb.connect(':memory:')
@@ -605,49 +552,6 @@ class FinalPipeline(dummyLightning):
         build2('train')
         build2('val')
 
-        # Extract data from in-memory database for immediate use
-        print("Step 10a: Extracting data from in-memory database...")
-        in_memory_data = {}
-
-        # Extract quantiles
-        quantiles_result = con.execute("""
-            SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
-        """).fetchnumpy()
-        n_features = quantiles_result['feature_idx'].max() + 1
-        n_quantiles = quantiles_result['q_idx'].max() + 1
-        quantiles_array = np.zeros((n_quantiles, n_features), dtype=np.float32)
-        quantiles_array[quantiles_result['q_idx'], quantiles_result['feature_idx']] = quantiles_result['value']
-        in_memory_data['quantiles'] = quantiles_array
-
-        # Extract train and val data
-        features_cols = ', '.join(self.features)
-        for split in ['train', 'val']:
-            split_data = {}
-
-            # Get index
-            index_result = con.execute(f"""
-                SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
-            """).fetchall()
-            split_data['index'] = index_result
-
-            # Get stock IDs
-            stock_ids_in_split = [r[0] for r in index_result]
-
-            # Load all stock data
-            split_data['data'] = {}
-            for stock_id in stock_ids_in_split:
-                data = con.execute(f"""
-                    SELECT {features_cols}
-                    FROM {split}_data
-                    WHERE stock_id = ?
-                    ORDER BY row_idx
-                """, [int(stock_id)]).fetchnumpy()
-                split_data['data'][int(stock_id)] = np.column_stack(
-                    [data[f] for f in self.features]
-                ).astype(np.float32)
-
-            in_memory_data[split] = split_data
-
         print("Step 10: Persisting tables in background...")
         tables = ['train_data', 'val_data', 'train_index', 'val_index', 'quantiles']
         print(f"  Starting background process to persist to {db_path}")
@@ -659,7 +563,7 @@ class FinalPipeline(dummyLightning):
         process.start()
         print(f"  Database persistence running in background (PID: {process.pid})")
 
-        return in_memory_data
+        return con
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
         """Compute quantiles from train_data table and store in DuckDB table."""
@@ -748,7 +652,6 @@ class FinalPipeline(dummyLightning):
 
         losses['nll'] = 0.0
         for h_idx, h_name in enumerate(self.horizons):
-            # Full Gaussian NLL: 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y-μ)²/σ²
             nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
                             (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
             h_loss = nll.mean()
