@@ -42,7 +42,7 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 torch.autograd.set_detect_anomaly(True)
 
 
-def _persist_db_worker(temp_dir: str, db_path: str, tables: list):
+def _persist_db_worker(con, db_path: str, tables: list):
     """Worker function to persist database in subprocess.
 
     Args:
@@ -51,34 +51,20 @@ def _persist_db_worker(temp_dir: str, db_path: str, tables: list):
         tables: List of table names to persist
     """
     try:
+        
         print(f"[Subprocess] Starting database persistence to {db_path}")
-        temp_path = Path(temp_dir)
-
-        # Create new connection to disk database
-        con = duckdb.connect(str(db_path))
-
-        # Load each parquet file and create table
+        
+        # Export tables to temporary parquet files
         for table in tables:
-            parquet_path = temp_path / f"{table}.parquet"
-            con.execute(f"""
-                CREATE TABLE {table} AS
-                SELECT * FROM read_parquet('{parquet_path}')
-            """)
-            print(f"[Subprocess] Created table {table}")
+            parquet_path = Path(db_path) / f"{table}.parquet"
+            con.execute(f"COPY {table} TO '{parquet_path}' (FORMAT PARQUET)")
+            print(f"  Exported {table} to temp storage")
 
         con.close()
-
-        # Clean up temporary directory
-        shutil.rmtree(temp_dir)
         print(f"[Subprocess] Database persistence completed successfully")
     except Exception as e:
         print(f"[Subprocess] Error persisting database: {e}")
-        # Clean up temp dir even on error
-        try:
-            shutil.rmtree(temp_dir)
-        except:
-            pass
-
+        
 
 class PriceHistoryDataset(Dataset):
     """Dataset with in-memory prefetched data for maximum GPU utilization."""
@@ -489,14 +475,11 @@ class FinalPipeline(dummyLightning):
             SELECT * FROM read_parquet('{parquet_path}')
         """)
 
-        print("Step 2-4: Load cached cutoff and stats, or compute them...")
         stats_cache_path = db_path.parent / 'stats_cache.parquet'
         cutoff_cache_path = db_path.parent / 'cutoff_cache.txt'
 
-        # Get stock IDs first (needed for debug filtering)
         print("Step 2a: Get stock IDs to process...")
         if self.debug_data:
-            # Exploit sorted order: scan until we find debug_data distinct IDs
             stock_ids = con.execute(f"""
                 SELECT DISTINCT id FROM raw_data LIMIT {self.debug_data}
             """).fetchall()
@@ -504,36 +487,42 @@ class FinalPipeline(dummyLightning):
             stock_ids_str = ", ".join(f"'{s}'" for s in stock_ids)
             stock_filter = f"WHERE id IN ({stock_ids_str})"
         else:
-            stock_ids = None  # Will be set from stats table later
             stock_filter = ""
 
-        # Load or compute cutoff
-        if not self.no_cache and cutoff_cache_path.exists():
-            cutoff = int(float(cutoff_cache_path.read_text().strip()))
-            print(f"  Loaded cached cutoff: {cutoff}")
-        else:
+        if self.no_cache or not cutoff_cache_path.exists():
             print("  Computing train/val cutoff (90th percentile of datetime)...")
             cutoff = con.execute("""
                 SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
                 FROM (SELECT datetime FROM raw_data USING SAMPLE 1000000)
             """).fetchone()[0]
-            print(f"  Train/val cutoff timestamp: {cutoff}")
             if not self.no_cache:
                 cutoff_cache_path.write_text(str(cutoff))
-
-        # Compute stats
-        con.execute(f"""
+        else:
+            cutoff = int(float(cutoff_cache_path.read_text().strip()))
+        print(f"  Train/val cutoff timestamp: {cutoff}")
+        
+        con.execute("""
             CREATE VIEW df AS
-            {self._compute_features_sql()}
+            SELECT *,
+                -- Returns at different time scales (1min, 30min, 1day, 2days)
+                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_1min,
+                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_30min,
+                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1min,
+                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_30min,
+                COALESCE(LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1day,
+                COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_2day,
+                -- Intra-minute relative features
+                COALESCE(close / NULLIF(open, 0), 1) AS close_open,
+                COALESCE(high / NULLIF(open, 0), 1) AS high_open,
+                COALESCE(low / NULLIF(open, 0), 1) AS low_open,
+                COALESCE(high / NULLIF(low, 0), 1) AS high_low
+            FROM raw_data
         """)
         if not self.no_cache and not self.debug_data and stats_cache_path.exists():
             con.execute(f"""
                 CREATE TABLE stats AS
                 SELECT * FROM read_parquet('{stats_cache_path}')
             """)
-            print(f"  Loaded cached stats from {stats_cache_path}")
-            stock_ids = con.execute("SELECT id FROM stats ORDER BY id").fetchall()
-            stock_ids = [row[0] for row in stock_ids]
         else:
             print("  Computing per-stock normalization stats...")
             con.execute(f"""
@@ -549,24 +538,16 @@ class FinalPipeline(dummyLightning):
                 {"AND" if stock_filter else "WHERE"} epoch_ns(datetime) <= {cutoff}
                 GROUP BY id
             """)
-            # Only cache full stats when not in no_cache mode
             if not self.no_cache and not self.debug_data:
                 con.execute(f"""
                     COPY stats TO '{stats_cache_path}' (FORMAT PARQUET)
                 """)
                 print(f"  Cached stats to {stats_cache_path}")
-            # Always get stock_ids after computing stats
-            if stock_ids is None:
-                stock_ids = con.execute("SELECT id FROM stats ORDER BY id").fetchall()
-                stock_ids = [row[0] for row in stock_ids]
-
-        total_stocks = len(stock_ids)
-        print(f"  Total stocks: {total_stocks}")
+        
+        stock_ids = [row[0] for row in con.execute("SELECT id FROM stats").fetchall()]
+        print(f"  Total stocks: {len(stock_ids)}")
 
         print("Step 6: Create data tables...")
-        # Features that need normalization with per-stock stats
-        norm_features = {'close_norm', 'volume_norm'}
-
         # Build SELECT columns: normalized features computed inline, direct features from df_split
         def build_select_cols():
             cols = []
@@ -594,9 +575,7 @@ class FinalPipeline(dummyLightning):
             CREATE TABLE df_materialized AS
             SELECT * FROM df {stock_filter}
         """)
-        con.execute("CREATE INDEX df_mat_id_idx ON df_materialized(id)")
 
-        # Now train/val split and normalization is fast since features are pre-computed
         print("  Building train_data...")
         con.execute(f"""
             CREATE TABLE train_data AS
@@ -738,19 +717,12 @@ class FinalPipeline(dummyLightning):
         temp_dir = tempfile.mkdtemp(prefix='duckdb_persist_')
         tables = ['train_data', 'val_data', 'train_index', 'val_index', 'quantiles']
 
-        # Export tables to temporary parquet files
-        for table in tables:
-            parquet_path = Path(temp_dir) / f"{table}.parquet"
-            con.execute(f"COPY {table} TO '{parquet_path}' (FORMAT PARQUET)")
-            print(f"  Exported {table} to temp storage")
-
-        con.close()
 
         # Start subprocess to persist to disk (non-blocking)
         print(f"  Starting background process to persist to {db_path}")
         process = mp.Process(
             target=_persist_db_worker,
-            args=(temp_dir, str(db_path), tables),
+            args=(con, str(db_path), tables),
             daemon=True  # Dies with parent process
         )
         process.start()
@@ -803,26 +775,6 @@ class FinalPipeline(dummyLightning):
                     "INSERT INTO quantiles VALUES (?, ?, ?)",
                     [f_idx, q_idx, float(quantile_val)]
                 )
-
-    def _compute_features_sql(self) -> str:
-        """Return SQL to compute all feature types"""
-        return """
-            SELECT *,
-                -- Returns at different time scales (1min, 30min, 1day, 2days)
-                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_1min,
-                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_30min,
-                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1min,
-                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_30min,
-                COALESCE(LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1day,
-                COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_2day,
-                -- Intra-minute relative features
-                COALESCE(close / NULLIF(open, 0), 1) AS close_open,
-                COALESCE(high / NULLIF(open, 0), 1) AS high_open,
-                COALESCE(low / NULLIF(open, 0), 1) AS low_open,
-                COALESCE(high / NULLIF(low, 0), 1) AS high_low
-            FROM raw_data
-        """
-
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
