@@ -706,7 +706,6 @@ class FinalPipeline(dummyLightning):
             0.10 * losses['return_quantile']
         )
 
-        # Log aggregate losses with hierarchical grouping
         # Price prediction losses
         self.log('price_prediction/quantized', losses['quantized'])
         self.log('price_prediction/nll', losses['nll'])
