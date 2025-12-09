@@ -318,8 +318,6 @@ class MultiReadout(dummyLightning):
 
 
 class FinalPipeline(dummyLightning):
-    """Complete pipeline combining all components"""
-
     def __init__(self, config):
         super().__init__(config)
         self.encoder = MultiEncoder(config)
@@ -356,8 +354,7 @@ class FinalPipeline(dummyLightning):
         """Prepare data using on-disk DuckDB storage."""
         db_path = self._get_db_path()
 
-        # Check if DB already exists with required tables
-        if not self.debug_data and self._check_db_ready():
+        if self._check_db_ready():
             if self.is_root():
                 print(f"Loading from existing DuckDB: {db_path}")
             con = duckdb.connect(str(db_path), read_only=True)
