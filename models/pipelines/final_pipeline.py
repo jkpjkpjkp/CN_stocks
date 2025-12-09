@@ -463,11 +463,9 @@ class FinalPipeline(dummyLightning):
             self.val_dataset = PriceHistoryDataset(self.config, db_path, 'val')
 
     def _build_duckdb(self, parquet_path: Path, db_path: Path):
-        if db_path.exists():
-            db_path.unlink()
-
-        # Use in-memory database for faster processing
         con = duckdb.connect(':memory:')
+        con.execute("ATTACH ':memory:' AS compressed_db (COMPRESS)")
+        con.execute("USE compressed_db")
         con.execute(f"SET memory_limit='{self.ram}GB'")
 
         con.execute(f"""
@@ -477,17 +475,6 @@ class FinalPipeline(dummyLightning):
 
         stats_cache_path = db_path.parent / 'stats_cache.parquet'
         cutoff_cache_path = db_path.parent / 'cutoff_cache.txt'
-
-        print("Step 2a: Get stock IDs to process...")
-        if self.debug_data:
-            stock_ids = con.execute(f"""
-                SELECT DISTINCT id FROM raw_data LIMIT {self.debug_data}
-            """).fetchall()
-            stock_ids = [row[0] for row in stock_ids]
-            stock_ids_str = ", ".join(f"'{s}'" for s in stock_ids)
-            stock_filter = f"WHERE id IN ({stock_ids_str})"
-        else:
-            stock_filter = ""
 
         if self.no_cache or not cutoff_cache_path.exists():
             print("  Computing train/val cutoff (90th percentile of datetime)...")
@@ -534,8 +521,7 @@ class FinalPipeline(dummyLightning):
                     AVG(volume) AS mean_volume,
                     STDDEV(volume) AS std_volume
                 FROM raw_data
-                {stock_filter}
-                {"AND" if stock_filter else "WHERE"} epoch_ns(datetime) <= {cutoff}
+                WHERE epoch_ns(datetime) <= {cutoff}
                 GROUP BY id
             """)
             if not self.no_cache and not self.debug_data:
@@ -553,9 +539,9 @@ class FinalPipeline(dummyLightning):
             cols = []
             for f in self.features:
                 if f == 'close_norm':
-                    cols.append('(d.close - COALESCE(s.mean_close, 0)) / (COALESCE(s.std_close, 1e-8) + 1e-8) AS close_norm')
+                    cols.append('(d.close - s.mean_close) / (s.std_close + 1e-8) AS close_norm')
                 elif f == 'volume_norm':
-                    cols.append('(d.volume - COALESCE(s.mean_volume, 0)) / (COALESCE(s.std_volume, 1e-8) + 1e-8) AS volume_norm')
+                    cols.append('(d.volume - s.mean_volume) / (s.std_volume + 1e-8) AS volume_norm')
                 else:
                     cols.append(f'd.{f}')
             return ',\n                    '.join(cols)
@@ -709,16 +695,8 @@ class FinalPipeline(dummyLightning):
 
             in_memory_data[split] = split_data
 
-        print("  In-memory data extracted")
-
-
-        # Persist in-memory database to disk in subprocess (non-blocking)
-        print("Step 10: Exporting tables for background persistence...")
-        temp_dir = tempfile.mkdtemp(prefix='duckdb_persist_')
+        print("Step 10: Persisting tables in background...")
         tables = ['train_data', 'val_data', 'train_index', 'val_index', 'quantiles']
-
-
-        # Start subprocess to persist to disk (non-blocking)
         print(f"  Starting background process to persist to {db_path}")
         process = mp.Process(
             target=_persist_db_worker,
@@ -727,8 +705,6 @@ class FinalPipeline(dummyLightning):
         )
         process.start()
         print(f"  Database persistence running in background (PID: {process.pid})")
-
-        print(f"DuckDB in-memory processing complete, disk persistence ongoing in background")
 
         return in_memory_data
 
