@@ -33,38 +33,11 @@ import duckdb
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
-import multiprocessing as mp
-import tempfile
-import shutil
 
 from ..prelude.model import dummyLightning, dummyConfig, TM
 
 torch.autograd.set_detect_anomaly(True)
 
-
-def _persist_db_worker(con, db_path: str, tables: list):
-    """Worker function to persist database in subprocess.
-
-    Args:
-        temp_dir: Directory containing temporary parquet files
-        db_path: Target database file path
-        tables: List of table names to persist
-    """
-    try:
-        
-        print(f"[Subprocess] Starting database persistence to {db_path}")
-        
-        # Export tables to temporary parquet files
-        for table in tables:
-            parquet_path = Path(db_path) / f"{table}.parquet"
-            con.execute(f"COPY {table} TO '{parquet_path}' (FORMAT PARQUET)")
-            print(f"  Exported {table} to temp storage")
-
-        con.close()
-        print(f"[Subprocess] Database persistence completed successfully")
-    except Exception as e:
-        print(f"[Subprocess] Error persisting database: {e}")
-        
 
 class PriceHistoryDataset(Dataset):
     """Dataset backed by in-memory DuckDB, materialized on access."""
@@ -407,9 +380,8 @@ class FinalPipeline(dummyLightning):
         return torch.from_numpy(quantiles).float()
 
     def _build_duckdb(self, parquet_path: Path, db_path: Path):
-        con = duckdb.connect(':memory:')
-        con.execute("ATTACH ':memory:' AS compressed_db (COMPRESS)")
-        con.execute("USE compressed_db")
+        # Build directly into db_path (in /dev/shm) - persists across runs
+        con = duckdb.connect(str(db_path))
         con.execute(f"SET memory_limit='{self.ram}GB'")
 
         con.execute(f"""
@@ -417,8 +389,8 @@ class FinalPipeline(dummyLightning):
             SELECT * FROM read_parquet('{parquet_path}')
         """)
 
-        stats_cache_path = db_path.parent / 'stats_cache.parquet'
-        cutoff_cache_path = db_path.parent / 'cutoff_cache.txt'
+        # Only cache the cutoff value (tiny file)
+        cutoff_cache_path = Path('/dev/shm') / 'pipeline_cutoff.txt'
 
         if self.no_cache or not cutoff_cache_path.exists():
             print("  Computing train/val cutoff (90th percentile of datetime)...")
@@ -431,7 +403,7 @@ class FinalPipeline(dummyLightning):
         else:
             cutoff = int(float(cutoff_cache_path.read_text().strip()))
         print(f"  Train/val cutoff timestamp: {cutoff}")
-        
+
         con.execute("""
             CREATE VIEW df AS
             SELECT *,
@@ -449,29 +421,20 @@ class FinalPipeline(dummyLightning):
                 COALESCE(high / low, 1) AS high_low
             FROM raw_data
         """)
-        if stats_cache_path.exists():
-            con.execute(f"""
-                CREATE TABLE stats AS
-                SELECT * FROM read_parquet('{stats_cache_path}')
-            """)
-        else:
-            print("  Computing per-stock normalization stats...")
-            con.execute(f"""
-                CREATE TABLE stats AS
-                SELECT
-                    id,
-                    AVG(close) AS mean_close,
-                    STDDEV(close) AS std_close,
-                    AVG(volume) AS mean_volume,
-                    STDDEV(volume) AS std_volume
-                FROM raw_data
-                WHERE epoch_ns(datetime) <= {cutoff}
-                GROUP BY id
-            """)
-            con.execute(f"""
-                COPY stats TO '{stats_cache_path}' (FORMAT PARQUET)
-            """)
-            print(f"  Cached stats to {stats_cache_path}")
+
+        print("  Computing per-stock normalization stats...")
+        con.execute(f"""
+            CREATE TABLE stats AS
+            SELECT
+                id,
+                AVG(close) AS mean_close,
+                STDDEV(close) AS std_close,
+                AVG(volume) AS mean_volume,
+                STDDEV(volume) AS std_volume
+            FROM raw_data
+            WHERE epoch_ns(datetime) <= {cutoff}
+            GROUP BY id
+        """)
         
         stock_ids = [row[0] for row in con.execute("SELECT id FROM stats").fetchall()]
         print(f"  Num stocks: {len(stock_ids)}")
@@ -549,17 +512,7 @@ class FinalPipeline(dummyLightning):
         build2('train')
         build2('val')
 
-        print("Step 10: Persisting tables in background...")
-        tables = ['train_data', 'val_data', 'train_index', 'val_index', 'quantiles']
-        print(f"  Starting background process to persist to {db_path}")
-        process = mp.Process(
-            target=_persist_db_worker,
-            args=(con, str(db_path), tables),
-            daemon=True  # Dies with parent process
-        )
-        process.start()
-        print(f"  Database persistence running in background (PID: {process.pid})")
-
+        print("Database build complete in /dev/shm")
         return con
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
@@ -914,10 +867,10 @@ class FinalPipelineConfig(dummyConfig):
 
         self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim
 
-        # DuckDB (in ../data)
+        # DuckDB - use /dev/shm for faster access and to avoid OOM
         if self.db_path is None:
             db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
-            self.db_path = str(Path(__file__).parent.parent.parent.parent / 'data' / db_name)
+            self.db_path = str(Path('/dev/shm') / db_name)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
         super().__post_init__()
