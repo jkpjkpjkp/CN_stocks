@@ -343,7 +343,8 @@ class FinalPipeline(dummyLightning):
 
         if path is None:
             path = Path.home() / 'h' / 'data' / 'a_1min.pq'
-        path = Path(path)
+        else:
+            path = Path(path)
 
         if self.is_root():
             con = self._build_duckdb(path, db_path)
@@ -407,18 +408,11 @@ class FinalPipeline(dummyLightning):
         con.execute("""
             CREATE VIEW df AS
             SELECT *,
-                -- Returns at different time scales (1min, 30min, 1day, 2days)
-                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_1min,
+                -- Returns at different time scales (30min, 1day, 2days) - expensive window functions
                 COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_30min,
-                COALESCE(LEAD(close, 1) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1min,
                 COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_30min,
                 COALESCE(LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1day,
-                COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_2day,
-                -- Intra-minute relative features
-                COALESCE(close / open, 1) AS close_open,
-                COALESCE(high / open, 1) AS high_open,
-                COALESCE(low / open, 1) AS low_open,
-                COALESCE(high / low, 1) AS high_low
+                COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_2day
             FROM raw_data
         """)
 
@@ -440,10 +434,10 @@ class FinalPipeline(dummyLightning):
         print(f"  Num stocks: {len(stock_ids)}")
 
         print("Step 6: Create data tables...")
-        
-        
+
+
         cols = []
-        for f in self.features:
+        for f in self.db_features:
             if f == 'close_norm':
                 cols.append('(d.close - s.mean_close) / (s.std_close + 1e-8) AS close_norm')
             elif f == 'volume_norm':
@@ -811,9 +805,14 @@ class FinalPipelineConfig(dummyConfig):
     max_cent_abs: int = 64
     db_path: str | None = None  # Path to DuckDB database file
 
-    features: tuple = ('close', 'close_norm', 'delta_1min', 'delta_30min',
-                       'ret_1min', 'ret_30min', 'ret_1day',
-                       'ret_2day', 'close_open', 'high_open',
+    # Features stored in DB (expensive to compute or raw)
+    db_features: tuple = ('open', 'high', 'low', 'close', 'close_norm',
+                          'delta_30min', 'ret_30min', 'ret_1day', 'ret_2day',
+                          'volume', 'volume_norm')
+    # All features (including cheap ones computed in getitem)
+    features: tuple = ('open', 'high', 'low', 'close', 'close_norm',
+                       'delta_1min', 'delta_30min', 'ret_1min', 'ret_30min',
+                       'ret_1day', 'ret_2day', 'close_open', 'high_open',
                        'low_open', 'high_low', 'volume', 'volume_norm')
     cent_feats: tuple = ('delta_1min', 'delta_30min')
     horizons: tuple = (1, 30, 240, 480)
