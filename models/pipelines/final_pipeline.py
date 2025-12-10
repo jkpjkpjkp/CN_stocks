@@ -49,6 +49,7 @@ class PriceHistoryDataset(Dataset):
         self.horizons = config.horizons
         self.num_horizons = len(self.horizons)
         self.features = config.features
+        self.db_features = config.db_features
         self.close_norm_idx = config.feat_idx['close_norm']
         self.con = con
 
@@ -59,6 +60,14 @@ class PriceHistoryDataset(Dataset):
         self.stock_ids = np.array([r[0] for r in result], dtype=np.int64)
         self.cumsums = np.array([r[1] for r in result], dtype=np.int64)
         self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
+
+        # Load stats for normalization (stock_id -> (mean_close, std_close, mean_vol, std_vol))
+        stats_result = con.execute("""
+            SELECT CAST(SUBSTR(id, 1, 6) AS INTEGER) as stock_id,
+                   mean_close, std_close, mean_volume, std_volume
+            FROM stats
+        """).fetchall()
+        self.stats = {r[0]: (r[1], r[2], r[3], r[4]) for r in stats_result}
 
     def __len__(self):
         return self.total_samples
@@ -77,18 +86,51 @@ class PriceHistoryDataset(Dataset):
         target_end = target_start + self.pred_len + max_horizon
         end_idx = max(start_idx + self.seq_len, target_end)
 
-        features_cols = ', '.join(self.features)
+        db_features_cols = ', '.join(self.db_features)
         data = self.con.execute(f"""
-            SELECT {features_cols}
+            SELECT {db_features_cols}
             FROM {self.split}_data
             WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
             ORDER BY row_idx
         """, [stock_id, start_idx, end_idx]).fetchnumpy()
 
-        stock_arr = np.column_stack([data[f] for f in self.features]).astype(np.float32)
+        # Get stats for normalization
+        mean_close, std_close, mean_vol, std_vol = self.stats.get(
+            stock_id, (0.0, 1.0, 0.0, 1.0))
 
-        features = stock_arr[:self.seq_len]
-        close_norm = stock_arr[self.seq_len // 2:, self.close_norm_idx]
+        # Build all features array
+        n_rows = len(data['close'])
+        all_features = np.zeros((n_rows, len(self.features)), dtype=np.float32)
+
+        # Map db_features to their positions
+        db_feat_map = {f: i for i, f in enumerate(self.db_features)}
+
+        for feat_idx, feat in enumerate(self.features):
+            if feat in db_feat_map:
+                all_features[:, feat_idx] = data[feat]
+            elif feat == 'close_norm':
+                all_features[:, feat_idx] = (data['close'] - mean_close) / (std_close + 1e-8)
+            elif feat == 'volume_norm':
+                all_features[:, feat_idx] = (data['volume'] - mean_vol) / (std_vol + 1e-8)
+            elif feat == 'delta_1min':
+                # close[t+1] - close[t], pad last with 0
+                close = data['close']
+                all_features[:-1, feat_idx] = close[1:] - close[:-1]
+            elif feat == 'ret_1min':
+                # close[t+1] / close[t] - 1, pad last with 0
+                close = data['close']
+                all_features[:-1, feat_idx] = close[1:] / (close[:-1] + 1e-8) - 1
+            elif feat == 'close_open':
+                all_features[:, feat_idx] = data['close'] / (data['open'] + 1e-8)
+            elif feat == 'high_open':
+                all_features[:, feat_idx] = data['high'] / (data['open'] + 1e-8)
+            elif feat == 'low_open':
+                all_features[:, feat_idx] = data['low'] / (data['open'] + 1e-8)
+            elif feat == 'high_low':
+                all_features[:, feat_idx] = data['high'] / (data['low'] + 1e-8)
+
+        features = all_features[:self.seq_len]
+        close_norm = all_features[self.seq_len // 2:, self.close_norm_idx]
 
         # Build targets and return_targets
         targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
@@ -98,7 +140,7 @@ class PriceHistoryDataset(Dataset):
         for h_idx, horizon in enumerate(self.horizons):
             future_prices = close_norm[horizon:horizon + self.pred_len]
             targets[:, h_idx] = future_prices
-            return_targets[:, h_idx] = future_prices / current_prices
+            return_targets[:, h_idx] = future_prices / (current_prices + 1e-8)
 
         return (
             torch.from_numpy(features).float(),
@@ -435,16 +477,7 @@ class FinalPipeline(dummyLightning):
 
         print("Step 6: Create data tables...")
 
-
-        cols = []
-        for f in self.db_features:
-            if f == 'close_norm':
-                cols.append('(d.close - s.mean_close) / (s.std_close + 1e-8) AS close_norm')
-            elif f == 'volume_norm':
-                cols.append('(d.volume - s.mean_volume) / (s.std_volume + 1e-8) AS volume_norm')
-            else:
-                cols.append(f'd.{f}')
-        select_cols = ',\n  '.join(cols)
+        select_cols = ',\n  '.join(f'd.{f}' for f in self.db_features)
 
         print("  Materializing features (window functions)...")
         con.execute(f"""
@@ -455,14 +488,13 @@ class FinalPipeline(dummyLightning):
         def build1(split='train'):
             print(f"  Building {split}_data...")
             con.execute(f"""
-                CREATE TABLE {split}_data AS
+                CREATE VIEW {split}_data AS
                 SELECT
                     CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
                     ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
                     {select_cols}
                 FROM df_materialized d
-                LEFT JOIN stats s ON d.id = s.id
-                WHERE epoch_ns(d.datetime) <= {cutoff}
+                WHERE epoch_ns(d.datetime) {'<=' if split == 'train' else '>'} {cutoff}
             """)
         build1('train')
         build1('val')
@@ -510,17 +542,45 @@ class FinalPipeline(dummyLightning):
         return con
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
-        """Compute quantiles from train_data table and store in DuckDB table."""
+        """Compute quantiles from train_data table and store in DuckDB table.
+
+        Quantiles are computed for all features including derived ones.
+        """
         n_quantize = self.n_quantize
         q_positions = [i / n_quantize for i in range(n_quantize + 1)]
-        features_cols = ', '.join(self.features)
+        db_features_cols = ', '.join(self.db_features)
 
         # Sample rows from the already-created train_data table
         sampled = con.execute(f"""
-            SELECT {features_cols}
+            SELECT {db_features_cols}
             FROM train_data
             USING SAMPLE {sample_size}
         """).fetchnumpy()
+
+        # Also need stats for normalization
+        stats_result = con.execute("""
+            SELECT AVG(mean_close), AVG(std_close), AVG(mean_volume), AVG(std_volume)
+            FROM stats
+        """).fetchone()
+        avg_mean_close, avg_std_close, avg_mean_vol, avg_std_vol = stats_result
+
+        # Compute derived features for quantile estimation
+        close = sampled['close']
+        open_price = sampled['open']
+        high = sampled['high']
+        low = sampled['low']
+        volume = sampled['volume']
+
+        derived = {
+            'close_norm': (close - avg_mean_close) / (avg_std_close + 1e-8),
+            'volume_norm': (volume - avg_mean_vol) / (avg_std_vol + 1e-8),
+            'delta_1min': np.diff(close, prepend=close[0]),
+            'ret_1min': np.diff(close, prepend=close[0]) / (np.concatenate([[close[0]], close[:-1]]) + 1e-8),
+            'close_open': close / (open_price + 1e-8),
+            'high_open': high / (open_price + 1e-8),
+            'low_open': low / (open_price + 1e-8),
+            'high_low': high / (low + 1e-8),
+        }
 
         # Create quantiles table
         con.execute("""
@@ -534,7 +594,10 @@ class FinalPipeline(dummyLightning):
 
         # Compute and insert quantiles for each feature
         for f_idx, col in enumerate(self.features):
-            col_data = np.sort(sampled[col])
+            if col in sampled:
+                col_data = np.sort(sampled[col])
+            else:
+                col_data = np.sort(derived[col])
             n = len(col_data)
 
             for q_idx, q in enumerate(q_positions):
@@ -805,10 +868,10 @@ class FinalPipelineConfig(dummyConfig):
     max_cent_abs: int = 64
     db_path: str | None = None  # Path to DuckDB database file
 
-    # Features stored in DB (expensive to compute or raw)
-    db_features: tuple = ('open', 'high', 'low', 'close', 'close_norm',
+    # Features stored in DB (raw OHLCV + expensive window functions)
+    db_features: tuple = ('open', 'high', 'low', 'close',
                           'delta_30min', 'ret_30min', 'ret_1day', 'ret_2day',
-                          'volume', 'volume_norm')
+                          'volume')
     # All features (including cheap ones computed in getitem)
     features: tuple = ('open', 'high', 'low', 'close', 'close_norm',
                        'delta_1min', 'delta_30min', 'ret_1min', 'ret_30min',
