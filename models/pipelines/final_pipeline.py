@@ -422,7 +422,7 @@ class FinalPipeline(dummyLightning):
         quantiles[result['q_idx'], result['feature_idx']] = result['value']
         return torch.from_numpy(quantiles).float()
 
-    def _build_duckdb(self, parquet_path: Path, db_path: Path):
+    def create_db(self, parquet_path: Path, db_path: Path):
         # Build directly into db_path (in /dev/shm) - persists across runs
         con = duckdb.connect(str(db_path))
         con.execute(f"SET memory_limit='{self.ram}GB'")
@@ -471,7 +471,7 @@ class FinalPipeline(dummyLightning):
             WHERE epoch_ns(datetime) <= {cutoff}
             GROUP BY id
         """)
-        
+
         stock_ids = [row[0] for row in con.execute("SELECT id FROM stats").fetchall()]
         print(f"  Num stocks: {len(stock_ids)}")
 
@@ -488,7 +488,7 @@ class FinalPipeline(dummyLightning):
         def build1(split='train'):
             print(f"  Building {split}_data...")
             con.execute(f"""
-                CREATE VIEW {split}_data AS
+                CREATE TABLE {split}_data AS
                 SELECT
                     CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
                     ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
@@ -505,7 +505,9 @@ class FinalPipeline(dummyLightning):
         print("Step 7: Creating indexes...")
         con.execute("CREATE INDEX train_data_idx ON train_data(stock_id, row_idx)")
         con.execute("CREATE INDEX val_data_idx ON val_data(stock_id, row_idx)")
+        con.close()
 
+    def _compute_index(self, db_path: Path):
         print("Step 8: Compute and store quantiles from train_data...")
         sample_size = 10000 if self.debug_data else 1000000
         self._compute_and_store_quantiles(con, sample_size)
@@ -526,7 +528,7 @@ class FinalPipeline(dummyLightning):
                 valid_stocks AS (
                     SELECT
                         stock_id,
-                        GREATEST(0, stock_len - {seq_len} - {max_horizon}) AS valid_samples
+                        stock_len - {seq_len} - {max_horizon} AS valid_samples
                     FROM stock_lengths
                 )
                 SELECT
@@ -542,10 +544,6 @@ class FinalPipeline(dummyLightning):
         return con
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
-        """Compute quantiles from train_data table and store in DuckDB table.
-
-        Quantiles are computed for all features including derived ones.
-        """
         n_quantize = self.n_quantize
         q_positions = [i / n_quantize for i in range(n_quantize + 1)]
         db_features_cols = ', '.join(self.db_features)
@@ -660,7 +658,7 @@ class FinalPipeline(dummyLightning):
         losses['nll'] = 0.0
         for h_idx, h_name in enumerate(self.horizons):
             nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
-                            (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
+                         (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
             h_loss = nll.mean()
             losses[f'nll_{h_name}'] = h_loss
             losses['nll'] += h_loss / len(self.horizons)
