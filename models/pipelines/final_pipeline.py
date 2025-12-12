@@ -21,8 +21,6 @@
 5. Multiple prediction horizons:
    - 1min, 30min, 1day, 2day ahead
    - TODO: Next day's OHLC
-
-All data storage uses on-disk DuckDB in ../data/pipeline.duckdb
 """
 import torch
 from torch import nn
@@ -35,8 +33,6 @@ from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 
 from ..prelude.model import dummyLightning, dummyConfig, TM
-
-torch.autograd.set_detect_anomaly(True)
 
 
 class PriceHistoryDataset(Dataset):
@@ -147,7 +143,6 @@ class PriceHistoryDataset(Dataset):
             torch.from_numpy(targets).float(),
             torch.from_numpy(return_targets).float(),
         )
-
 
 
 class QuantizeEncoder(dummyLightning):
@@ -389,7 +384,7 @@ class FinalPipeline(dummyLightning):
             path = Path(path)
 
         if self.is_root():
-            con = self._build_duckdb(path, db_path)
+            con = self.create_db(path, db_path)
             self.encoder_quantiles = self._load_quantiles(con)
             self.encoder.encoder_quantiles = self.encoder_quantiles
             self.train_dataset = PriceHistoryDataset(self.config, 'train', con)
@@ -423,17 +418,17 @@ class FinalPipeline(dummyLightning):
         return torch.from_numpy(quantiles).float()
 
     def create_db(self, parquet_path: Path, db_path: Path):
-        # Build directly into db_path (in /dev/shm) - persists across runs
+        # Build directly into db_path (in /home/jkp/ssd) - persists across runs
         con = duckdb.connect(str(db_path))
         con.execute(f"SET memory_limit='{self.ram}GB'")
 
         con.execute(f"""
-            CREATE VIEW raw_data AS
+            CREATE VIEW IF NOT EXISTS raw_data AS
             SELECT * FROM read_parquet('{parquet_path}')
         """)
 
         # Only cache the cutoff value (tiny file)
-        cutoff_cache_path = Path('/dev/shm') / 'pipeline_cutoff.txt'
+        cutoff_cache_path = Path('/home/jkp/ssd') / 'pipeline_cutoff.txt'
 
         if self.no_cache or not cutoff_cache_path.exists():
             print("  Computing train/val cutoff (90th percentile of datetime)...")
@@ -448,7 +443,7 @@ class FinalPipeline(dummyLightning):
         print(f"  Train/val cutoff timestamp: {cutoff}")
 
         con.execute("""
-            CREATE VIEW df AS
+            CREATE VIEW IF NOT EXISTS df AS
             SELECT *,
                 -- Returns at different time scales (30min, 1day, 2days) - expensive window functions
                 COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_30min,
@@ -460,7 +455,7 @@ class FinalPipeline(dummyLightning):
 
         print("  Computing per-stock normalization stats...")
         con.execute(f"""
-            CREATE TABLE stats AS
+            CREATE TABLE IF NOT EXISTS stats AS
             SELECT
                 id,
                 AVG(close) AS mean_close,
@@ -480,34 +475,35 @@ class FinalPipeline(dummyLightning):
         select_cols = ',\n  '.join(f'd.{f}' for f in self.db_features)
 
         print("  Materializing features (window functions)...")
-        con.execute(f"""
-            CREATE TABLE df_materialized AS
-            SELECT * FROM df
-        """)
-
-        def build1(split='train'):
-            print(f"  Building {split}_data...")
-            con.execute(f"""
-                CREATE TABLE {split}_data AS
-                SELECT
-                    CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
-                    ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
-                    {select_cols}
-                FROM df_materialized d
-                WHERE epoch_ns(d.datetime) {'<=' if split == 'train' else '>'} {cutoff}
+        train_exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='train_data'").fetchone()
+        val_exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='val_data'").fetchone()
+        if not (train_exists and val_exists):
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS df_materialized AS
+                SELECT * FROM df
             """)
-        build1('train')
-        build1('val')
 
-        # Free up memory
-        con.execute("DROP TABLE df_materialized")
+            def build1(split='train'):
+                print(f"  Building {split}_data...")
+                con.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {split}_data AS
+                    SELECT
+                        CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
+                        ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
+                        {select_cols}
+                    FROM df_materialized d
+                    WHERE epoch_ns(d.datetime) {'<=' if split == 'train' else '>'} {cutoff}
+                """)
+            build1('train')
+            build1('val')
+
+            # Free up memory
+            con.execute("DROP TABLE df_materialized")
 
         print("Step 7: Creating indexes...")
-        con.execute("CREATE INDEX train_data_idx ON train_data(stock_id, row_idx)")
-        con.execute("CREATE INDEX val_data_idx ON val_data(stock_id, row_idx)")
-        con.close()
+        con.execute("CREATE INDEX IF NOT EXISTS train_data_idx ON train_data(stock_id, row_idx)")
+        con.execute("CREATE INDEX IF NOT EXISTS val_data_idx ON val_data(stock_id, row_idx)")
 
-    def _compute_index(self, db_path: Path):
         print("Step 8: Compute and store quantiles from train_data...")
         sample_size = 10000 if self.debug_data else 1000000
         self._compute_and_store_quantiles(con, sample_size)
@@ -519,7 +515,7 @@ class FinalPipeline(dummyLightning):
         def build2(split='train'):
             print(f"  Building {split}_index...")
             con.execute(f"""
-                CREATE TABLE {split}_index AS
+                CREATE TABLE IF NOT EXISTS {split}_index AS
                 WITH stock_lengths AS (
                     SELECT stock_id, MAX(row_idx) + 1 AS stock_len
                     FROM {split}_data
@@ -540,27 +536,27 @@ class FinalPipeline(dummyLightning):
         build2('train')
         build2('val')
 
-        print("Database build complete in /dev/shm")
+        print("Database build complete in /home/jkp/ssd")
         return con
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
+        quantiles_exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='quantiles'").fetchone()
+        if quantiles_exists:
+            return
         n_quantize = self.n_quantize
         q_positions = [i / n_quantize for i in range(n_quantize + 1)]
         db_features_cols = ', '.join(self.db_features)
 
-        # Sample rows from the already-created train_data table
         sampled = con.execute(f"""
             SELECT {db_features_cols}
             FROM train_data
             USING SAMPLE {sample_size}
         """).fetchnumpy()
 
-        # Also need stats for normalization
-        stats_result = con.execute("""
+        avg_mean_close, avg_std_close, avg_mean_vol, avg_std_vol = con.execute("""
             SELECT AVG(mean_close), AVG(std_close), AVG(mean_volume), AVG(std_volume)
             FROM stats
         """).fetchone()
-        avg_mean_close, avg_std_close, avg_mean_vol, avg_std_vol = stats_result
 
         # Compute derived features for quantile estimation
         close = sampled['close']
@@ -927,10 +923,10 @@ class FinalPipelineConfig(dummyConfig):
 
         self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim
 
-        # DuckDB - use /dev/shm for faster access and to avoid OOM
+        # DuckDB - use /home/jkp/ssd for faster access and to avoid OOM
         if self.db_path is None:
             db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
-            self.db_path = str(Path('/dev/shm') / db_name)
+            self.db_path = str(Path('/home/jkp/ssd') / db_name)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
         super().__post_init__()
