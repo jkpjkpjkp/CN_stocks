@@ -109,7 +109,7 @@ class PriceHistoryDataset(Dataset):
                 all_features[:, feat_idx] = raw_data[:, self.db_feat_idx[feat]]
             elif feat == 'close_norm':
                 close = raw_data[:, self.db_feat_idx['close']]
-                all_features[:, feat_idx] = (close - mean_close) / (std_close + 1e-8)
+                all_features[:, feat_idx] = (close - mean_close) / (std_close + 1e-8) * 10
             elif feat == 'volume_norm':
                 volume = raw_data[:, self.db_feat_idx['volume']]
                 all_features[:, feat_idx] = (volume - mean_vol) / (std_vol + 1e-8)
@@ -118,23 +118,23 @@ class PriceHistoryDataset(Dataset):
                 all_features[:-1, feat_idx] = close[1:] - close[:-1]
             elif feat == 'ret_1min':
                 close = raw_data[:, self.db_feat_idx['close']]
-                all_features[:-1, feat_idx] = close[1:] / (close[:-1] + 1e-8) - 1
+                all_features[:-1, feat_idx] = (close[1:] / (close[:-1] + 1e-8) - 1) * 100
             elif feat == 'close_open':
                 close = raw_data[:, self.db_feat_idx['close']]
                 open_p = raw_data[:, self.db_feat_idx['open']]
-                all_features[:, feat_idx] = close / (open_p + 1e-8)
+                all_features[:, feat_idx] = close / (open_p + 1e-8) * 1000
             elif feat == 'high_open':
                 high = raw_data[:, self.db_feat_idx['high']]
                 open_p = raw_data[:, self.db_feat_idx['open']]
-                all_features[:, feat_idx] = high / (open_p + 1e-8)
+                all_features[:, feat_idx] = high / (open_p + 1e-8) * 1000
             elif feat == 'low_open':
                 low = raw_data[:, self.db_feat_idx['low']]
                 open_p = raw_data[:, self.db_feat_idx['open']]
-                all_features[:, feat_idx] = low / (open_p + 1e-8)
+                all_features[:, feat_idx] = low / (open_p + 1e-8) * 1000
             elif feat == 'high_low':
                 high = raw_data[:, self.db_feat_idx['high']]
                 low = raw_data[:, self.db_feat_idx['low']]
-                all_features[:, feat_idx] = high / (low + 1e-8)
+                all_features[:, feat_idx] = high / (low + 1e-8) * 1000
 
         features = all_features[:self.seq_len]
         close_norm = all_features[self.seq_len // 2:, self.close_norm_idx]
@@ -956,10 +956,11 @@ class FinalPipelineConfig(dummyConfig):
                           'delta_30min', 'ret_30min', 'ret_1day', 'ret_2day',
                           'volume')
     # All features (including cheap ones computed in getitem)
-    features: tuple = ('open', 'high', 'low', 'close', 'close_norm',
-                       'delta_1min', 'delta_30min', 'ret_1min', 'ret_30min',
-                       'ret_1day', 'ret_2day', 'close_open', 'high_open',
-                       'low_open', 'high_low', 'volume', 'volume_norm')
+    # Excludes raw OHLC and volume - only normalized/ratio features
+    features: tuple = ('close_norm', 'delta_1min', 'delta_30min',
+                       'ret_1min', 'ret_30min', 'ret_1day', 'ret_2day',
+                       'close_open', 'high_open', 'low_open', 'high_low',
+                       'volume_norm')
     cent_feats: tuple = ('delta_1min', 'delta_30min')
     horizons: tuple = (1, 30, 240, 480)
     quantiles: tuple = (10, 25, 50, 75, 90)
