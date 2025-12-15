@@ -347,6 +347,12 @@ class FinalPipeline(dummyLightning):
         self.register_buffer('pred_quantiles',
                              torch.tensor(config.quantiles, dtype=torch.float32) / 100.0)
 
+        # Adaptive loss scaling: track RMS of each loss type with EMA
+        self.loss_names = ['quantized', 'nll', 'quantile', 'return_nll', 'return_quantile']
+        self.loss_ema_decay = 0.99
+        for name in self.loss_names:
+            self.register_buffer(f'loss_rms_{name}', torch.tensor(1.0))
+
     def _get_db_path(self) -> Path:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         return Path(self.db_path)
@@ -735,7 +741,7 @@ class FinalPipeline(dummyLightning):
             losses[f'quantized_{h_name}'] = h_loss
             losses['quantized'] += h_loss / len(self.horizons)
 
-        # Mean + Variance prediction loss (NLL)
+        # Mean + Variance prediction loss (NLL) - capped at 20
         pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
         pred_var = self.readout(features, 'var')  # (batch, pred_len, num_horizons)
         pred_var += 1e-8  # (batch, pred_len, num_horizons)
@@ -744,6 +750,7 @@ class FinalPipeline(dummyLightning):
         for h_idx, h_name in enumerate(self.horizons):
             nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
                          (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
+            nll = nll.clamp(max=20.0)  # Cap NLL to prevent instability
             h_loss = nll.mean()
             losses[f'nll_{h_name}'] = h_loss
             losses['nll'] += h_loss / len(self.horizons)
@@ -760,7 +767,7 @@ class FinalPipeline(dummyLightning):
         # ===== Return prediction losses =====
         y_returns = y_returns.to(pred_mean.dtype)
 
-        # Return variance prediction loss (NLL)
+        # Return variance prediction loss (NLL) - capped at 20
         pred_return_mean = self.readout(features, 'return_mean')  # (batch, pred_len, num_horizons)
         pred_return_var = self.readout(features, 'return_var')  # (batch, pred_len, num_horizons)
         pred_return_var += 1e-8
@@ -769,6 +776,7 @@ class FinalPipeline(dummyLightning):
         for h_idx, h_name in enumerate(self.horizons):
             nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var[:, :, h_idx]) +
                          (y_returns[:, :, h_idx] - pred_return_mean[:, :, h_idx]) ** 2 / pred_return_var[:, :, h_idx])
+            nll = nll.clamp(max=20.0)  # Cap NLL to prevent instability
             h_loss = nll.mean()
             losses[f'return_nll_{h_name}'] = h_loss
             losses['return_nll'] += h_loss / len(self.horizons)
@@ -782,13 +790,36 @@ class FinalPipeline(dummyLightning):
             losses[f'return_quantile_{h_name}'] = h_loss
             losses['return_quantile'] += h_loss / len(self.horizons)
 
-        # Combine losses
+        # Adaptive loss scaling: update RMS estimates and compute scale factors
+        with torch.no_grad():
+            loss_values = {name: losses[name].detach() for name in self.loss_names}
+
+            # Update EMA of RMS for each loss
+            for name in self.loss_names:
+                rms_buffer = getattr(self, f'loss_rms_{name}')
+                # TODO: this is so wrong. 
+                current_rms = torch.sqrt(loss_values[name] ** 2 + 1e-8)
+                # EMA update
+                new_rms = self.loss_ema_decay * rms_buffer + (1 - self.loss_ema_decay) * current_rms
+                rms_buffer.copy_(new_rms)
+
+            # Compute geometric mean of all RMS values for normalization target
+            rms_values = torch.stack([getattr(self, f'loss_rms_{name}') for name in self.loss_names])
+            target_rms = torch.exp(torch.log(rms_values + 1e-8).mean())
+
+        # Compute scale factors to normalize each loss to target magnitude
+        scale_factors = {}
+        for name in self.loss_names:
+            rms = getattr(self, f'loss_rms_{name}')
+            scale_factors[name] = (target_rms / (rms + 1e-8)).clamp(0.1, 10.0)
+
+        # Combine losses with adaptive scaling (equal weights after scaling)
         total_loss = (
-            0.2 * losses['quantized'] +
-            0.2 * losses['nll'] +
-            0.2 * losses['quantile'] +
-            0.2 * losses['return_nll'] +
-            0.2 * losses['return_quantile']
+            0.2 * scale_factors['quantized'] * losses['quantized'] +
+            0.2 * scale_factors['nll'] * losses['nll'] +
+            0.2 * scale_factors['quantile'] * losses['quantile'] +
+            0.2 * scale_factors['return_nll'] * losses['return_nll'] +
+            0.2 * scale_factors['return_quantile'] * losses['return_quantile']
         )
 
         # Price prediction losses
@@ -799,6 +830,10 @@ class FinalPipeline(dummyLightning):
         # Return prediction losses
         self.log('return_prediction/nll', losses['return_nll'])
         self.log('return_prediction/quantile', losses['return_quantile'])
+
+        # Log adaptive scale factors
+        for name in self.loss_names:
+            self.log(f'loss_scale/{name}', scale_factors[name])
 
         for h_name in self.horizons:
             # Price prediction per horizon
@@ -825,6 +860,9 @@ class FinalPipeline(dummyLightning):
             result[f'quantile_{h_name}'] = losses[f'quantile_{h_name}']
             result[f'return_nll_{h_name}'] = losses[f'return_nll_{h_name}']
             result[f'return_quantile_{h_name}'] = losses[f'return_quantile_{h_name}']
+
+        if Path('/tmp/breakpoint').exists():
+            breakpoint()
 
         return result
 
