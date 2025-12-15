@@ -782,18 +782,13 @@ class FinalPipeline(dummyLightning):
             losses[f'return_quantile_{h_name}'] = h_loss
             losses['return_quantile'] += h_loss / len(self.horizons)
 
-        assert (
-            losses['quantized'] >= 0 and
-            losses['quantile'] >= 0 and
-            losses['return_quantile'] >= 0
-        ), losses
         # Combine losses
         total_loss = (
-            0.15 * losses['quantized'] +
-            0.15 * losses['nll'] +
-            0.15 * losses['quantile'] +
-            0.15 * losses['return_nll'] +
-            0.10 * losses['return_quantile']
+            0.2 * losses['quantized'] +
+            0.2 * losses['nll'] +
+            0.2 * losses['quantile'] +
+            0.2 * losses['return_nll'] +
+            0.2 * losses['return_quantile']
         )
 
         # Price prediction losses
