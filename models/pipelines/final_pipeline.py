@@ -111,7 +111,6 @@ class PriceHistoryDataset(Dataset):
             targets[:, h_idx] = future_prices
             return_targets[:, h_idx] = future_prices / (close_norm[:self.seq_len // 2] + 1e-8)
 
-        breakpoint()
         return (
             torch.from_numpy(all_features[:self.seq_len]).float(),
             torch.from_numpy(targets).float(),
@@ -390,23 +389,15 @@ class FinalPipeline(dummyLightning):
         self.val_dataset = PriceHistoryDataset(self.config, 'val', mmap_dir)
 
     def _create_mmap_arrays(self, con: duckdb.DuckDBPyConnection, mmap_dir: Path):
-        """Create memory-mapped numpy arrays from DuckDB data."""
-        # Save stats
         stats_result = con.execute("""
             SELECT CAST(SUBSTR(id, 1, 6) AS INTEGER) as stock_id,
                    mean_close, std_close, mean_volume, std_volume
             FROM stats
         """).fetchall()
-        stats_arr = np.array(stats_result, dtype=np.float64)
-        np.save(mmap_dir / 'stats.npy', stats_arr)
-
-        # Save quantiles
-        quantiles = self._load_quantiles(con)
-        np.save(mmap_dir / 'quantiles.npy', quantiles.numpy())
+        np.save(mmap_dir / 'stats.npy', np.array(stats_result, dtype=np.float32))
+        np.save(mmap_dir / 'quantiles.npy', self._load_quantiles(con).numpy())
 
         db_features_cols = ', '.join(self.db_features)
-        n_db_features = len(self.db_features)
-
         for split in ['train', 'val']:
             index = con.execute(f"""
                 SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
@@ -429,9 +420,7 @@ class FinalPipeline(dummyLightning):
                 offset += stock_len_map.get(int(sid), 0)
             total_rows = offset
 
-            # Create data array with db_features columns
-            data = np.zeros((total_rows, n_db_features), dtype=np.float32)
-
+            data = np.zeros((total_rows, len(self.db_features)), dtype=np.float32)
             for i, stock_id in enumerate(stock_ids):
                 stock_id = int(stock_id)
                 result = con.execute(f"""
@@ -523,7 +512,7 @@ class FinalPipeline(dummyLightning):
         val_exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='val_data'").fetchone()
         if not (train_exists and val_exists):
             con.execute("""
-                CREATE TABLE IF NOT EXISTS df_materialized AS
+                CREATE TEMP TABLE df_materialized AS
                 SELECT * FROM df
             """)
 
@@ -541,8 +530,6 @@ class FinalPipeline(dummyLightning):
                 """)
             build1('train')
             build1('val')
-
-            con.execute("DROP TABLE df_materialized")
 
         print("  Creating indexes...")
         con.execute("CREATE INDEX IF NOT EXISTS train_data_idx ON train_data(stock_id, row_idx)")
@@ -577,8 +564,6 @@ class FinalPipeline(dummyLightning):
             """)
         build2('train')
         build2('val')
-
-        print("Database build complete in /home/jkp/ssd")
         return con
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
@@ -659,27 +644,18 @@ class FinalPipeline(dummyLightning):
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
         x, y, y_returns = batch
-        # x: (batch, seq_len, features)
-        # y: (batch, pred_len, num_horizons) - normalized prices where pred_len = seq_len // 2
-        # y_returns: (batch, pred_len, num_horizons) - return multipliers (future_close / current_close)
-
-        seq_len = x.shape[1]
+        breakpoint()
         losses = {}
 
-        features = self.forward(x)[:, seq_len//2:, :]
-        # Get predictions for all sequence positions
-        # But we only care about predictions from positions seq_len//2 onwards
+        features = self.forward(x)[:, self.seq_len//2:, :]
         pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, n_quantize)
         y = y.to(pred_quantized.dtype)
         y_returns_typed = y_returns.to(pred_quantized.dtype)
 
-        # Quantized prediction loss - predicting returns
-        # Use close feature quantiles (index 0)
-        quantiles_tensor = self.encoder_quantiles[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)
-        target_quantized = torch.bucketize(y_returns_typed, quantiles_tensor)  # (batch, pred_len, num_horizons)
-        target_quantized = torch.clamp(target_quantized, 0, self.n_quantize - 1)
-
         losses['quantized'] = 0.0
+        quantiles_tensor = self.encoder_quantiles[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)  # TODO: hard-code 0 is bad
+        target_quantized = torch.bucketize(y_returns_typed, quantiles_tensor)
+        target_quantized = torch.clamp(target_quantized, 0, self.n_quantize - 1)
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = F.cross_entropy(
                 pred_quantized[:, :, h_idx, :].reshape(-1, self.n_quantize),
@@ -688,24 +664,20 @@ class FinalPipeline(dummyLightning):
             losses[f'quantized_{h_name}'] = h_loss
             losses['quantized'] += h_loss / len(self.horizons)
 
-        # Mean + Variance prediction loss (NLL) - capped at 20
-        pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
-        pred_var = self.readout(features, 'var')  # (batch, pred_len, num_horizons)
-        pred_var += 1e-8  # (batch, pred_len, num_horizons)
-
         losses['nll'] = 0.0
+        pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
+        pred_var = self.readout(features, 'var')
+        pred_var += 1e-8
         for h_idx, h_name in enumerate(self.horizons):
             nll = 1/2 * (torch.log(2 * torch.pi * pred_var[:, :, h_idx]) +
                          (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
-            nll = nll.clamp(max=20.0)  # Cap NLL to prevent instability
+            nll = nll.clamp(max=20.0)
             h_loss = nll.mean()
             losses[f'nll_{h_name}'] = h_loss
             losses['nll'] += h_loss / len(self.horizons)
 
-        # Quantile prediction loss
-        pred_quantiles = self.readout(features, 'quantile')
-
         losses['quantile'] = 0.0
+        pred_quantiles = self.readout(features, 'quantile')
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = self._quantile_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
             losses[f'quantile_{h_name}'] = h_loss
@@ -714,40 +686,35 @@ class FinalPipeline(dummyLightning):
         # ===== Return prediction losses =====
         y_returns = y_returns.to(pred_mean.dtype)
 
-        # Return variance prediction loss (NLL) - capped at 20
-        pred_return_mean = self.readout(features, 'return_mean')  # (batch, pred_len, num_horizons)
-        pred_return_var = self.readout(features, 'return_var')  # (batch, pred_len, num_horizons)
+        pred_return_mean = self.readout(features, 'return_mean')
+        pred_return_var = self.readout(features, 'return_var')
         pred_return_var += 1e-8
 
         losses['return_nll'] = 0.0
         for h_idx, h_name in enumerate(self.horizons):
             nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var[:, :, h_idx]) +
                          (y_returns[:, :, h_idx] - pred_return_mean[:, :, h_idx]) ** 2 / pred_return_var[:, :, h_idx])
-            nll = nll.clamp(max=20.0)  # Cap NLL to prevent instability
+            nll = nll.clamp(max=20.0)
             h_loss = nll.mean()
             losses[f'return_nll_{h_name}'] = h_loss
             losses['return_nll'] += h_loss / len(self.horizons)
 
-        # Return quantile prediction loss
-        pred_return_quantiles = self.readout(features, 'return_quantile')
-
         losses['return_quantile'] = 0.0
+        pred_return_quantiles = self.readout(features, 'return_quantile')
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = self._quantile_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
             losses[f'return_quantile_{h_name}'] = h_loss
             losses['return_quantile'] += h_loss / len(self.horizons)
 
-        # Adaptive loss scaling: update RMS estimates and compute scale factors
-        with torch.no_grad():
+        
+        with torch.no_grad():  # Adaptive loss scaling with RMS estimates
             loss_values = {name: losses[name].detach() for name in self.loss_names}
 
             # Update EMA of RMS for each loss
             for name in self.loss_names:
                 rms_buffer = getattr(self, f'loss_rms_{name}')
-                # TODO: this is so wrong. 
-                current_rms = torch.sqrt(loss_values[name] ** 2 + 1e-8)
-                # EMA update
-                new_rms = self.loss_ema_decay * rms_buffer + (1 - self.loss_ema_decay) * current_rms
+                current_rms = torch.sqrt(loss_values[name] ** 2 + 1e-8)  # TODO: this is so not RMS. 
+                new_rms = self.loss_ema_decay * rms_buffer + (1 - self.loss_ema_decay) * current_rms  # EMA update
                 rms_buffer.copy_(new_rms)
 
             # Compute geometric mean of all RMS values for normalization target
@@ -760,21 +727,17 @@ class FinalPipeline(dummyLightning):
             rms = getattr(self, f'loss_rms_{name}')
             scale_factors[name] = (target_rms / (rms + 1e-8)).clamp(0.1, 10.0)
 
-        # Combine losses with adaptive scaling (equal weights after scaling)
         total_loss = (
-            0.2 * scale_factors['quantized'] * losses['quantized'] +
-            0.2 * scale_factors['nll'] * losses['nll'] +
-            0.2 * scale_factors['quantile'] * losses['quantile'] +
-            0.2 * scale_factors['return_nll'] * losses['return_nll'] +
-            0.2 * scale_factors['return_quantile'] * losses['return_quantile']
-        )
+            scale_factors['quantized'] * losses['quantized'] +
+            scale_factors['nll'] * losses['nll'] +
+            scale_factors['quantile'] * losses['quantile'] +
+            scale_factors['return_nll'] * losses['return_nll'] +
+            scale_factors['return_quantile'] * losses['return_quantile']
+        ) / 5
 
-        # Price prediction losses
         self.log('price_prediction/quantized', losses['quantized'])
         self.log('price_prediction/nll', losses['nll'])
         self.log('price_prediction/quantile', losses['quantile'])
-
-        # Return prediction losses
         self.log('return_prediction/nll', losses['return_nll'])
         self.log('return_prediction/quantile', losses['return_quantile'])
 
@@ -837,7 +800,6 @@ class FinalPipeline(dummyLightning):
 
 
 def parse_args_to_config(base_config):
-    """Parse CLI arguments and override config fields"""
     import argparse
     import sys
     from dataclasses import fields
@@ -868,30 +830,22 @@ def parse_args_to_config(base_config):
         elif tp == str or tp == 'str' or 'str | None' in str(tp) or 'Optional[str]' in str(tp):
             parser.add_argument(f'--{field_name}', type=str, default=default_val,
                               help=f'{field_name} (default: {default_val})')
-        elif 'tuple' in str(tp):
-            # Skip tuple types - they are not meant to be overridden from CLI
-            parser.set_defaults(**{field_name: default_val})
         else:
-            # Fallback for any other type
             parser.set_defaults(**{field_name: default_val})
 
-    # Filter out module-like arguments (e.g., "models.pipelines.final_pipeline")
-    # These come from wrappers like utils.oom_debug_hook
+    # Filter out module-like arguments from wrappers like profilers.oom_debug_hook
     filtered_argv = [
         arg for arg in sys.argv[1:]
         if not arg.count('.') >= 2
     ]
-
     args = parser.parse_args(filtered_argv)
 
-    # Override config with parsed args
     overrides = {}
     for field in fields(FinalPipelineConfig):
         field_name = field.name
         tp = field.type
         arg_val = getattr(args, field_name)
 
-        # Handle bool | int type
         if 'bool | int' in str(tp) or 'int | bool' in str(tp):
             if arg_val.lower() in ('true', '1', 'yes'):
                 overrides[field_name] = True
@@ -945,7 +899,7 @@ class FinalPipelineConfig(dummyConfig):
     quantiles: tuple = (0.1, 0.25, 0.5, 0.75, 0.9)
 
     debug_data: int | None = None
-    debug_model: bool = False
+    no_compile: bool = False
     
     # ddp
     world_size: int = 1
@@ -981,32 +935,26 @@ class FinalPipelineConfig(dummyConfig):
         self.num_quantiles = len(self.quantiles)
         self.pred_len = self.seq_len // 2
 
-        self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim
+        self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim if self.batch_size is None else self.batch_size
         self.num_workers = min(os.cpu_count(), self.batch_size // 16) if self.num_workers is None else self.num_workers
         print(f'batch size: {self.batch_size}, num_workers: {self.num_workers}')
 
         super().__post_init__()
 
 
-config = FinalPipelineConfig(
-    shrink_model=True,
-    debug_model=True,
-)
-
 if __name__ == "__main__":
-    config = parse_args_to_config(config)
+    config = parse_args_to_config(FinalPipelineConfig(
+        shrink_model=True,
+        no_compile=True,
+    ))
     p = FinalPipeline(config)
 
     p._init_distributed()
     if p.is_root():
         print(f"{p.world_size} GPUs")
 
-    if p.is_root():
-        print("Preparing data...")
     p.prepare_data()
     assert len(p.train_dataset)
     assert len(p.val_dataset)
 
-    if p.is_root():
-        print("Starting training...")
     p.fit()

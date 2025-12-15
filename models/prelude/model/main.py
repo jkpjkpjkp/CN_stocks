@@ -96,7 +96,7 @@ class dummyLightning(Module):
             num_replicas=self.world_size,
             rank=self.rank,
             shuffle=True,
-            drop_last=not self.debug_data,
+            drop_last=True,
         )
         # When using DistributedSampler, shuffle must be False in DataLoader
         return DataLoader(
@@ -105,7 +105,7 @@ class dummyLightning(Module):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=not self.debug_data,
+            drop_last=True,
         )
 
     @property
@@ -170,7 +170,7 @@ class dummyLightning(Module):
         for name, param in self.named_parameters():
             if name[-5:] == '.bias':
                 param.data.zero_()
-        if not self.debug_model:
+        if not self.no_compile:
             self.forward = torch.autocast(
                 device_type=self.device, dtype=torch.bfloat16
             )(torch.compile(self.forward))
