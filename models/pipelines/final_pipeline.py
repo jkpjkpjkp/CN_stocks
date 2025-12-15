@@ -31,6 +31,7 @@ import duckdb
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
+import os
 
 from ..prelude.model import dummyLightning, dummyConfig, TM
 
@@ -38,8 +39,9 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 class PriceHistoryDataset(Dataset):
     """Dataset backed by in-memory DuckDB, materialized on access."""
 
-    def __init__(self, config, split: str, con: duckdb.DuckDBPyConnection):
+    def __init__(self, config, split: str, db_path: str):
         self.split = split
+        self.db_path = db_path
         self.seq_len = config.seq_len
         self.pred_len = config.pred_len
         self.horizons = config.horizons
@@ -47,7 +49,7 @@ class PriceHistoryDataset(Dataset):
         self.features = config.features
         self.db_features = config.db_features
         self.close_norm_idx = config.feat_idx['close_norm']
-        self.con = con
+        con = duckdb.connect(db_path, read_only=True)
 
         # Load just the index
         result = con.execute(f"""
@@ -63,6 +65,7 @@ class PriceHistoryDataset(Dataset):
                    mean_close, std_close, mean_volume, std_volume
             FROM stats
         """).fetchall()
+        con.close()
         self.stats = {r[0]: (r[1], r[2], r[3], r[4]) for r in stats_result}
 
     def __len__(self):
@@ -83,12 +86,15 @@ class PriceHistoryDataset(Dataset):
         end_idx = max(start_idx + self.seq_len, target_end)
 
         db_features_cols = ', '.join(self.db_features)
-        data = self.con.execute(f"""
+
+        con = duckdb.connect(self.db_path, read_only=True)
+        data = con.execute(f"""
             SELECT {db_features_cols}
             FROM {self.split}_data
             WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
             ORDER BY row_idx
         """, [stock_id, start_idx, end_idx]).fetchnumpy()
+        con.close()
 
         # Get stats for normalization
         mean_close, std_close, mean_vol, std_vol = self.stats.get(
@@ -371,10 +377,6 @@ class FinalPipeline(dummyLightning):
 
         if self.is_root():
             con = self.create_db(pq_path, db_path)
-            self.encoder_quantiles = self._load_quantiles(con)
-            self.encoder.encoder_quantiles = self.encoder_quantiles
-            self.train_dataset = PriceHistoryDataset(self.config, 'train', con)
-            self.val_dataset = PriceHistoryDataset(self.config, 'val', con)
         else:
             # Non-root processes will need to wait for disk persistence
             import time
@@ -387,10 +389,11 @@ class FinalPipeline(dummyLightning):
             if not self._check_db_ready():
                 raise RuntimeError(f"Database not ready after {max_wait}s")
             con = duckdb.connect(str(db_path), read_only=True)
-            self.encoder_quantiles = self._load_quantiles(con)
-            self.encoder.encoder_quantiles = self.encoder_quantiles
-            self.train_dataset = PriceHistoryDataset(self.config, 'train', con)
-            self.val_dataset = PriceHistoryDataset(self.config, 'val', con)
+        self.encoder_quantiles = self._load_quantiles(con)
+        self.encoder.encoder_quantiles = self.encoder_quantiles
+        con.close()
+        self.train_dataset = PriceHistoryDataset(self.config, 'train', db_path)
+        self.val_dataset = PriceHistoryDataset(self.config, 'val', db_path)
 
     def _load_quantiles(self, con: duckdb.DuckDBPyConnection) -> torch.Tensor:
         """Load quantiles from DuckDB connection."""
@@ -468,6 +471,7 @@ class FinalPipeline(dummyLightning):
                     SELECT
                         CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
                         ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
+                        CAST(d.datetime AS DATE) AS date,
                         {',\n  '.join(f'd.{f}' for f in self.db_features)}
                     FROM df_materialized d
                     WHERE epoch_ns(d.datetime) {'<=' if split == 'train' else '>'} {cutoff}
@@ -897,6 +901,8 @@ class FinalPipelineConfig(dummyConfig):
         self.pred_len = self.seq_len // 2
 
         self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim
+        self.num_workers = min(os.cpu_count(), int(self.batch_size ** 0.5))
+        print(f'batch size: {self.batch_size}, num_workers: {self.num_workers}')
 
         # DuckDB - use /home/jkp/ssd for faster access and to avoid OOM
         if self.db_path is None:
