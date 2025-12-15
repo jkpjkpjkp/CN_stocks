@@ -37,11 +37,11 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 
 
 class PriceHistoryDataset(Dataset):
-    """Dataset backed by in-memory DuckDB, materialized on access."""
+    """Dataset backed by memory-mapped numpy arrays for fast data loading."""
 
-    def __init__(self, config, split: str, db_path: str):
+    def __init__(self, config, split: str, mmap_dir: str):
         self.split = split
-        self.db_path = db_path
+        self.mmap_dir = Path(mmap_dir)
         self.seq_len = config.seq_len
         self.pred_len = config.pred_len
         self.horizons = config.horizons
@@ -49,24 +49,27 @@ class PriceHistoryDataset(Dataset):
         self.features = config.features
         self.db_features = config.db_features
         self.close_norm_idx = config.feat_idx['close_norm']
-        con = duckdb.connect(db_path, read_only=True)
 
-        # Load just the index
-        result = con.execute(f"""
-            SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
-        """).fetchall()
-        self.stock_ids = np.array([r[0] for r in result], dtype=np.int64)
-        self.cumsums = np.array([r[1] for r in result], dtype=np.int64)
+        # Load index arrays
+        self.stock_ids = np.load(self.mmap_dir / f'{split}_stock_ids.npy')
+        self.cumsums = np.load(self.mmap_dir / f'{split}_cumsums.npy')
+        self.stock_offsets = np.load(self.mmap_dir / f'{split}_stock_offsets.npy')
         self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
 
-        # Load stats for normalization (stock_id -> (mean_close, std_close, mean_vol, std_vol))
-        stats_result = con.execute("""
-            SELECT CAST(SUBSTR(id, 1, 6) AS INTEGER) as stock_id,
-                   mean_close, std_close, mean_volume, std_volume
-            FROM stats
-        """).fetchall()
-        con.close()
-        self.stats = {r[0]: (r[1], r[2], r[3], r[4]) for r in stats_result}
+        # Memory-map the raw feature data (db_features only, all stocks concatenated)
+        # Shape: (total_rows, len(db_features))
+        self.data = np.load(
+            self.mmap_dir / f'{split}_data.npy',
+            mmap_mode='r'
+        )
+
+        # Load stats for normalization
+        stats_data = np.load(self.mmap_dir / 'stats.npy')
+        # stats_data: (num_stocks, 5) -> [stock_id, mean_close, std_close, mean_vol, std_vol]
+        self.stats = {int(r[0]): (r[1], r[2], r[3], r[4]) for r in stats_data}
+
+        # Map db_features to their column indices in the mmap array
+        self.db_feat_idx = {f: i for i, f in enumerate(self.db_features)}
 
     def __len__(self):
         return self.total_samples
@@ -75,61 +78,64 @@ class PriceHistoryDataset(Dataset):
         # Binary search to find which stock this index belongs to
         stock_pos = np.searchsorted(self.cumsums, idx, side='right')
         stock_id = int(self.stock_ids[stock_pos])
+
         # Compute local offset within this stock
         prev_cumsum = int(self.cumsums[stock_pos - 1]) if stock_pos > 0 else 0
-        start_idx = idx - prev_cumsum
+        local_idx = idx - prev_cumsum
 
-        # Query the slice we need from DuckDB
+        # Get the global offset for this stock's data
+        stock_offset = int(self.stock_offsets[stock_pos])
+
+        # Calculate how many rows we need
         max_horizon = max(self.horizons)
-        target_start = start_idx + self.seq_len // 2
+        target_start = local_idx + self.seq_len // 2
         target_end = target_start + self.pred_len + max_horizon
-        end_idx = max(start_idx + self.seq_len, target_end)
+        end_idx = max(local_idx + self.seq_len, target_end)
 
-        db_features_cols = ', '.join(self.db_features)
-
-        con = duckdb.connect(self.db_path, read_only=True)
-        data = con.execute(f"""
-            SELECT {db_features_cols}
-            FROM {self.split}_data
-            WHERE stock_id = ? AND row_idx >= ? AND row_idx < ?
-            ORDER BY row_idx
-        """, [stock_id, start_idx, end_idx]).fetchnumpy()
-        con.close()
+        # Slice the memory-mapped array
+        global_start = stock_offset + local_idx
+        global_end = stock_offset + end_idx
+        raw_data = self.data[global_start:global_end]
 
         # Get stats for normalization
         mean_close, std_close, mean_vol, std_vol = self.stats.get(
             stock_id, (0.0, 1.0, 0.0, 1.0))
 
-        # Build all features array
-        n_rows = len(data['close'])
+        # Build all features array (same logic as before)
+        n_rows = raw_data.shape[0]
         all_features = np.zeros((n_rows, len(self.features)), dtype=np.float32)
 
-        # Map db_features to their positions
-        db_feat_map = {f: i for i, f in enumerate(self.db_features)}
-
         for feat_idx, feat in enumerate(self.features):
-            if feat in db_feat_map:
-                all_features[:, feat_idx] = data[feat]
+            if feat in self.db_feat_idx:
+                all_features[:, feat_idx] = raw_data[:, self.db_feat_idx[feat]]
             elif feat == 'close_norm':
-                all_features[:, feat_idx] = (data['close'] - mean_close) / (std_close + 1e-8)
+                close = raw_data[:, self.db_feat_idx['close']]
+                all_features[:, feat_idx] = (close - mean_close) / (std_close + 1e-8)
             elif feat == 'volume_norm':
-                all_features[:, feat_idx] = (data['volume'] - mean_vol) / (std_vol + 1e-8)
+                volume = raw_data[:, self.db_feat_idx['volume']]
+                all_features[:, feat_idx] = (volume - mean_vol) / (std_vol + 1e-8)
             elif feat == 'delta_1min':
-                # close[t+1] - close[t], pad last with 0
-                close = data['close']
+                close = raw_data[:, self.db_feat_idx['close']]
                 all_features[:-1, feat_idx] = close[1:] - close[:-1]
             elif feat == 'ret_1min':
-                # close[t+1] / close[t] - 1, pad last with 0
-                close = data['close']
+                close = raw_data[:, self.db_feat_idx['close']]
                 all_features[:-1, feat_idx] = close[1:] / (close[:-1] + 1e-8) - 1
             elif feat == 'close_open':
-                all_features[:, feat_idx] = data['close'] / (data['open'] + 1e-8)
+                close = raw_data[:, self.db_feat_idx['close']]
+                open_p = raw_data[:, self.db_feat_idx['open']]
+                all_features[:, feat_idx] = close / (open_p + 1e-8)
             elif feat == 'high_open':
-                all_features[:, feat_idx] = data['high'] / (data['open'] + 1e-8)
+                high = raw_data[:, self.db_feat_idx['high']]
+                open_p = raw_data[:, self.db_feat_idx['open']]
+                all_features[:, feat_idx] = high / (open_p + 1e-8)
             elif feat == 'low_open':
-                all_features[:, feat_idx] = data['low'] / (data['open'] + 1e-8)
+                low = raw_data[:, self.db_feat_idx['low']]
+                open_p = raw_data[:, self.db_feat_idx['open']]
+                all_features[:, feat_idx] = low / (open_p + 1e-8)
             elif feat == 'high_low':
-                all_features[:, feat_idx] = data['high'] / (data['low'] + 1e-8)
+                high = raw_data[:, self.db_feat_idx['high']]
+                low = raw_data[:, self.db_feat_idx['low']]
+                all_features[:, feat_idx] = high / (low + 1e-8)
 
         features = all_features[:self.seq_len]
         close_norm = all_features[self.seq_len // 2:, self.close_norm_idx]
@@ -366,34 +372,140 @@ class FinalPipeline(dummyLightning):
         finally:
             con.close()
 
+    def _get_mmap_dir(self) -> Path:
+        """Get directory for memory-mapped arrays."""
+        mmap_dir = Path('/home/jkp/ssd') / 'pipeline_mmap'
+        mmap_dir.mkdir(parents=True, exist_ok=True)
+        return mmap_dir
+
+    def _check_mmap_ready(self) -> bool:
+        """Check if memory-mapped arrays exist."""
+        mmap_dir = self._get_mmap_dir()
+        required_files = [
+            'train_data.npy', 'train_stock_ids.npy',
+            'train_cumsums.npy', 'train_stock_offsets.npy',
+            'val_data.npy', 'val_stock_ids.npy',
+            'val_cumsums.npy', 'val_stock_offsets.npy',
+            'stats.npy', 'quantiles.npy'
+        ]
+        return all((mmap_dir / f).exists() for f in required_files)
+
     def prepare_data(self, pq_path: Optional[str | Path] = None):
-        """Prepare data using on-disk DuckDB storage."""
+        """Prepare data: create DuckDB if needed, then create mmap arrays."""
 
         db_path = self._get_db_path()
+        mmap_dir = self._get_mmap_dir()
+
         if pq_path is None:
             pq_path = Path.home() / 'h' / 'data' / 'a_1min.pq'
         else:
             pq_path = Path(pq_path)
 
         if self.is_root():
+            # First ensure DuckDB has the data
             con = self.create_db(pq_path, db_path)
+
+            # Then create memory-mapped arrays if needed
+            if not self._check_mmap_ready():
+                print("  Creating memory-mapped arrays...")
+                self._create_mmap_arrays(con, mmap_dir)
+            con.close()
         else:
-            # Non-root processes will need to wait for disk persistence
+            # Non-root processes wait for mmap files
             import time
-            max_wait = 600  # 10 minutes max
+            max_wait = 600
             wait_interval = 5
             elapsed = 0
-            while not self._check_db_ready() and elapsed < max_wait:
+            while not self._check_mmap_ready() and elapsed < max_wait:
                 time.sleep(wait_interval)
                 elapsed += wait_interval
-            if not self._check_db_ready():
-                raise RuntimeError(f"Database not ready after {max_wait}s")
-            con = duckdb.connect(str(db_path), read_only=True)
-        self.encoder_quantiles = self._load_quantiles(con)
+            if not self._check_mmap_ready():
+                raise RuntimeError(f"Mmap arrays not ready after {max_wait}s")
+
+        # Load quantiles
+        self.encoder_quantiles = torch.from_numpy(
+            np.load(mmap_dir / 'quantiles.npy')
+        ).float()
         self.encoder.encoder_quantiles = self.encoder_quantiles
-        con.close()
-        self.train_dataset = PriceHistoryDataset(self.config, 'train', db_path)
-        self.val_dataset = PriceHistoryDataset(self.config, 'val', db_path)
+
+        self.train_dataset = PriceHistoryDataset(self.config, 'train', mmap_dir)
+        self.val_dataset = PriceHistoryDataset(self.config, 'val', mmap_dir)
+
+    def _create_mmap_arrays(self, con: duckdb.DuckDBPyConnection, mmap_dir: Path):
+        """Create memory-mapped numpy arrays from DuckDB data."""
+        # Save stats
+        stats_result = con.execute("""
+            SELECT CAST(SUBSTR(id, 1, 6) AS INTEGER) as stock_id,
+                   mean_close, std_close, mean_volume, std_volume
+            FROM stats
+        """).fetchall()
+        stats_arr = np.array(stats_result, dtype=np.float64)
+        np.save(mmap_dir / 'stats.npy', stats_arr)
+
+        # Save quantiles
+        quantiles = self._load_quantiles(con)
+        np.save(mmap_dir / 'quantiles.npy', quantiles.numpy())
+
+        db_features_cols = ', '.join(self.db_features)
+        n_db_features = len(self.db_features)
+
+        for split in ['train', 'val']:
+            print(f"    Building {split} mmap arrays...")
+
+            # Get index info
+            index_result = con.execute(f"""
+                SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
+            """).fetchall()
+            stock_ids = np.array([r[0] for r in index_result], dtype=np.int64)
+            cumsums = np.array([r[1] for r in index_result], dtype=np.int64)
+
+            # Get stock lengths
+            stock_lengths = con.execute(f"""
+                SELECT stock_id, COUNT(*) as cnt
+                FROM {split}_data
+                GROUP BY stock_id
+                ORDER BY stock_id
+            """).fetchall()
+            stock_len_map = {r[0]: r[1] for r in stock_lengths}
+
+            # Compute offsets
+            stock_offsets = np.zeros(len(stock_ids), dtype=np.int64)
+            offset = 0
+            for i, sid in enumerate(stock_ids):
+                stock_offsets[i] = offset
+                offset += stock_len_map.get(int(sid), 0)
+            total_rows = offset
+
+            # Create data array with db_features columns
+            data = np.zeros((total_rows, n_db_features), dtype=np.float32)
+
+            # Process each stock
+            for i, stock_id in enumerate(stock_ids):
+                stock_id = int(stock_id)
+                result = con.execute(f"""
+                    SELECT {db_features_cols}
+                    FROM {split}_data
+                    WHERE stock_id = ?
+                    ORDER BY row_idx
+                """, [stock_id]).fetchnumpy()
+
+                n_rows = len(result[self.db_features[0]])
+                if n_rows == 0:
+                    continue
+
+                start = int(stock_offsets[i])
+                for col_idx, col in enumerate(self.db_features):
+                    data[start:start + n_rows, col_idx] = result[col]
+
+                if i % 500 == 0:
+                    print(f"      Processed {i}/{len(stock_ids)} stocks")
+
+            # Save arrays
+            np.save(mmap_dir / f'{split}_data.npy', data)
+            np.save(mmap_dir / f'{split}_stock_ids.npy', stock_ids)
+            np.save(mmap_dir / f'{split}_cumsums.npy', cumsums)
+            np.save(mmap_dir / f'{split}_stock_offsets.npy', stock_offsets)
+            print(f"    Saved {split} arrays: {total_rows} rows")
 
     def _load_quantiles(self, con: duckdb.DuckDBPyConnection) -> torch.Tensor:
         """Load quantiles from DuckDB connection."""
@@ -862,7 +974,7 @@ class FinalPipelineConfig(dummyConfig):
     world_size: int = 1
     ddp_backend: str = 'nccl'
     master_addr: str = 'localhost'
-    master_port: str = '12355'
+    port: str = '12355'
 
     debug_ddp: bool = False
     num_workers: int | None = None
@@ -901,7 +1013,7 @@ class FinalPipelineConfig(dummyConfig):
         self.pred_len = self.seq_len // 2
 
         self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim
-        self.num_workers = min(os.cpu_count(), int(self.batch_size ** 0.5))
+        self.num_workers = min(os.cpu_count(), self.batch_size // 16)
         print(f'batch size: {self.batch_size}, num_workers: {self.num_workers}')
 
         # DuckDB - use /home/jkp/ssd for faster access and to avoid OOM

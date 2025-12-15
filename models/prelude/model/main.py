@@ -74,7 +74,7 @@ class dummyLightning(Module):
         assert config
         self.config = config
         os.environ['MASTER_ADDR'] = config.master_addr
-        os.environ['MASTER_PORT'] = config.master_port
+        os.environ['MASTER_PORT'] = config.port
 
     def __getattr__(self, name):
         try:
