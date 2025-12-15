@@ -98,8 +98,7 @@ class PriceHistoryDataset(Dataset):
         raw_data = self.data[global_start:global_end]
 
         # Get stats for normalization
-        mean_close, std_close, mean_vol, std_vol = self.stats.get(
-            stock_id, (0.0, 1.0, 0.0, 1.0))
+        mean_close, std_close, mean_vol, std_vol = self.stats[stock_id]
 
         # Build all features array (same logic as before)
         n_rows = raw_data.shape[0]
@@ -298,7 +297,6 @@ class MultiReadout(dummyLightning):
         self.return_quantile_head = nn.Linear(config.hidden_dim,
                                               config.num_quantiles*self.num_horizons)
 
-        # TODO: will this be overridden?
         # TODO: MuP
         nn.init.trunc_normal_(self.variance_head.weight, std=0.02, a=-0.04, b=0.08)
         nn.init.trunc_normal_(self.return_variance_head.weight, std=0.02, a=-0.04, b=0.08)
