@@ -96,13 +96,13 @@ class PriceHistoryDataset(Dataset):
                 close = g('close')
                 all_features[:-1, feat_idx] = (close[1:] / (close[:-1] + 1e-8) - 1) * 100
             elif feat == 'close_open':
-                all_features[:, feat_idx] = g('close') / (g('open') + 1e-8) * 1000
+                all_features[:, feat_idx] = (g('close') / (g('open') + 1e-8) - 1) * 1000
             elif feat == 'high_open':
-                all_features[:, feat_idx] = g('high') / (g('open') + 1e-8) * 1000
+                all_features[:, feat_idx] = (g('high') / (g('open') + 1e-8) - 1) * 1000
             elif feat == 'low_open':
-                all_features[:, feat_idx] = g('low') / (g('open') + 1e-8) * 1000
+                all_features[:, feat_idx] = (g('low') / (g('open') + 1e-8) - 1) * 1000
             elif feat == 'high_low':
-                all_features[:, feat_idx] = g('high') / (g('low') + 1e-8) * 1000
+                all_features[:, feat_idx] = (g('high') / (g('low') + 1e-8) - 1) * 1000
 
         targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
         return_targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
@@ -945,7 +945,6 @@ class FinalPipelineConfig(dummyConfig):
 if __name__ == "__main__":
     config = parse_args_to_config(FinalPipelineConfig(
         shrink_model=True,
-        no_compile=True,
     ))
     p = FinalPipeline(config)
 
