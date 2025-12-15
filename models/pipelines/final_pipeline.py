@@ -37,120 +37,83 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 
 
 class PriceHistoryDataset(Dataset):
-    """Dataset backed by memory-mapped numpy arrays for fast data loading."""
-
+    """Dataset backed by memory-mapped numpy arrays."""
     def __init__(self, config, split: str, mmap_dir: str):
-        self.split = split
         self.mmap_dir = Path(mmap_dir)
-        self.seq_len = config.seq_len
-        self.pred_len = config.pred_len
-        self.horizons = config.horizons
-        self.num_horizons = len(self.horizons)
-        self.features = config.features
-        self.db_features = config.db_features
-        self.close_norm_idx = config.feat_idx['close_norm']
-
-        # Load index arrays
+        self.config = config
+        self.horizons, self.seq_len, self.features, self.num_horizons = \
+            config.horizons, config.seq_len, config.features, config.num_horizons
+        
         self.stock_ids = np.load(self.mmap_dir / f'{split}_stock_ids.npy')
         self.cumsums = np.load(self.mmap_dir / f'{split}_cumsums.npy')
         self.stock_offsets = np.load(self.mmap_dir / f'{split}_stock_offsets.npy')
         self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
 
-        # Memory-map the raw feature data (db_features only, all stocks concatenated)
-        # Shape: (total_rows, len(db_features))
         self.data = np.load(
             self.mmap_dir / f'{split}_data.npy',
             mmap_mode='r'
-        )
+        )  # shape: (total_rows, len(db_features))
 
-        # Load stats for normalization
-        stats_data = np.load(self.mmap_dir / 'stats.npy')
-        # stats_data: (num_stocks, 5) -> [stock_id, mean_close, std_close, mean_vol, std_vol]
-        self.stats = {int(r[0]): (r[1], r[2], r[3], r[4]) for r in stats_data}
-
-        # Map db_features to their column indices in the mmap array
-        self.db_feat_idx = {f: i for i, f in enumerate(self.db_features)}
+        self.stats = {int(r[0]): (r[1], r[2], r[3], r[4]) for r in np.load(self.mmap_dir / 'stats.npy')}
+        self.db_feat_idx = {f: i for i, f in enumerate(config.db_features)}
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, idx):
-        # Binary search to find which stock this index belongs to
-        stock_pos = np.searchsorted(self.cumsums, idx, side='right')
-        stock_id = int(self.stock_ids[stock_pos])
-
-        # Compute local offset within this stock
-        prev_cumsum = int(self.cumsums[stock_pos - 1]) if stock_pos > 0 else 0
+        stock_index = np.searchsorted(self.cumsums, idx, side='right')
+        stock_id = int(self.stock_ids[stock_index])
+        prev_cumsum = int(self.cumsums[stock_index - 1]) if stock_index > 0 else 0
         local_idx = idx - prev_cumsum
+        stock_offset = int(self.stock_offsets[stock_index]) 
 
-        # Get the global offset for this stock's data
-        stock_offset = int(self.stock_offsets[stock_pos])
-
-        # Calculate how many rows we need
+        # slice
         max_horizon = max(self.horizons)
         target_start = local_idx + self.seq_len // 2
-        target_end = target_start + self.pred_len + max_horizon
+        target_end = target_start + self.seq_len // 2 + max_horizon
         end_idx = max(local_idx + self.seq_len, target_end)
-
-        # Slice the memory-mapped array
         global_start = stock_offset + local_idx
         global_end = stock_offset + end_idx
         raw_data = self.data[global_start:global_end]
 
-        # Get stats for normalization
         mean_close, std_close, mean_vol, std_vol = self.stats[stock_id]
 
-        # Build all features array (same logic as before)
-        n_rows = raw_data.shape[0]
-        all_features = np.zeros((n_rows, len(self.features)), dtype=np.float32)
-
+        def g(feat):
+            return raw_data[:, self.db_feat_idx[feat]]
+        all_features = np.zeros((raw_data.shape[0], len(self.features)), dtype=np.float32)
         for feat_idx, feat in enumerate(self.features):
             if feat in self.db_feat_idx:
                 all_features[:, feat_idx] = raw_data[:, self.db_feat_idx[feat]]
             elif feat == 'close_norm':
-                close = raw_data[:, self.db_feat_idx['close']]
-                all_features[:, feat_idx] = (close - mean_close) / (std_close + 1e-8) * 10
+                all_features[:, feat_idx] = (g('close') - mean_close) / (std_close + 1e-8) * 10
+                close_norm = all_features[self.seq_len // 2:, feat_idx]
             elif feat == 'volume_norm':
-                volume = raw_data[:, self.db_feat_idx['volume']]
-                all_features[:, feat_idx] = (volume - mean_vol) / (std_vol + 1e-8)
+                all_features[:, feat_idx] = (g('volume') - mean_vol) / (std_vol + 1e-8)
             elif feat == 'delta_1min':
-                close = raw_data[:, self.db_feat_idx['close']]
+                close = g('close')
                 all_features[:-1, feat_idx] = close[1:] - close[:-1]
             elif feat == 'ret_1min':
-                close = raw_data[:, self.db_feat_idx['close']]
+                close = g('close')
                 all_features[:-1, feat_idx] = (close[1:] / (close[:-1] + 1e-8) - 1) * 100
             elif feat == 'close_open':
-                close = raw_data[:, self.db_feat_idx['close']]
-                open_p = raw_data[:, self.db_feat_idx['open']]
-                all_features[:, feat_idx] = close / (open_p + 1e-8) * 1000
+                all_features[:, feat_idx] = g('close') / (g('open') + 1e-8) * 1000
             elif feat == 'high_open':
-                high = raw_data[:, self.db_feat_idx['high']]
-                open_p = raw_data[:, self.db_feat_idx['open']]
-                all_features[:, feat_idx] = high / (open_p + 1e-8) * 1000
+                all_features[:, feat_idx] = g('high') / (g('open') + 1e-8) * 1000
             elif feat == 'low_open':
-                low = raw_data[:, self.db_feat_idx['low']]
-                open_p = raw_data[:, self.db_feat_idx['open']]
-                all_features[:, feat_idx] = low / (open_p + 1e-8) * 1000
+                all_features[:, feat_idx] = g('low') / (g('open') + 1e-8) * 1000
             elif feat == 'high_low':
-                high = raw_data[:, self.db_feat_idx['high']]
-                low = raw_data[:, self.db_feat_idx['low']]
-                all_features[:, feat_idx] = high / (low + 1e-8) * 1000
+                all_features[:, feat_idx] = g('high') / (g('low') + 1e-8) * 1000
 
-        features = all_features[:self.seq_len]
-        close_norm = all_features[self.seq_len // 2:, self.close_norm_idx]
-
-        # Build targets and return_targets
-        targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
-        return_targets = np.zeros((self.pred_len, self.num_horizons), dtype=np.float32)
-        current_prices = close_norm[:self.pred_len]
-
+        targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
+        return_targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
         for h_idx, horizon in enumerate(self.horizons):
-            future_prices = close_norm[horizon:horizon + self.pred_len]
+            future_prices = close_norm[horizon:horizon + self.seq_len // 2]
             targets[:, h_idx] = future_prices
-            return_targets[:, h_idx] = future_prices / (current_prices + 1e-8)
+            return_targets[:, h_idx] = future_prices / (close_norm[:self.seq_len // 2] + 1e-8)
 
+        breakpoint()
         return (
-            torch.from_numpy(features).float(),
+            torch.from_numpy(all_features[:self.seq_len]).float(),
             torch.from_numpy(targets).float(),
             torch.from_numpy(return_targets).float(),
         )
@@ -173,23 +136,16 @@ class QuantizeEncoder(dummyLightning):
         quantiles_tensor = quantiles.squeeze(-1)[1:-1, :].to(x.device,
                                                              dtype=x.dtype)
 
-        # Bucketize each feature with its corresponding quantiles
         tokens = torch.stack([
             torch.bucketize(x[:, i].contiguous(),
                             quantiles_tensor[:, i].contiguous(), right=True)
             for i in range(x.shape[1])
         ], dim=1)  # (batch, num_features)
-
-        # Clamp to valid embedding indices [0, n_quantize-1]
         tokens = tokens.clamp(0, self.n_quantize - 1)
 
-        # Embed each feature: (batch, num_features, embed_dim)
         embedded = self.embedding(tokens)
-
-        # Flatten and project: (batch, num_features * embed_dim) -> (batch, embed_dim)
-        batch_size = embedded.shape[0]
-        flattened = embedded.reshape(batch_size, -1)
-        return self.proj(flattened)
+        embedded = embedded.flatten(1)  # (batch, num_features * embed_dim) -> (batch, embed_dim)
+        return self.proj(embedded)
 
 
 class CentsEncoder(dummyLightning):
@@ -225,6 +181,7 @@ class CentsEncoder(dummyLightning):
 
 
 class SinEncoder(dummyLightning):
+    ## TODO: values maybe very small. should adapt
     def __init__(self, config):
         super().__init__(config)
 
@@ -408,14 +365,11 @@ class FinalPipeline(dummyLightning):
         if self.is_root():
             # First ensure DuckDB has the data
             con = self.create_db(pq_path, db_path)
-
-            # Then create memory-mapped arrays if needed
             if not self._check_mmap_ready():
                 print("  Creating memory-mapped arrays...")
                 self._create_mmap_arrays(con, mmap_dir)
             con.close()
-        else:
-            # Non-root processes wait for mmap files
+        else:  # wait
             import time
             max_wait = 600
             wait_interval = 5
@@ -454,16 +408,12 @@ class FinalPipeline(dummyLightning):
         n_db_features = len(self.db_features)
 
         for split in ['train', 'val']:
-            print(f"    Building {split} mmap arrays...")
-
-            # Get index info
-            index_result = con.execute(f"""
+            index = con.execute(f"""
                 SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
             """).fetchall()
-            stock_ids = np.array([r[0] for r in index_result], dtype=np.int64)
-            cumsums = np.array([r[1] for r in index_result], dtype=np.int64)
+            stock_ids = np.array([r[0] for r in index], dtype=np.int64)
+            cumsums = np.array([r[1] for r in index], dtype=np.int64)
 
-            # Get stock lengths
             stock_lengths = con.execute(f"""
                 SELECT stock_id, COUNT(*) as cnt
                 FROM {split}_data
@@ -472,7 +422,6 @@ class FinalPipeline(dummyLightning):
             """).fetchall()
             stock_len_map = {r[0]: r[1] for r in stock_lengths}
 
-            # Compute offsets
             stock_offsets = np.zeros(len(stock_ids), dtype=np.int64)
             offset = 0
             for i, sid in enumerate(stock_ids):
@@ -483,7 +432,6 @@ class FinalPipeline(dummyLightning):
             # Create data array with db_features columns
             data = np.zeros((total_rows, n_db_features), dtype=np.float32)
 
-            # Process each stock
             for i, stock_id in enumerate(stock_ids):
                 stock_id = int(stock_id)
                 result = con.execute(f"""
@@ -541,8 +489,7 @@ class FinalPipeline(dummyLightning):
                 SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
                 FROM (SELECT datetime FROM raw_data USING SAMPLE 1000000)
             """).fetchone()[0]
-            if not self.no_cache:
-                cutoff_cache_path.write_text(str(cutoff))
+            cutoff_cache_path.write_text(str(cutoff))
         print(f"  Train/val cutoff timestamp: {cutoff}")
 
         # 1min data is computed in getitem
@@ -970,6 +917,7 @@ class FinalPipelineConfig(dummyConfig):
     max_freq: float = 10000.
     standard_rope: bool = False  # use fine-grained rope
     qk_norm: bool = False
+    shrink_model: bool = False
 
     # Training
     batch_size: int | None = None
@@ -977,40 +925,33 @@ class FinalPipelineConfig(dummyConfig):
     epochs: int = 100
     warmup_steps: int = 1000
     grad_clip: float = 1.0
+    num_workers: int | None = None
 
     # Data
     seq_len: int = 4096
     n_quantize: int = 128
     max_cent_abs: int = 64
-    db_path: str | None = None  # Path to DuckDB database file
-
-    # Features stored in DB (raw OHLCV + expensive window functions)
+    db_path: str = '/home/jkp/ssd/pipeline.duckdb'
     db_features: tuple = ('open', 'high', 'low', 'close',
                           'delta_30min', 'ret_30min', 'ret_1day', 'ret_2day',
                           'volume')
-    # All features (including cheap ones computed in getitem)
-    # Excludes raw OHLC and volume - only normalized/ratio features
+    # All features (including computed in getitem)
     features: tuple = ('close_norm', 'delta_1min', 'delta_30min',
                        'ret_1min', 'ret_30min', 'ret_1day', 'ret_2day',
                        'close_open', 'high_open', 'low_open', 'high_low',
                        'volume_norm')
     cent_feats: tuple = ('delta_1min', 'delta_30min')
     horizons: tuple = (1, 30, 240, 480)
-    quantiles: tuple = (10, 25, 50, 75, 90)
+    quantiles: tuple = (0.1, 0.25, 0.5, 0.75, 0.9)
 
     debug_data: int | None = None
     debug_model: bool = False
-    no_cache: bool = False  # Skip cache files, force recalc in RAM
-
-    # DDP settings
+    
+    # ddp
     world_size: int = 1
     ddp_backend: str = 'nccl'
     master_addr: str = 'localhost'
     port: str = '12355'
-
-    debug_ddp: bool = False
-    num_workers: int | None = None
-    shrink_model: bool = False
 
     # Hardware
     device: str = 'cuda'
@@ -1018,41 +959,31 @@ class FinalPipelineConfig(dummyConfig):
     ram: int = 368
 
     def __post_init__(self):
-        # Handle shrink_model before other calculations
+        # Trunk
         if self.shrink_model:
             self.hidden_dim //= 4
             self.num_heads //= 2
             self.num_layers //= 2
             self.embed_dim //= 2
-
-        # Model
         self.interim_dim = int(self.hidden_dim * self.expand)
         self.head_dim = int(self.hidden_dim * self.attn / self.num_heads)
 
         # Embedding
         self.q_dim = self.sin_dim = self.embed_dim // 2
         self.num_cents = self.max_cent_abs * 2 + 1
-
-        # Features - named index for clean access
-        self.feat_idx = {name: i for i, name in enumerate(self.features)}
         self.num_features = len(self.features)
         self.num_quantize_features = self.num_features
         self.num_cent_feats = len(self.cent_feats)
-        self.cent_feat_idx = [self.feat_idx[f] for f in self.cent_feats]
+        self.cent_feat_idx = [i for i, f in enumerate(self.features) if f in self.cent_feats]
 
+        # Prediction
         self.num_horizons = len(self.horizons)
         self.num_quantiles = len(self.quantiles)
         self.pred_len = self.seq_len // 2
 
         self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim
-        self.num_workers = min(os.cpu_count(), self.batch_size // 16)
+        self.num_workers = min(os.cpu_count(), self.batch_size // 16) if self.num_workers is None else self.num_workers
         print(f'batch size: {self.batch_size}, num_workers: {self.num_workers}')
-
-        # DuckDB - use /home/jkp/ssd for faster access and to avoid OOM
-        if self.db_path is None:
-            db_name = f'pipeline_debug_{self.debug_data}.duckdb' if self.debug_data else 'pipeline.duckdb'
-            self.db_path = str(Path('/home/jkp/ssd') / db_name)
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
         super().__post_init__()
 
