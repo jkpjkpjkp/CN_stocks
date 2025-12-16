@@ -106,10 +106,11 @@ class PriceHistoryDataset(Dataset):
 
         targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
         return_targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
+        close = g('close')[self.seq_len // 2:]
         for h_idx, horizon in enumerate(self.horizons):
-            future_prices = close_norm[horizon:horizon + self.seq_len // 2]
-            targets[:, h_idx] = future_prices
-            return_targets[:, h_idx] = future_prices / (close_norm[:self.seq_len // 2] + 1e-8)
+            targets[:, h_idx] = close_norm[horizon:horizon + self.seq_len // 2]
+            return_targets[:, h_idx] = (close[horizon:horizon + self.seq_len // 2]
+                                         / (close[:self.seq_len // 2] + 1e-8))
 
         return (
             torch.from_numpy(all_features[:self.seq_len]).float(),
@@ -934,7 +935,7 @@ class FinalPipelineConfig(dummyConfig):
         self.num_quantiles = len(self.quantiles)
         self.pred_len = self.seq_len // 2
 
-        self.batch_size = self.vram * 2 ** 21 // self.seq_len // self.num_layers // self.interim_dim if self.batch_size is None else self.batch_size
+        self.batch_size = self.vram * 2 ** (21 if self.no_compile else 23) // self.seq_len // self.num_layers // self.interim_dim if self.batch_size is None else self.batch_size
         self.num_workers = min(os.cpu_count(), self.batch_size // 16) if self.num_workers is None else self.num_workers
         print(f'batch size: {self.batch_size}, num_workers: {self.num_workers}')
 
