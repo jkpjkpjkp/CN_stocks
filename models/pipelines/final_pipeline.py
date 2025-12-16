@@ -644,7 +644,6 @@ class FinalPipeline(dummyLightning):
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
         x, y, y_returns = batch
-        breakpoint()
         losses = {}
 
         features = self.forward(x)[:, self.seq_len//2:, :]
