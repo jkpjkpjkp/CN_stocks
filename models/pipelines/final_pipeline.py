@@ -3,24 +3,21 @@
    - Quantize: percentile
    - Cent: delta in cents
    - Sinusoidal
-   - TODO: CNN: Image encoding over K-line graphs (from draw.py)
 
-2. Multiple preprocessing approaches:
-   - Raw (ohlc + volume)
+2. preprocessing:
    - Per-stock normalized
-   - Returns (1min, 30min, 6hr, 1day, 2day)
-   - Intra-minute (close divided by open, etc.)
-   - Cross-normalized (normalized per timestep)
+   - Returns (1min, 30min, 1day, 2day)
+   - close divided by open, etc. (intra-minute)
 
-4. Multiple prediction types and encodings:
-   - Quantized predictions (cross-entropy)
-   - Cent-based predictions (cross-entropy)
+3. predictions:
+   - cumulative return
+   - horizon return
+
    - Mean + Variance predictions (NLL loss)
    - Quantile predictions (sided Huber loss)
 
-5. Multiple prediction horizons:
-   - 1min, 30min, 1day, 2day ahead
-   - TODO: Next day's OHLC
+4. horizons:
+   - 1min, 30min, 1day, 2day
 """
 import torch
 from torch import nn
@@ -37,17 +34,15 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 
 
 class PriceHistoryDataset(Dataset):
-    """Dataset backed by memory-mapped numpy arrays."""
     def __init__(self, config, split: str):
-        self.mmap_dir = Path(config.mmap_dir)
         self.config = config
         self.horizons, self.seq_len, self.features, self.num_horizons = \
             config.horizons, config.seq_len, config.features, config.num_horizons
-        
+
         self.stock_ids = np.load(config.mmap_dir + f'{split}_stock_ids.npy')
         self.cumsums = np.load(config.mmap_dir + f'{split}_cumsums.npy')
         self.stock_offsets = np.load(config.mmap_dir + f'{split}_stock_offsets.npy')
-        self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
+        self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) else 0
         self.data = np.load(
             config.mmap_dir + f'{split}_data.npy',
             mmap_mode='r'
@@ -116,32 +111,37 @@ class PriceHistoryDataset(Dataset):
 
 
 class QuantizeEncoder(dummyLightning):
-    # TODO: reshape before embed
     def __init__(self, config):
         super().__init__(config)
         self.embedding = nn.Embedding(config.n_buckets * config.num_features, config.embed_dim)
         self.quantiles = torch.from_numpy(np.load(self.mmap_dir + 'quantiles.npy')).float()
 
     def forward(self, x: torch.Tensor):
-        # x: (batch, num_features)
-        # quantiles: (num_quantiles, num_features)
-
+        batch_size, num_features = x.shape
+        assert num_features == self.num_features
+        n_bars, num_features = self.quantiles.shape
+        assert num_features == self.num_features
+        assert n_bars + 1 == self.n_buckets
         # Use interior quantile boundaries for bucketization
-        quantiles_tensor = self.quantiles[1:, :].to(x.device,
-                                                    dtype=x.dtype)
+        quantiles_tensor = self.quantiles.to(x.device,
+                                             dtype=x.dtype)
 
         tokens = torch.stack([
             torch.bucketize(x[:, i].contiguous(),
                             quantiles_tensor[:, i].contiguous(), right=True)
             for i in range(x.shape[1])
-        ], dim=1)  # (batch, num_features)
-        tokens = tokens.clamp(0, self.n_buckets - 1)
+        ], dim=1)
+        assert tokens.shape == (batch_size, num_features)
+        assert tokens.max() < self.n_buckets
 
-        # Offset each feature's tokens to its own embedding range
         offsets = torch.arange(x.shape[1], device=x.device) * self.n_buckets
-        tokens = tokens + offsets  # (batch, num_features)
+        tokens = tokens + offsets
 
-        return self.embedding(tokens)
+        emb = self.embedding(tokens)
+        assert emb.shape == (batch_size, num_features, self.embed_dim)
+        ret = emb.mean(dim=1)
+        assert ret.shape == (batch_size, self.embed_dim)
+        return ret
 
 
 class CentsEncoder(dummyLightning):
@@ -150,8 +150,6 @@ class CentsEncoder(dummyLightning):
         self.max_cent_abs = config.max_cent_abs
         self.embedding = nn.Embedding(2 * config.max_cent_abs + 3,
                                       config.embed_dim)
-        self.proj = nn.Linear(config.embed_dim * config.num_cent_feats,
-                              config.embed_dim)
 
     def forward(self, x):
         """Convert cent differences to tokens
@@ -162,21 +160,20 @@ class CentsEncoder(dummyLightning):
         Returns:
             (batch, embed_dim) - projected embeddings
         """
-        x = (x * 100).long().clamp(-self.max_cent_abs-1, self.max_cent_abs+1)
+        x = x * 100
+        assert (x - x.long()).abs().max() < 1e-6, f"{x}"
+        x = x.long().clamp(-self.max_cent_abs-1, self.max_cent_abs+1)
         x = x + self.max_cent_abs + 1
 
-        embedded = self.embedding(x)
-
-        batch_size = embedded.shape[0]
-        flattened = embedded.reshape(batch_size, -1)
-        return self.proj(flattened)
+        emb = self.embedding(x)
+        return emb.mean(dim=1)
 
 
 class SinEncoder(dummyLightning):
-    # TODO: values maybe very small. should adapt
     def __init__(self, config):
         super().__init__(config)
 
+        self.norm = nn.LayerNorm(config.num_features)
         freqs = torch.exp(
             torch.linspace(0, np.log(config.max_freq),
                            config.sin_dim // 2)
@@ -186,11 +183,11 @@ class SinEncoder(dummyLightning):
 
         # Project flattened sin/cos features to embed_dim
         # Input will be (batch, features * embed_dim) after flattening
-        # For 12 features: 12 * embed_dim
         self.proj = nn.Linear(config.sin_dim * config.num_features, config.embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, features)"""
+        x = self.norm(x)
         # x: (batch, features), freqs: (1, 1, embed_dim // 2)
         # Add dimension for broadcasting: (batch, features, 1) * (1, 1, embed_dim // 2) -> (batch, features, embed_dim // 2)
         sin_emb = torch.sin(x.unsqueeze(-1) * self.freqs)
@@ -240,7 +237,6 @@ class MultiReadout(dummyLightning):
         self.return_quantile_head = nn.Linear(config.hidden_dim,
                                               config.num_quantiles*self.num_horizons)
 
-        # TODO: MuP
         nn.init.trunc_normal_(self.variance_head.weight, std=0.02, a=-0.04, b=0.08)
         nn.init.trunc_normal_(self.return_variance_head.weight, std=0.02, a=-0.04, b=0.08)
 
@@ -277,7 +273,7 @@ class FinalPipeline(dummyLightning):
         self._init_distributed()
         self.prepare_data()
         self.prepare_model()
-    
+
     def prepare_model(self):
         self.encoder = MultiEncoder(self.config)
         self.backbone = TM(self.config)
@@ -322,9 +318,9 @@ class FinalPipeline(dummyLightning):
             if not self._check_mmap_ready():
                 print("  Creating memory-mapped arrays...")
                 self._create_mmap_arrays(con)
-            
+
             print("  Compute and store quantiles from train_data...")
-            self._compute_and_store_quantiles(con, 1000000)
+            self._compute_and_store_quantiles(con, self.samples)
             con.close()
         else:  # wait
             import time
@@ -390,7 +386,6 @@ class FinalPipeline(dummyLightning):
             print(f"    Saved {split} arrays: {total_rows} rows")
 
     def _create_db(self):
-        # Build directly into db_path (in /home/jkp/ssd) - persists across runs
         con = duckdb.connect(self.db_path)
         con.execute(f"SET memory_limit='{self.ram}GB'")
 
@@ -406,22 +401,20 @@ class FinalPipeline(dummyLightning):
             print("  Computing train/val cutoff (90th percentile of datetime)...")
             cutoff = con.execute("""
                 SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
-                FROM (SELECT datetime FROM raw_data USING SAMPLE 1000000)
-            """).fetchone()[0]
+                FROM (SELECT datetime FROM raw_data USING SAMPLE ?)
+            """, [self.samples]).fetchone()
             cutoff_cache_path.write_text(str(cutoff))
         print(f"  Train/val cutoff timestamp: {cutoff}")
 
         con.execute("""
             CREATE VIEW IF NOT EXISTS df AS
             SELECT *,
-                -- Returns at different time scales (30min, 1day, 2days)
                 LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_30min,
                 LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_1day,
                 LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_2day
             FROM raw_data
         """)
 
-        print("  Create data tables...")
         exists = con.execute("""
             SELECT name
             FROM sqlite_master
@@ -439,7 +432,7 @@ class FinalPipeline(dummyLightning):
                 con.execute(f"""
                     CREATE TABLE IF NOT EXISTS {split}_data AS
                     SELECT
-                        CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,
+                        CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,  -- this is correct: 'a start value of 1 refers to the first character of the string'
                         ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
                         CAST(d.datetime AS DATE) AS date,
                         {',\n  '.join(f'd.{f}' for f in self.db_features)}
@@ -456,7 +449,7 @@ class FinalPipeline(dummyLightning):
         print("  Build index tables...")
         seq_len = self.seq_len
         max_horizon = max(self.horizons)
-        
+
         def build2(split='train'):
             print(f"  Building {split}_index...")
             con.execute(f"""
@@ -481,7 +474,7 @@ class FinalPipeline(dummyLightning):
         build2('train')
         build2('val')
         return con
-    
+
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int = 1000000):
         """Compute 256 quantiles by iterating through Dataset, deduplicating high-frequency modes."""
         filename = self.mmap_dir + 'quantiles.npy'
@@ -505,10 +498,9 @@ class FinalPipeline(dummyLightning):
         all_features = np.concatenate(all_features, axis=0)  # (samples * seq_len, num_features)
         print(f"    Collected {all_features.shape[0]} feature vectors")
 
-        # Compute quantiles with deduplication via binary search on k
-        print("    Computing quantiles on GPU with binary search for distinct values...")
-        n_buckets = self.n_buckets
-        quantiles = np.zeros((n_buckets, len(self.features)), dtype=np.float32)
+        print("     Computing quantiles with deduplication via binary search on k...")
+        n_breaks = self.n_buckets - 1
+        quantiles = np.zeros((n_breaks, len(self.features)), dtype=np.float32)
 
         all_features_t = torch.from_numpy(all_features)
 
@@ -517,46 +509,43 @@ class FinalPipeline(dummyLightning):
             n_vals = values.shape[0]
 
             def compute_quantiles_k(k: int) -> torch.Tensor:
-                indices = torch.linspace(0, n_vals - 1, k, device=values.device).long()
+                indices = torch.linspace(0, n_vals - 1, k, device=values.device).long()[1:-1]
                 return values[indices]
 
-            # Binary search for k such that unique(quantiles(k)) == 256
-            lo, hi = n_buckets, min(n_vals, n_buckets * 8)
+            lo, hi = n_breaks, min(n_vals, n_breaks * 8)
 
-            # First check if we can achieve 256 unique at hi
             q_hi = compute_quantiles_k(hi)
-            assert len(torch.unique(q_hi)) >= n_buckets
+            assert len(torch.unique(q_hi)) >= n_breaks
 
             flag = False
             while lo < hi:
                 mid = (lo + hi) // 2
                 q_mid = compute_quantiles_k(mid)
                 unique_mid = len(torch.unique(q_mid))
-                if unique_mid == n_buckets:
+                if unique_mid == n_breaks:
                     quantiles[:, feat_idx] = torch.unique(q_mid).cpu().numpy()
                     flag = True
                     break
-                if unique_mid < n_buckets:
+                if unique_mid < n_breaks:
                     lo = mid + 1
                 else:
                     hi = mid - 1
-            assert flag
+            assert flag, f"{lo}, {hi}, {compute_quantiles_k(lo)}"
         for feat_idx in range(len(self.features)):
-            for i in range(1, n_buckets):
-                assert quantiles[i, feat_idx] >= quantiles[i-1, feat_idx]
+            for i in range(1, n_breaks):
+                assert quantiles[i-1, feat_idx] < quantiles[i, feat_idx]
 
-        print("    Storing quantiles in DuckDB...")
+        print("    Storing quantiles...")
         con.execute(
-            "CREATE TABLE quantiles (feature_idx INTEGER, q_idx INTEGER, value FLOAT)"
+            "CREATE OR REPLACE TABLE quantiles (feature_idx INTEGER, q_idx INTEGER, value FLOAT)"
         )
         for feat_idx in range(len(self.features)):
-            for q_idx in range(n_buckets):
+            for q_idx in range(n_breaks):
                 con.execute(
                     "INSERT INTO quantiles VALUES (?, ?, ?)",
                     [feat_idx, q_idx, float(quantiles[q_idx, feat_idx])]
                 )
-        
-        print("    Creating quantiles npy...")
+
         np.save(filename, quantiles)
 
     def forward(self, x: torch.Tensor):
@@ -598,7 +587,7 @@ class FinalPipeline(dummyLightning):
             h_loss = self._sided_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
             losses[f'return_quantile_{h_name}'] = h_loss
             losses['return_quantile'] += h_loss / len(self.horizons)
-        
+
         ret_mean = pred_return_quantiles[:, :, :, self.num_quantiles//2]
         ret_var = self.readout(features, 'return_var') + 1e-8
 
@@ -619,7 +608,7 @@ class FinalPipeline(dummyLightning):
             # Update EMA of RMS for each loss
             for name in self.loss_names:
                 rms_buffer = getattr(self, f'loss_rms_{name}')
-                current_rms = torch.sqrt(loss_values[name] ** 2 + 1e-8)  # TODO: this is so not RMS. 
+                current_rms = torch.sqrt(loss_values[name] ** 2 + 1e-8)  # TODO: this is so not RMS.
                 new_rms = self.loss_ema * rms_buffer + (1 - self.loss_ema) * current_rms  # EMA update
                 rms_buffer.copy_(new_rms)
 
@@ -785,6 +774,7 @@ class FinalPipelineConfig(dummyConfig):
     seq_len: int = 4096
     n_buckets: int = 256
     max_cent_abs: int = 64
+    samples: int = 1000000
     db_path: str = '/home/jkp/ssd/pipeline.duckdb'
     db_features: tuple = ('open', 'high', 'low', 'close',
                           'ret_30min', 'ret_1day', 'ret_2day',
@@ -802,7 +792,7 @@ class FinalPipelineConfig(dummyConfig):
 
     debug_data: int | None = None
     no_compile: bool = False
-    
+
     # ddp
     world_size: int = 1
     ddp_backend: str = 'nccl'
