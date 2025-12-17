@@ -202,19 +202,18 @@ class dummyLightning(Module):
 
             self.optimizer.zero_grad()
             outputs = ddp_model.module.step(batch) if hasattr(ddp_model, 'module') else self.step(batch)
-            loss = outputs['loss'] if isinstance(outputs, dict) else outputs
+            loss = outputs['loss']
 
             if train:
                 loss.backward()
                 clip_grad_norm_(self.parameters(), self.grad_clip)
                 self.optimizer_step()
 
-            # Track loss for epoch average
             epoch_losses.append(loss.item())
 
-            # Log step loss periodically
             if random.randint(0, 9) == 0 or batch_idx == len(dataloader) - 1:
-                self.log('loss', loss.item())
+                for key, value in outputs.items():
+                    self.log(key, value)
 
             self.global_step += 1
             progress.update(task, advance=1, metrics=self.prog_bar_metrics)

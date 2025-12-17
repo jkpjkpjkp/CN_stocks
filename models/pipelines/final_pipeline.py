@@ -34,7 +34,7 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 
 
 class PriceHistoryDataset(Dataset):
-    def __init__(self, config, split: str):
+    def __init__(self, config, split: str, load_y_stats: bool = True):
         self.config = config
         self.horizons, self.seq_len, self.features, self.num_horizons = \
             config.horizons, config.seq_len, config.features, config.num_horizons
@@ -49,6 +49,20 @@ class PriceHistoryDataset(Dataset):
         )  # shape: (total_rows, len(db_features))
 
         self.db_feat_idx = {f: i for i, f in enumerate(config.db_features)}
+
+        # Load y normalization stats if available
+        self.load_y_stats = load_y_stats
+        if load_y_stats:
+            stats_file = config.mmap_dir + 'y_stats.npz'
+            stats = np.load(stats_file)
+            self.y_ret_mean = stats['y_ret_mean']  # (num_horizons,)
+            self.y_ret_std = stats['y_ret_std']    # (num_horizons,)
+            self.y_per_step_std = float(stats['y_per_step_std'])  # scalar
+
+            # Precompute sqrt(position) normalization factors for y
+            # Position 0 uses sqrt(1) to avoid division by zero
+            positions = np.arange(1, self.seq_len // 2 + 1)
+            self.y_norm_factors = (self.y_per_step_std * np.sqrt(positions)).astype(np.float32)  # (seq_len//2,)
 
     def __len__(self):
         return self.total_samples
@@ -86,15 +100,15 @@ class PriceHistoryDataset(Dataset):
                 all_features[:-1, feat_idx] = close[1:] - close[:-1]
             elif feat == 'ret_1min':
                 close = g('close')
-                all_features[:-1, feat_idx] = (close[1:] / (close[:-1] + 1e-8) - 1) * 100
+                all_features[:-1, feat_idx] = (close[1:] / (close[:-1] + 1e-8) - 1)
             elif feat == 'close_open':
-                all_features[:, feat_idx] = (g('close') / (g('open') + 1e-8) - 1) * 1000
+                all_features[:, feat_idx] = (g('close') / (g('open') + 1e-8) - 1)
             elif feat == 'high_open':
-                all_features[:, feat_idx] = (g('high') / (g('open') + 1e-8) - 1) * 1000
+                all_features[:, feat_idx] = (g('high') / (g('open') + 1e-8) - 1)
             elif feat == 'low_open':
-                all_features[:, feat_idx] = (g('low') / (g('open') + 1e-8) - 1) * 1000
+                all_features[:, feat_idx] = (g('low') / (g('open') + 1e-8) - 1)
             elif feat == 'high_low':
-                all_features[:, feat_idx] = (g('high') / (g('low') + 1e-8) - 1) * 1000
+                all_features[:, feat_idx] = (g('high') / (g('low') + 1e-8) - 1)
 
         y = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
         y_ret = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
@@ -102,6 +116,19 @@ class PriceHistoryDataset(Dataset):
             y[:, h_idx] = close[horizon + self.seq_len // 2: horizon + self.seq_len] / close[0] - 1
             y_ret[:, h_idx] = (close[horizon + self.seq_len // 2: horizon + self.seq_len]
                                / (close[self.seq_len // 2: self.seq_len] + 1e-8))
+
+        # Apply asinh to handle extraneous values (outliers)
+        y = np.arcsinh(y)
+        y_ret = np.arcsinh(y_ret)
+
+        # Normalize if stats are loaded
+        if self.load_y_stats:
+            # y_ret: normalize to ~N(0,1) per horizon
+            y_ret = (y_ret - self.y_ret_mean) / (self.y_ret_std + 1e-8)
+
+            # y: normalize by position-dependent factor (brownian motion scaling)
+            # y_norm_factors has shape (seq_len//2,), need to broadcast to (seq_len//2, num_horizons)
+            y = y / (self.y_norm_factors[:, None] + 1e-8)
 
         return (
             torch.from_numpy(all_features[:self.seq_len]).float(),
@@ -214,7 +241,7 @@ class MultiEncoder(dummyLightning):
 
         x_flat = x.view(-1, feat_dim)
         embeddings = [
-            self.quantize_encoder(x_flat, self.encoder_quantiles),
+            self.quantize_encoder(x_flat),
             self.cent_encoder(x_flat[:, self.cent_feat_idx]),
             self.sin_encoder(x_flat),
         ]
@@ -278,9 +305,8 @@ class FinalPipeline(dummyLightning):
         self.encoder = MultiEncoder(self.config)
         self.backbone = TM(self.config)
         self.readout = MultiReadout(self.config)
-        # Prediction quantiles as fractions (config has percentiles like 10, 25, 50, 75, 90)
         self.register_buffer('pred_quantiles',
-                             torch.tensor(self.config.quantiles, dtype=torch.float32) / 100.0)
+                             torch.tensor(self.config.quantiles, dtype=torch.float32))
 
         for name in self.loss_names:
             self.register_buffer(f'loss_rms_{name}', torch.tensor(1.0))
@@ -303,13 +329,15 @@ class FinalPipeline(dummyLightning):
         finally:
             con.close()
 
-    def _check_mmap_ready(self, require_quantile=False) -> bool:
+    def _check_mmap_ready(self, require_quantile=False, require_y_stats=False) -> bool:
         required_files = (
             'train_data.npy', 'train_stock_ids.npy', 'train_cumsums.npy', 'train_stock_offsets.npy',
             'val_data.npy', 'val_stock_ids.npy', 'val_cumsums.npy', 'val_stock_offsets.npy',
         )
         if require_quantile:
             required_files += ('quantiles.npy',)
+        if require_y_stats:
+            required_files += ('y_stats.npz',)
         return all(Path(self.mmap_dir + f).exists() for f in required_files)
 
     def prepare_data(self):
@@ -320,17 +348,18 @@ class FinalPipeline(dummyLightning):
                 self._create_mmap_arrays(con)
 
             print("  Compute and store quantiles from train_data...")
-            self._compute_and_store_quantiles(con, self.samples)
+            self._compute_and_store_quantiles(con)
+
             con.close()
         else:  # wait
             import time
             max_wait = 600
             wait_interval = 5
             elapsed = 0
-            while not self._check_mmap_ready(require_quantile=True) and elapsed < max_wait:
+            while not self._check_mmap_ready(require_quantile=True, require_y_stats=True) and elapsed < max_wait:
                 time.sleep(wait_interval)
                 elapsed += wait_interval
-            assert self._check_mmap_ready(require_quantile=True), "MMAP arrays not ready after waiting"
+            assert self._check_mmap_ready(require_quantile=True, require_y_stats=True), "MMAP arrays not ready after waiting"
         self.train_dataset = PriceHistoryDataset(self.config, 'train')
         self.val_dataset = PriceHistoryDataset(self.config, 'val')
 
@@ -475,18 +504,17 @@ class FinalPipeline(dummyLightning):
         build2('val')
         return con
 
-    def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int = 1000000):
+    def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection):
         """Compute 256 quantiles by iterating through Dataset, deduplicating high-frequency modes."""
         filename = self.mmap_dir + 'quantiles.npy'
         if Path(filename).exists():
             return
 
-        print(f"    Constructing Dataset and sampling {sample_size} items...")
-        dataset = PriceHistoryDataset(self.config, 'train')
+        print(f"    Constructing Dataset and sampling {self.samples} items...")
+        dataset = PriceHistoryDataset(self.config, 'train', load_y_stats=False)
 
-        # Sample indices
         n_total = len(dataset)
-        indices = np.random.choice(n_total, size=min(sample_size, n_total), replace=False)
+        indices = np.random.choice(n_total, size=self.samples, replace=False)
 
         all_features = []
         for i, idx in enumerate(indices):
@@ -545,8 +573,50 @@ class FinalPipeline(dummyLightning):
                     "INSERT INTO quantiles VALUES (?, ?, ?)",
                     [feat_idx, q_idx, float(quantiles[q_idx, feat_idx])]
                 )
-
         np.save(filename, quantiles)
+
+        print(f"    Computing y stats ...")
+        all_y = []
+        all_y_ret = []
+        for i, idx in enumerate(indices):
+            _, y, y_ret = dataset[idx]
+            all_y.append(y.numpy())
+            all_y_ret.append(y_ret.numpy())
+            if i % 10000 == 0:
+                print(f"      Processed {i}/{len(indices)} samples")
+
+        all_y = np.stack(all_y)       # (samples, seq_len//2, num_horizons)
+        all_y_ret = np.stack(all_y_ret)  # (samples, seq_len//2, num_horizons)
+
+        # y_ret stats: mean and std per horizon
+        y_ret_mean = all_y_ret.mean(axis=(0, 1))  # (num_horizons,)
+        y_ret_std = all_y_ret.std(axis=(0, 1))    # (num_horizons,)
+
+        # y stats: estimate per-step std for brownian motion
+        # For brownian motion at position i, std = sigma * sqrt(i)
+        # We estimate sigma by: sigma = std(y[:, i, h]) / sqrt(i) for various i, then average
+        num_horizons = all_y.shape[2]
+        seq_half = all_y.shape[1]
+
+        # Use positions 1 to seq_half to estimate sigma (skip 0 to avoid division by 0)
+        sigma_estimates = []
+        for pos in range(1, seq_half):
+            for h_idx in range(num_horizons):
+                pos_std = all_y[:, pos, h_idx].std()
+                sigma_est = pos_std / np.sqrt(pos)
+                sigma_estimates.append(sigma_est)
+
+        y_per_step_std = np.mean(sigma_estimates)  # single scalar
+
+        print(f"    y_ret mean: {y_ret_mean}, std: {y_ret_std}")
+        print(f"    y per-step std (sigma): {y_per_step_std}")
+
+        np.savez(stats_file,
+                 y_ret_mean=y_ret_mean.astype(np.float32),
+                 y_ret_std=y_ret_std.astype(np.float32),
+                 y_per_step_std=np.float32(y_per_step_std))
+        print(f"    Saved y stats to {stats_file}")
+
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
@@ -564,7 +634,7 @@ class FinalPipeline(dummyLightning):
         y = y.to(pred_quantiles.dtype)
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = self._sided_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
-            losses[f'quantile_{h_name}'] = h_loss
+            losses[f'{h_name}/quantile'] = h_loss
             losses['quantile'] += h_loss / len(self.horizons)
 
         losses['nll'] = 0.0
@@ -576,7 +646,7 @@ class FinalPipeline(dummyLightning):
                          (y[:, :, h_idx] - pred_mean[:, :, h_idx]) ** 2 / pred_var[:, :, h_idx])
             nll = nll.clamp(max=20.0)
             h_loss = nll.mean()
-            losses[f'nll_{h_name}'] = h_loss
+            losses[f'{h_name}/nll'] = h_loss
             losses['nll'] += h_loss / len(self.horizons)
 
         y_returns = y_returns.to(pred_mean.dtype)
@@ -585,7 +655,7 @@ class FinalPipeline(dummyLightning):
         pred_return_quantiles = self.readout(features, 'return_quantile')
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = self._sided_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
-            losses[f'return_quantile_{h_name}'] = h_loss
+            losses[f'{h_name}/return_quantile'] = h_loss
             losses['return_quantile'] += h_loss / len(self.horizons)
 
         ret_mean = pred_return_quantiles[:, :, :, self.num_quantiles//2]
@@ -599,7 +669,7 @@ class FinalPipeline(dummyLightning):
             ) / 2
             nll = nll.clamp(max=20.0)
             h_loss = nll.mean()
-            losses[f'return_nll_{h_name}'] = h_loss
+            losses[f'{h_name}/return_nll'] = h_loss
             losses['return_nll'] += h_loss / len(self.horizons)
 
         with torch.no_grad():  # Adaptive loss scaling with RMS estimates
@@ -622,46 +692,20 @@ class FinalPipeline(dummyLightning):
             rms = getattr(self, f'loss_rms_{name}')
             scale_factors[name] = (target_rms / (rms + 1e-8)).clamp(0.1, 10.0)
 
-        total_loss = (
+        losses['loss'] = (
             scale_factors['nll'] * losses['nll'] +
             scale_factors['quantile'] * losses['quantile'] +
             scale_factors['return_nll'] * losses['return_nll'] +
             scale_factors['return_quantile'] * losses['return_quantile']
         ) / 4
 
-        self.log('price_prediction/nll', losses['nll'])
-        self.log('price_prediction/quantile', losses['quantile'])
-        self.log('return_prediction/nll', losses['return_nll'])
-        self.log('return_prediction/quantile', losses['return_quantile'])
-
-        # Log adaptive scale factors
         for name in self.loss_names:
-            self.log(f'loss_scale/{name}', scale_factors[name])
-
-        for h_name in self.horizons:
-            self.log(f'price/h/{h_name}/nll', losses[f'nll_{h_name}'])
-            self.log(f'price/h/{h_name}/sided', losses[f'quantile_{h_name}'])
-            self.log(f'ret/h/{h_name}/nll', losses[f'return_nll_{h_name}'])
-            self.log(f'ret/h/{h_name}/sided', losses[f'return_quantile_{h_name}'])
-
-        result = {
-            'loss': total_loss,
-            'nll_loss': losses['nll'],
-            'quantile_loss': losses['quantile'],
-            'return_nll_loss': losses['return_nll'],
-            'return_quantile_loss': losses['return_quantile']
-        }
-
-        for h_name in self.horizons:
-            result[f'nll_{h_name}'] = losses[f'nll_{h_name}']
-            result[f'quantile_{h_name}'] = losses[f'quantile_{h_name}']
-            result[f'return_nll_{h_name}'] = losses[f'return_nll_{h_name}']
-            result[f'return_quantile_{h_name}'] = losses[f'return_quantile_{h_name}']
+            losses[f'scale/{name}'] = scale_factors[name]
 
         if Path('/tmp/breakpoint').exists():
             breakpoint()
 
-        return result
+        return losses
 
     def _sided_loss(self, pred, target):
         """ pred: (b, l, num_quantiles)
