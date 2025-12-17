@@ -29,7 +29,7 @@ from torch.utils.data import Dataset
 import numpy as np
 import duckdb
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Tuple, Dict
 from dataclasses import dataclass
 import os
 
@@ -38,19 +38,18 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 
 class PriceHistoryDataset(Dataset):
     """Dataset backed by memory-mapped numpy arrays."""
-    def __init__(self, config, split: str, mmap_dir: str | Path):
-        self.mmap_dir = Path(mmap_dir)
+    def __init__(self, config, split: str):
+        self.mmap_dir = Path(config.mmap_dir)
         self.config = config
         self.horizons, self.seq_len, self.features, self.num_horizons = \
             config.horizons, config.seq_len, config.features, config.num_horizons
         
-        self.stock_ids = np.load(self.mmap_dir / f'{split}_stock_ids.npy')
-        self.cumsums = np.load(self.mmap_dir / f'{split}_cumsums.npy')
-        self.stock_offsets = np.load(self.mmap_dir / f'{split}_stock_offsets.npy')
+        self.stock_ids = np.load(config.mmap_dir + f'{split}_stock_ids.npy')
+        self.cumsums = np.load(config.mmap_dir + f'{split}_cumsums.npy')
+        self.stock_offsets = np.load(config.mmap_dir + f'{split}_stock_offsets.npy')
         self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) > 0 else 0
-
         self.data = np.load(
-            self.mmap_dir / f'{split}_data.npy',
+            config.mmap_dir + f'{split}_data.npy',
             mmap_mode='r'
         )  # shape: (total_rows, len(db_features))
 
@@ -117,18 +116,19 @@ class PriceHistoryDataset(Dataset):
 
 
 class QuantizeEncoder(dummyLightning):
-    # TODO: compute quantiles and proj
+    # TODO: reshape before embed
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.n_buckets, config.q_dim)
+        self.embedding = nn.Embedding(config.n_buckets * config.num_features, config.embed_dim)
+        self.quantiles = torch.from_numpy(np.load(self.mmap_dir + 'quantiles.npy')).float()
 
-    def forward(self, x: torch.Tensor, quantiles: torch.Tensor):
+    def forward(self, x: torch.Tensor):
         # x: (batch, num_features)
         # quantiles: (num_quantiles, num_features)
 
         # Use interior quantile boundaries for bucketization
-        quantiles_tensor = quantiles.squeeze(-1)[1:-1, :].to(x.device,
-                                                             dtype=x.dtype)
+        quantiles_tensor = self.quantiles[1:, :].to(x.device,
+                                                    dtype=x.dtype)
 
         tokens = torch.stack([
             torch.bucketize(x[:, i].contiguous(),
@@ -137,7 +137,8 @@ class QuantizeEncoder(dummyLightning):
         ], dim=1)  # (batch, num_features)
         tokens = tokens.clamp(0, self.n_buckets - 1)
 
-        return self.embedding(tokens).flatten(1)
+        breakpoint()
+        return self.embedding(tokens)
 
 
 class CentsEncoder(dummyLightning):
@@ -183,8 +184,7 @@ class SinEncoder(dummyLightning):
         # Project flattened sin/cos features to embed_dim
         # Input will be (batch, features * embed_dim) after flattening
         # For 12 features: 12 * embed_dim
-        self.proj = nn.Linear(config.num_features * config.sin_dim,
-                              config.embed_dim)
+        self.proj = nn.Linear(config.sin_dim * config.num_features, config.embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, features)"""
@@ -271,30 +271,27 @@ class MultiReadout(dummyLightning):
 class FinalPipeline(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.encoder = MultiEncoder(config)
-        self.backbone = TM(config)
-        self.readout = MultiReadout(config)
+        self._init_distributed()
+        self.prepare_data()
+        self.prepare_model()
+    
+    def prepare_model(self):
+        self.encoder = MultiEncoder(self.config)
+        self.backbone = TM(self.config)
+        self.readout = MultiReadout(self.config)
         # Prediction quantiles as fractions (config has percentiles like 10, 25, 50, 75, 90)
         self.register_buffer('pred_quantiles',
-                             torch.tensor(config.quantiles, dtype=torch.float32) / 100.0)
+                             torch.tensor(self.config.quantiles, dtype=torch.float32) / 100.0)
 
-        # Adaptive loss scaling: track RMS of each loss type with EMA
-        self.loss_names = ['nll', 'quantile', 'return_nll', 'return_quantile']
-        self.loss_ema_decay = 0.99
         for name in self.loss_names:
             self.register_buffer(f'loss_rms_{name}', torch.tensor(1.0))
 
-    def _get_db_path(self) -> Path:
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        return Path(self.db_path)
-
     def _check_db_ready(self) -> bool:
         """Check if DuckDB database exists and has required tables"""
-        db_path = self._get_db_path()
-        if not db_path.exists():
+        if not Path(self.db_path).exists():
             return False
 
-        con = duckdb.connect(str(db_path), read_only=True)
+        con = duckdb.connect(self.db_path, read_only=True)
         try:
             tables = con.execute(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
@@ -307,14 +304,7 @@ class FinalPipeline(dummyLightning):
         finally:
             con.close()
 
-    def _get_mmap_dir(self) -> Path:
-        """Get directory for memory-mapped arrays."""
-        mmap_dir = Path('/home/jkp/ssd') / 'pipeline_mmap'
-        mmap_dir.mkdir(parents=True, exist_ok=True)
-        return mmap_dir
-
     def _check_mmap_ready(self) -> bool:
-        mmap_dir = self._get_mmap_dir()
         required_files = [
             'train_data.npy', 'train_stock_ids.npy',
             'train_cumsums.npy', 'train_stock_offsets.npy',
@@ -322,24 +312,14 @@ class FinalPipeline(dummyLightning):
             'val_cumsums.npy', 'val_stock_offsets.npy',
             'quantiles.npy'
         ]
-        return all((mmap_dir / f).exists() for f in required_files)
+        return all(Path(self.mmap_dir + f).exists() for f in required_files)
 
-    def prepare_data(self, pq_path: Optional[str | Path] = None):
-        """Prepare data: create DuckDB if needed, then create mmap arrays."""
-
-        db_path = self._get_db_path()
-        mmap_dir = self._get_mmap_dir()
-
-        if pq_path is None:
-            pq_path = Path.home() / 'h' / 'data' / 'a_1min.pq'
-        else:
-            pq_path = Path(pq_path)
-
+    def prepare_data(self):
         if self.is_root():
-            con = self.create_db(pq_path, db_path)
+            con = self.create_db()
             if not self._check_mmap_ready():
                 print("  Creating memory-mapped arrays...")
-                self._create_mmap_arrays(con, mmap_dir)
+                self._create_mmap_arrays(con)
             con.close()
         else:  # wait
             import time
@@ -352,18 +332,10 @@ class FinalPipeline(dummyLightning):
             if not self._check_mmap_ready():
                 raise RuntimeError(f"Mmap arrays not ready after {max_wait}s")
 
-        # Load quantiles
-        self.encoder_quantiles = torch.from_numpy(
-            np.load(mmap_dir / 'quantiles.npy')
-        ).float()
-        self.encoder.encoder_quantiles = self.encoder_quantiles
+        self.train_dataset = PriceHistoryDataset(self.config, 'train')
+        self.val_dataset = PriceHistoryDataset(self.config, 'val')
 
-        self.train_dataset = PriceHistoryDataset(self.config, 'train', mmap_dir)
-        self.val_dataset = PriceHistoryDataset(self.config, 'val', mmap_dir)
-
-    def _create_mmap_arrays(self, con: duckdb.DuckDBPyConnection, mmap_dir: Path):
-        np.save(mmap_dir / 'quantiles.npy', self._load_quantiles(con).numpy())
-
+    def _create_mmap_arrays(self, con: duckdb.DuckDBPyConnection):
         db_features_cols = ', '.join(self.db_features)
         for split in ['train', 'val']:
             index = con.execute(f"""
@@ -408,21 +380,24 @@ class FinalPipeline(dummyLightning):
                 if i % 500 == 0:
                     print(f"      Processed {i}/{len(stock_ids)} stocks")
 
-            # Save arrays
-            np.save(mmap_dir / f'{split}_data.npy', data)
-            np.save(mmap_dir / f'{split}_stock_ids.npy', stock_ids)
-            np.save(mmap_dir / f'{split}_cumsums.npy', cumsums)
-            np.save(mmap_dir / f'{split}_stock_offsets.npy', stock_offsets)
+            np.save(self.mmap_dir + f'{split}_data.npy', data)
+            np.save(self.mmap_dir + f'{split}_stock_ids.npy', stock_ids)
+            np.save(self.mmap_dir + f'{split}_cumsums.npy', cumsums)
+            np.save(self.mmap_dir + f'{split}_stock_offsets.npy', stock_offsets)
             print(f"    Saved {split} arrays: {total_rows} rows")
 
-    def create_db(self, parquet_path: Path, db_path: Path):
+        print("  Compute and store quantiles from train_data...")
+        self._compute_and_store_quantiles(con, 1000000)
+
+
+    def create_db(self):
         # Build directly into db_path (in /home/jkp/ssd) - persists across runs
-        con = duckdb.connect(str(db_path))
+        con = duckdb.connect(self.db_path)
         con.execute(f"SET memory_limit='{self.ram}GB'")
 
         con.execute(f"""
             CREATE VIEW IF NOT EXISTS raw_data AS
-            SELECT * FROM read_parquet('{parquet_path}')
+            SELECT * FROM read_parquet('{self.pq_path}')
         """)
 
         cutoff_cache_path = Path('/home/jkp/ssd') / 'pipeline_cutoff.txt'
@@ -437,7 +412,6 @@ class FinalPipeline(dummyLightning):
             cutoff_cache_path.write_text(str(cutoff))
         print(f"  Train/val cutoff timestamp: {cutoff}")
 
-        # 1min data is computed in getitem
         con.execute("""
             CREATE VIEW IF NOT EXISTS df AS
             SELECT *,
@@ -480,9 +454,6 @@ class FinalPipeline(dummyLightning):
         con.execute("CREATE INDEX IF NOT EXISTS train_data_idx ON train_data(stock_id, row_idx)")
         con.execute("CREATE INDEX IF NOT EXISTS val_data_idx ON val_data(stock_id, row_idx)")
 
-        print("  Compute and store quantiles from train_data...")
-        self._compute_and_store_quantiles(con, 1000000)
-
         print("  Build index tables...")
         seq_len = self.seq_len
         max_horizon = max(self.horizons)
@@ -512,16 +483,90 @@ class FinalPipeline(dummyLightning):
         build2('val')
         return con
     
-    def _load_quantiles(self, con: duckdb.DuckDBPyConnection) -> torch.Tensor:
-        """Load quantiles from DuckDB connection."""
-        result = con.execute("""
-            SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
-        """).fetchnumpy()
-        assert result['feature_idx'].max() + 1 == self.n_features
-        assert result['q_idx'].max() + 1 == self.n_buckets
-        quantiles = np.zeros((self.n_buckets, self.n_features), dtype=np.float32)
-        quantiles[result['q_idx'], result['feature_idx']] = result['value']
-        return torch.from_numpy(quantiles).float()
+    def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int = 1000000):
+        """Compute 256 quantiles by iterating through Dataset, deduplicating high-frequency modes."""
+        exists = con.execute("""
+            SELECT name FROM sqlite_master WHERE type='table' AND name='quantiles'
+        """).fetchall()
+        if exists:
+            print("    Quantiles table already exists, skipping...")
+            return
+
+        assert self._check_mmap_ready()
+
+        print(f"    Constructing Dataset and sampling {sample_size} items...")
+        dataset = PriceHistoryDataset(self.config, 'train', self.mmap_dir)
+
+        # Sample indices
+        n_total = len(dataset)
+        indices = np.random.choice(n_total, size=min(sample_size, n_total), replace=False)
+
+        # Collect all feature values
+        all_features = []
+        for i, idx in enumerate(indices):
+            x, _, _ = dataset[idx]  # x: (seq_len, num_features)
+            all_features.append(x.numpy())
+            if i % 10000 == 0:
+                print(f"      Processed {i}/{len(indices)} samples")
+
+        all_features = np.concatenate(all_features, axis=0)  # (samples * seq_len, num_features)
+        print(f"    Collected {all_features.shape[0]} feature vectors")
+
+        # Compute quantiles with deduplication via binary search on k
+        print("    Computing quantiles on GPU with binary search for distinct values...")
+        n_buckets = self.n_buckets
+        quantiles = np.zeros((n_buckets, len(self.features)), dtype=np.float32)
+
+        all_features_t = torch.from_numpy(all_features).cuda()
+
+        for feat_idx, feat in enumerate(self.features):
+            values = all_features_t[:, feat_idx].contiguous()
+            n_vals = values.shape[0]
+
+            def compute_quantiles_k(k: int) -> torch.Tensor:
+                """Compute k quantiles using torch.kthvalue on GPU."""
+                indices = torch.linspace(0, n_vals - 1, k, device=values.device).long()
+                sorted_vals, _ = values.sort()
+                return sorted_vals[indices]
+
+            # Binary search for k such that unique(quantiles(k)) == 256
+            lo, hi = n_buckets, min(n_vals, n_buckets * 2)
+
+            # First check if we can achieve 256 unique at hi
+            q_hi = compute_quantiles_k(hi)
+            assert len(torch.unique(q_hi)) >= n_buckets
+
+            flag = False
+            while lo < hi:
+                mid = (lo + hi) // 2
+                q_mid = compute_quantiles_k(mid)
+                unique_mid = len(torch.unique(q_mid))
+                if unique_mid == n_buckets:
+                    quantiles[:, feat_idx] = torch.unique(q_mid).cpu().numpy()
+                    flag = True
+                    break
+                if unique_mid < n_buckets:
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            assert flag
+        for feat_idx in range(len(self.features)):
+            for i in range(1, n_buckets):
+                assert quantiles[i, feat_idx] >= quantiles[i-1, feat_idx]
+
+        print("    Storing quantiles in DuckDB...")
+        con.execute(
+            "CREATE TABLE quantiles (feature_idx INTEGER, q_idx INTEGER, value FLOAT)"
+        )
+        for feat_idx in range(len(self.features)):
+            for q_idx in range(n_buckets):
+                con.execute(
+                    "INSERT INTO quantiles VALUES (?, ?, ?)",
+                    [feat_idx, q_idx, float(quantiles[q_idx, feat_idx])]
+                )
+        
+        print("    Creating quantiles npy...")
+        np.save(self.mmap_dir + 'quantiles.npy', quantiles)
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
@@ -584,7 +629,7 @@ class FinalPipeline(dummyLightning):
             for name in self.loss_names:
                 rms_buffer = getattr(self, f'loss_rms_{name}')
                 current_rms = torch.sqrt(loss_values[name] ** 2 + 1e-8)  # TODO: this is so not RMS. 
-                new_rms = self.loss_ema_decay * rms_buffer + (1 - self.loss_ema_decay) * current_rms  # EMA update
+                new_rms = self.loss_ema * rms_buffer + (1 - self.loss_ema) * current_rms  # EMA update
                 rms_buffer.copy_(new_rms)
 
             # Compute geometric mean of all RMS values for normalization target
@@ -742,10 +787,12 @@ class FinalPipelineConfig(dummyConfig):
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     num_workers: int | None = None
+    loss_names: tuple = ('nll', 'quantile', 'return_nll', 'return_quantile')
+    loss_ema: float = 0.99
 
     # Data
     seq_len: int = 4096
-    n_buckets: int = 128
+    n_buckets: int = 256
     max_cent_abs: int = 64
     db_path: str = '/home/jkp/ssd/pipeline.duckdb'
     db_features: tuple = ('open', 'high', 'low', 'close',
@@ -758,6 +805,9 @@ class FinalPipelineConfig(dummyConfig):
     cent_feats: tuple = ('delta_1min',)
     horizons: tuple = (1, 30, 240, 480)
     quantiles: tuple = (0.1, 0.25, 0.5, 0.75, 0.9)
+    mmap_dir: str = '/home/jkp/ssd/pipeline_mmap/'
+    db_path: str = '/home/jkp/ssd/pipeline.duckdb'
+    pq_path: str = '/home/jkp/ssd/a_1min.pq'
 
     debug_data: int | None = None
     no_compile: bool = False
@@ -807,13 +857,4 @@ if __name__ == "__main__":
         shrink_model=True,
     ))
     p = FinalPipeline(config)
-
-    p._init_distributed()
-    if p.is_root():
-        print(f"{p.world_size} GPUs")
-
-    p.prepare_data()
-    assert len(p.train_dataset)
-    assert len(p.val_dataset)
-
     p.fit()
