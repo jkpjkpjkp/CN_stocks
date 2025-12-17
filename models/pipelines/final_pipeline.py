@@ -307,14 +307,13 @@ class FinalPipeline(dummyLightning):
         finally:
             con.close()
 
-    def _check_mmap_ready(self) -> bool:
-        required_files = [
-            'train_data.npy', 'train_stock_ids.npy',
-            'train_cumsums.npy', 'train_stock_offsets.npy',
-            'val_data.npy', 'val_stock_ids.npy',
-            'val_cumsums.npy', 'val_stock_offsets.npy',
-            'quantiles.npy'
-        ]
+    def _check_mmap_ready(self, require_quantile=False) -> bool:
+        required_files = (
+            'train_data.npy', 'train_stock_ids.npy', 'train_cumsums.npy', 'train_stock_offsets.npy',
+            'val_data.npy', 'val_stock_ids.npy', 'val_cumsums.npy', 'val_stock_offsets.npy',
+        )
+        if require_quantile:
+            required_files += ('quantiles.npy',)
         return all(Path(self.mmap_dir + f).exists() for f in required_files)
 
     def prepare_data(self):
@@ -323,18 +322,19 @@ class FinalPipeline(dummyLightning):
             if not self._check_mmap_ready():
                 print("  Creating memory-mapped arrays...")
                 self._create_mmap_arrays(con)
+            
+            print("  Compute and store quantiles from train_data...")
+            self._compute_and_store_quantiles(con, 1000000)
             con.close()
         else:  # wait
             import time
             max_wait = 600
             wait_interval = 5
             elapsed = 0
-            while not self._check_mmap_ready() and elapsed < max_wait:
+            while not self._check_mmap_ready(require_quantile=True) and elapsed < max_wait:
                 time.sleep(wait_interval)
                 elapsed += wait_interval
-            if not self._check_mmap_ready():
-                raise RuntimeError(f"Mmap arrays not ready after {max_wait}s")
-
+            assert self._check_mmap_ready(require_quantile=True), "MMAP arrays not ready after waiting"
         self.train_dataset = PriceHistoryDataset(self.config, 'train')
         self.val_dataset = PriceHistoryDataset(self.config, 'val')
 
@@ -388,10 +388,6 @@ class FinalPipeline(dummyLightning):
             np.save(self.mmap_dir + f'{split}_cumsums.npy', cumsums)
             np.save(self.mmap_dir + f'{split}_stock_offsets.npy', stock_offsets)
             print(f"    Saved {split} arrays: {total_rows} rows")
-
-        print("  Compute and store quantiles from train_data...")
-        self._compute_and_store_quantiles(con, 1000000)
-
 
     def create_db(self):
         # Build directly into db_path (in /home/jkp/ssd) - persists across runs
@@ -488,17 +484,12 @@ class FinalPipeline(dummyLightning):
     
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int = 1000000):
         """Compute 256 quantiles by iterating through Dataset, deduplicating high-frequency modes."""
-        exists = con.execute("""
-            SELECT name FROM sqlite_master WHERE type='table' AND name='quantiles'
-        """).fetchall()
-        if exists:
-            print("    Quantiles table already exists, skipping...")
+        filename = self.mmap_dir + 'quantiles.npy'
+        if Path(filename).exists():
             return
 
-        assert self._check_mmap_ready()
-
         print(f"    Constructing Dataset and sampling {sample_size} items...")
-        dataset = PriceHistoryDataset(self.config, 'train', self.mmap_dir)
+        dataset = PriceHistoryDataset(self.config, 'train')
 
         # Sample indices
         n_total = len(dataset)
@@ -569,7 +560,7 @@ class FinalPipeline(dummyLightning):
                 )
         
         print("    Creating quantiles npy...")
-        np.save(self.mmap_dir + 'quantiles.npy', quantiles)
+        np.save(filename, quantiles)
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
