@@ -38,7 +38,7 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 
 class PriceHistoryDataset(Dataset):
     """Dataset backed by memory-mapped numpy arrays."""
-    def __init__(self, config, split: str, mmap_dir: str):
+    def __init__(self, config, split: str, mmap_dir: str | Path):
         self.mmap_dir = Path(mmap_dir)
         self.config = config
         self.horizons, self.seq_len, self.features, self.num_horizons = \
@@ -54,18 +54,16 @@ class PriceHistoryDataset(Dataset):
             mmap_mode='r'
         )  # shape: (total_rows, len(db_features))
 
-        self.stats = {int(r[0]): (r[1], r[2], r[3], r[4]) for r in np.load(self.mmap_dir / 'stats.npy')}
         self.db_feat_idx = {f: i for i, f in enumerate(config.db_features)}
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, idx):
-        stock_index = np.searchsorted(self.cumsums, idx, side='right')
-        stock_id = int(self.stock_ids[stock_index])
-        prev_cumsum = int(self.cumsums[stock_index - 1]) if stock_index > 0 else 0
+        stock_rank = np.searchsorted(self.cumsums, idx, side='right')
+        prev_cumsum = int(self.cumsums[stock_rank - 1]) if stock_rank else 0
         local_idx = idx - prev_cumsum
-        stock_offset = int(self.stock_offsets[stock_index]) 
+        stock_offset = int(self.stock_offsets[stock_rank])
 
         # slice
         max_horizon = max(self.horizons)
@@ -76,8 +74,6 @@ class PriceHistoryDataset(Dataset):
         global_end = stock_offset + end_idx
         raw_data = self.data[global_start:global_end]
 
-        mean_close, std_close, mean_vol, std_vol = self.stats[stock_id]
-
         def g(feat):
             return raw_data[:, self.db_feat_idx[feat]]
         all_features = np.zeros((raw_data.shape[0], len(self.features)), dtype=np.float32)
@@ -85,10 +81,12 @@ class PriceHistoryDataset(Dataset):
             if feat in self.db_feat_idx:
                 all_features[:, feat_idx] = raw_data[:, self.db_feat_idx[feat]]
             elif feat == 'close_norm':
-                all_features[:, feat_idx] = (g('close') - mean_close) / (std_close + 1e-8) * 10
-                close_norm = all_features[self.seq_len // 2:, feat_idx]
+                close = g('close')
+                all_features[:, feat_idx] = close / close[0] - 1
             elif feat == 'volume_norm':
-                all_features[:, feat_idx] = (g('volume') - mean_vol) / (std_vol + 1e-8)
+                volume = g('volume')
+                all_features[:, feat_idx] = ((volume - volume[:self.seq_len // 2].mean())
+                                             / (volume[:self.seq_len // 2].std() + 1e-8))
             elif feat == 'delta_1min':
                 close = g('close')
                 all_features[:-1, feat_idx] = close[1:] - close[:-1]
@@ -104,29 +102,25 @@ class PriceHistoryDataset(Dataset):
             elif feat == 'high_low':
                 all_features[:, feat_idx] = (g('high') / (g('low') + 1e-8) - 1) * 1000
 
-        targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
-        return_targets = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
-        close = g('close')[self.seq_len // 2:]
+        y = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
+        y_ret = np.zeros((self.seq_len//2, self.num_horizons), dtype=np.float32)
         for h_idx, horizon in enumerate(self.horizons):
-            targets[:, h_idx] = close_norm[horizon:horizon + self.seq_len // 2]
-            return_targets[:, h_idx] = (close[horizon:horizon + self.seq_len // 2]
-                                         / (close[:self.seq_len // 2] + 1e-8))
+            y[:, h_idx] = close[horizon + self.seq_len // 2: horizon + self.seq_len] / close[0] - 1
+            y_ret[:, h_idx] = (close[horizon + self.seq_len // 2: horizon + self.seq_len]
+                               / (close[self.seq_len // 2: self.seq_len] + 1e-8))
 
         return (
             torch.from_numpy(all_features[:self.seq_len]).float(),
-            torch.from_numpy(targets).float(),
-            torch.from_numpy(return_targets).float(),
+            torch.from_numpy(y).float(),
+            torch.from_numpy(y_ret).float(),
         )
 
 
 class QuantizeEncoder(dummyLightning):
+    # TODO: compute quantiles and proj
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.n_buckets,
-                                      config.q_dim)
-        self.proj = nn.Linear(config.q_dim
-                              * config.num_quantize_features,
-                              config.embed_dim)
+        self.embedding = nn.Embedding(config.n_buckets, config.q_dim)
 
     def forward(self, x: torch.Tensor, quantiles: torch.Tensor):
         # x: (batch, num_features)
@@ -143,9 +137,7 @@ class QuantizeEncoder(dummyLightning):
         ], dim=1)  # (batch, num_features)
         tokens = tokens.clamp(0, self.n_buckets - 1)
 
-        embedded = self.embedding(tokens)
-        embedded = embedded.flatten(1)  # (batch, num_features * embed_dim) -> (batch, embed_dim)
-        return self.proj(embedded)
+        return self.embedding(tokens).flatten(1)
 
 
 class CentsEncoder(dummyLightning):
@@ -161,27 +153,23 @@ class CentsEncoder(dummyLightning):
         """Convert cent differences to tokens
 
         Args:
-            x: (batch, cent_feats) - delta price features (delta_1min, delta_30min)
+            x: (batch, cent_feats) - delta price features (delta_1min)
 
         Returns:
             (batch, embed_dim) - projected embeddings
         """
-        # Convert to cents and clamp
-        # x: (batch, cent_feats)
         x = (x * 100).long().clamp(-self.max_cent_abs-1, self.max_cent_abs+1)
         x = x + self.max_cent_abs + 1
 
-        # Embed each feature: (batch, cent_feats, embed_dim)
         embedded = self.embedding(x)
 
-        # Flatten and project: (batch, cent_feats * embed_dim) -> (batch, embed_dim)
         batch_size = embedded.shape[0]
         flattened = embedded.reshape(batch_size, -1)
         return self.proj(flattened)
 
 
 class SinEncoder(dummyLightning):
-    ## TODO: values maybe very small. should adapt
+    # TODO: values maybe very small. should adapt
     def __init__(self, config):
         super().__init__(config)
 
@@ -239,8 +227,6 @@ class MultiReadout(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
 
-        self.quantized_head = nn.Linear(config.hidden_dim,
-                                        config.n_buckets * self.num_horizons)
         self.cent_head = nn.Linear(config.hidden_dim,
                                    config.num_cents * self.num_horizons)
         self.variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
@@ -264,11 +250,7 @@ class MultiReadout(dummyLightning):
         batch_size, seq_len, _ = x.shape
         x = x.float()
 
-        if target_type == 'quantized':
-            out = self.quantized_head(x)
-            return out.view(batch_size, seq_len, self.num_horizons,
-                            self.n_buckets)
-        elif target_type == 'cent':
+        if target_type == 'cent':
             out = self.cent_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
                             self.num_cents)
@@ -297,7 +279,7 @@ class FinalPipeline(dummyLightning):
                              torch.tensor(config.quantiles, dtype=torch.float32) / 100.0)
 
         # Adaptive loss scaling: track RMS of each loss type with EMA
-        self.loss_names = ['quantized', 'nll', 'quantile', 'return_nll', 'return_quantile']
+        self.loss_names = ['nll', 'quantile', 'return_nll', 'return_quantile']
         self.loss_ema_decay = 0.99
         for name in self.loss_names:
             self.register_buffer(f'loss_rms_{name}', torch.tensor(1.0))
@@ -332,14 +314,13 @@ class FinalPipeline(dummyLightning):
         return mmap_dir
 
     def _check_mmap_ready(self) -> bool:
-        """Check if memory-mapped arrays exist."""
         mmap_dir = self._get_mmap_dir()
         required_files = [
             'train_data.npy', 'train_stock_ids.npy',
             'train_cumsums.npy', 'train_stock_offsets.npy',
             'val_data.npy', 'val_stock_ids.npy',
             'val_cumsums.npy', 'val_stock_offsets.npy',
-            'stats.npy', 'quantiles.npy'
+            'quantiles.npy'
         ]
         return all((mmap_dir / f).exists() for f in required_files)
 
@@ -355,7 +336,6 @@ class FinalPipeline(dummyLightning):
             pq_path = Path(pq_path)
 
         if self.is_root():
-            # First ensure DuckDB has the data
             con = self.create_db(pq_path, db_path)
             if not self._check_mmap_ready():
                 print("  Creating memory-mapped arrays...")
@@ -382,12 +362,6 @@ class FinalPipeline(dummyLightning):
         self.val_dataset = PriceHistoryDataset(self.config, 'val', mmap_dir)
 
     def _create_mmap_arrays(self, con: duckdb.DuckDBPyConnection, mmap_dir: Path):
-        stats_result = con.execute("""
-            SELECT CAST(SUBSTR(id, 1, 6) AS INTEGER) as stock_id,
-                   mean_close, std_close, mean_volume, std_volume
-            FROM stats
-        """).fetchall()
-        np.save(mmap_dir / 'stats.npy', np.array(stats_result, dtype=np.float32))
         np.save(mmap_dir / 'quantiles.npy', self._load_quantiles(con).numpy())
 
         db_features_cols = ', '.join(self.db_features)
@@ -467,32 +441,21 @@ class FinalPipeline(dummyLightning):
         con.execute("""
             CREATE VIEW IF NOT EXISTS df AS
             SELECT *,
-                -- Returns at different time scales (30min, 1day, 2days) - expensive window functions
-                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) - close, 0) AS delta_30min,
-                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_30min,
-                COALESCE(LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1day,
-                COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_2day
+                -- Returns at different time scales (30min, 1day, 2days)
+                LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_30min,
+                LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_1day,
+                LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_2day
             FROM raw_data
-        """)
-
-        print("  Computing per-stock stats...")
-        con.execute(f"""
-            CREATE TABLE IF NOT EXISTS stats AS
-            SELECT
-                id,
-                AVG(close) AS mean_close,
-                STDDEV(close) AS std_close,
-                AVG(volume) AS mean_volume,
-                STDDEV(volume) AS std_volume
-            FROM raw_data
-            WHERE epoch_ns(datetime) <= {cutoff}
-            GROUP BY id
         """)
 
         print("  Create data tables...")
-        train_exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='train_data'").fetchone()
-        val_exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='val_data'").fetchone()
-        if not (train_exists and val_exists):
+        exists = con.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND (name='train_data' OR name='val_data')
+        """).fetchall()
+        if len(exists) != 2:
+            assert len(exists) < 2
             con.execute("""
                 CREATE TEMP TABLE df_materialized AS
                 SELECT * FROM df
@@ -523,6 +486,7 @@ class FinalPipeline(dummyLightning):
         print("  Build index tables...")
         seq_len = self.seq_len
         max_horizon = max(self.horizons)
+        
         def build2(split='train'):
             print(f"  Building {split}_index...")
             con.execute(f"""
@@ -553,82 +517,11 @@ class FinalPipeline(dummyLightning):
         result = con.execute("""
             SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
         """).fetchnumpy()
-        n_features = result['feature_idx'].max() + 1
-        assert result['q_idx'].max() + 1 == self.n_quantized
-        quantiles = np.zeros((self.n_quantized, n_features), dtype=np.float32)
+        assert result['feature_idx'].max() + 1 == self.n_features
+        assert result['q_idx'].max() + 1 == self.n_buckets
+        quantiles = np.zeros((self.n_buckets, self.n_features), dtype=np.float32)
         quantiles[result['q_idx'], result['feature_idx']] = result['value']
         return torch.from_numpy(quantiles).float()
-
-    def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
-        if con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='quantiles'"
-        ).fetchone():
-            return
-        q_positions = [i / self.n_buckets for i in range(self.n_buckets + 1)]
-        db_features_cols = ', '.join(self.db_features)
-
-        sampled = con.execute(f"""
-            SELECT {db_features_cols}
-            FROM train_data
-            USING SAMPLE {sample_size}
-        """).fetchnumpy()
-
-        avg_mean_close, avg_std_close, avg_mean_vol, avg_std_vol = con.execute("""
-            SELECT AVG(mean_close), AVG(std_close), AVG(mean_volume), AVG(std_volume)
-            FROM stats
-        """).fetchone()
-
-        # Compute derived features for quantile estimation
-        close = sampled['close']
-        open_price = sampled['open']
-        high = sampled['high']
-        low = sampled['low']
-        volume = sampled['volume']
-
-        derived = {
-            'close_norm': (close - avg_mean_close) / (avg_std_close + 1e-8),
-            'volume_norm': (volume - avg_mean_vol) / (avg_std_vol + 1e-8),
-            'delta_1min': np.diff(close, prepend=close[0]),
-            'ret_1min': np.diff(close, prepend=close[0]) / (np.concatenate([[close[0]], close[:-1]]) + 1e-8),
-            'close_open': close / (open_price + 1e-8),
-            'high_open': high / (open_price + 1e-8),
-            'low_open': low / (open_price + 1e-8),
-            'high_low': high / (low + 1e-8),
-        }
-
-        # Create quantiles table
-        con.execute("""
-            CREATE TABLE quantiles (
-                feature_idx INTEGER,
-                q_idx INTEGER,
-                value DOUBLE,
-                PRIMARY KEY (feature_idx, q_idx)
-            )
-        """)
-
-        # Compute and insert quantiles for each feature
-        for f_idx, col in enumerate(self.features):
-            if col in sampled:
-                col_data = np.sort(sampled[col])
-            else:
-                col_data = np.sort(derived[col])
-            n = len(col_data)
-
-            for q_idx, q in enumerate(q_positions):
-                idx = q * (n - 1)
-                idx_lower = int(np.floor(idx))
-                idx_upper = min(int(np.ceil(idx)), n - 1)
-
-                if idx_lower == idx_upper:
-                    quantile_val = col_data[idx_lower]
-                else:
-                    weight = idx - idx_lower
-                    quantile_val = (1 - weight) * col_data[idx_lower] + weight * col_data[idx_upper]
-
-                con.execute(
-                    "INSERT INTO quantiles VALUES (?, ?, ?)",
-                    [f_idx, q_idx, float(quantile_val)]
-                )
 
     def forward(self, x: torch.Tensor):
         encoded = self.encoder(x)
@@ -640,24 +533,10 @@ class FinalPipeline(dummyLightning):
         losses = {}
 
         features = self.forward(x)[:, self.seq_len//2:, :]
-        pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, n_buckets)
-        y = y.to(pred_quantized.dtype)
-        y_returns_typed = y_returns.to(pred_quantized.dtype)
-
-        losses['quantized'] = 0.0
-        quantiles_tensor = self.encoder_quantiles[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)  # TODO: hard-code 0 is bad
-        target_quantized = torch.bucketize(y_returns_typed, quantiles_tensor)
-        target_quantized = torch.clamp(target_quantized, 0, self.n_buckets - 1)
-        for h_idx, h_name in enumerate(self.horizons):
-            h_loss = F.cross_entropy(
-                pred_quantized[:, :, h_idx, :].reshape(-1, self.n_buckets),
-                target_quantized[:, :, h_idx].reshape(-1)
-            )
-            losses[f'quantized_{h_name}'] = h_loss
-            losses['quantized'] += h_loss / len(self.horizons)
 
         losses['quantile'] = 0.0
         pred_quantiles = self.readout(features, 'quantile')
+        y = y.to(pred_quantiles.dtype)
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = self._sided_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
             losses[f'quantile_{h_name}'] = h_loss
@@ -684,14 +563,15 @@ class FinalPipeline(dummyLightning):
             losses[f'return_quantile_{h_name}'] = h_loss
             losses['return_quantile'] += h_loss / len(self.horizons)
         
-        pred_return_mean = pred_return_quantiles[:, :, :, self.num_quantiles//2]
-        pred_return_var = self.readout(features, 'return_var')
-        pred_return_var += 1e-8
+        ret_mean = pred_return_quantiles[:, :, :, self.num_quantiles//2]
+        ret_var = self.readout(features, 'return_var') + 1e-8
 
         losses['return_nll'] = 0.0
         for h_idx, h_name in enumerate(self.horizons):
-            nll = 1/2 * (torch.log(2 * torch.pi * pred_return_var[:, :, h_idx]) +
-                         (y_returns[:, :, h_idx] - pred_return_mean[:, :, h_idx]) ** 2 / pred_return_var[:, :, h_idx])
+            nll = (
+                torch.log(2*torch.pi * ret_var[:, :, h_idx]) +
+                (y_returns[:, :, h_idx] - ret_mean[:, :, h_idx]) ** 2 / ret_var[:, :, h_idx]
+            ) / 2
             nll = nll.clamp(max=20.0)
             h_loss = nll.mean()
             losses[f'return_nll_{h_name}'] = h_loss
@@ -718,14 +598,12 @@ class FinalPipeline(dummyLightning):
             scale_factors[name] = (target_rms / (rms + 1e-8)).clamp(0.1, 10.0)
 
         total_loss = (
-            scale_factors['quantized'] * losses['quantized'] +
             scale_factors['nll'] * losses['nll'] +
             scale_factors['quantile'] * losses['quantile'] +
             scale_factors['return_nll'] * losses['return_nll'] +
             scale_factors['return_quantile'] * losses['return_quantile']
-        ) / 5
+        ) / 4
 
-        self.log('price_prediction/quantized', losses['quantized'])
         self.log('price_prediction/nll', losses['nll'])
         self.log('price_prediction/quantile', losses['quantile'])
         self.log('return_prediction/nll', losses['return_nll'])
@@ -736,18 +614,13 @@ class FinalPipeline(dummyLightning):
             self.log(f'loss_scale/{name}', scale_factors[name])
 
         for h_name in self.horizons:
-            # Price prediction per horizon
-            self.log(f'price_prediction/horizons/{h_name}/quantized', losses[f'quantized_{h_name}'])
-            self.log(f'price_prediction/horizons/{h_name}/nll', losses[f'nll_{h_name}'])
-            self.log(f'price_prediction/horizons/{h_name}/quantile', losses[f'quantile_{h_name}'])
-
-            # Return prediction per horizon
-            self.log(f'return_prediction/horizons/{h_name}/nll', losses[f'return_nll_{h_name}'])
-            self.log(f'return_prediction/horizons/{h_name}/quantile', losses[f'return_quantile_{h_name}'])
+            self.log(f'price/h/{h_name}/nll', losses[f'nll_{h_name}'])
+            self.log(f'price/h/{h_name}/sided', losses[f'quantile_{h_name}'])
+            self.log(f'ret/h/{h_name}/nll', losses[f'return_nll_{h_name}'])
+            self.log(f'ret/h/{h_name}/sided', losses[f'return_quantile_{h_name}'])
 
         result = {
             'loss': total_loss,
-            'quantized_loss': losses['quantized'],
             'nll_loss': losses['nll'],
             'quantile_loss': losses['quantile'],
             'return_nll_loss': losses['return_nll'],
@@ -755,7 +628,6 @@ class FinalPipeline(dummyLightning):
         }
 
         for h_name in self.horizons:
-            result[f'quantized_{h_name}'] = losses[f'quantized_{h_name}']
             result[f'nll_{h_name}'] = losses[f'nll_{h_name}']
             result[f'quantile_{h_name}'] = losses[f'quantile_{h_name}']
             result[f'return_nll_{h_name}'] = losses[f'return_nll_{h_name}']
@@ -877,14 +749,13 @@ class FinalPipelineConfig(dummyConfig):
     max_cent_abs: int = 64
     db_path: str = '/home/jkp/ssd/pipeline.duckdb'
     db_features: tuple = ('open', 'high', 'low', 'close',
-                          'delta_30min', 'ret_30min', 'ret_1day', 'ret_2day',
+                          'ret_30min', 'ret_1day', 'ret_2day',
                           'volume')
-    # All features (including computed in getitem)
-    features: tuple = ('close_norm', 'delta_1min', 'delta_30min',
+    features: tuple = ('close_norm', 'delta_1min',
                        'ret_1min', 'ret_30min', 'ret_1day', 'ret_2day',
                        'close_open', 'high_open', 'low_open', 'high_low',
                        'volume_norm')
-    cent_feats: tuple = ('delta_1min', 'delta_30min')
+    cent_feats: tuple = ('delta_1min',)
     horizons: tuple = (1, 30, 240, 480)
     quantiles: tuple = (0.1, 0.25, 0.5, 0.75, 0.9)
 
@@ -916,7 +787,6 @@ class FinalPipelineConfig(dummyConfig):
         self.q_dim = self.sin_dim = self.embed_dim // 2
         self.num_cents = self.max_cent_abs * 2 + 1
         self.num_features = len(self.features)
-        self.num_quantize_features = self.num_features
         self.num_cent_feats = len(self.cent_feats)
         self.cent_feat_idx = [i for i, f in enumerate(self.features) if f in self.cent_feats]
 
