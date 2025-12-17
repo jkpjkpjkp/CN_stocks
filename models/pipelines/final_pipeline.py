@@ -137,7 +137,10 @@ class QuantizeEncoder(dummyLightning):
         ], dim=1)  # (batch, num_features)
         tokens = tokens.clamp(0, self.n_buckets - 1)
 
-        breakpoint()
+        # Offset each feature's tokens to its own embedding range
+        offsets = torch.arange(x.shape[1], device=x.device) * self.n_buckets
+        tokens = tokens + offsets  # (batch, num_features)
+
         return self.embedding(tokens)
 
 

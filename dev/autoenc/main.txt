@@ -1,0 +1,2 @@
+train a autoencoder model from 30min return data in /data/share/data_raw/intra_30min/ to compute a 'generalized pca' for overnight return each day. 
+using the encoder in ./net.py and a similar decoder, train for various bottleneck_dim
