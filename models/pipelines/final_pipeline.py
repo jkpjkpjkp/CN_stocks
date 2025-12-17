@@ -318,7 +318,7 @@ class FinalPipeline(dummyLightning):
 
     def prepare_data(self):
         if self.is_root():
-            con = self.create_db()
+            con = self._create_db()
             if not self._check_mmap_ready():
                 print("  Creating memory-mapped arrays...")
                 self._create_mmap_arrays(con)
@@ -389,7 +389,7 @@ class FinalPipeline(dummyLightning):
             np.save(self.mmap_dir + f'{split}_stock_offsets.npy', stock_offsets)
             print(f"    Saved {split} arrays: {total_rows} rows")
 
-    def create_db(self):
+    def _create_db(self):
         # Build directly into db_path (in /home/jkp/ssd) - persists across runs
         con = duckdb.connect(self.db_path)
         con.execute(f"SET memory_limit='{self.ram}GB'")
@@ -495,7 +495,6 @@ class FinalPipeline(dummyLightning):
         n_total = len(dataset)
         indices = np.random.choice(n_total, size=min(sample_size, n_total), replace=False)
 
-        # Collect all feature values
         all_features = []
         for i, idx in enumerate(indices):
             x, _, _ = dataset[idx]  # x: (seq_len, num_features)
@@ -511,20 +510,18 @@ class FinalPipeline(dummyLightning):
         n_buckets = self.n_buckets
         quantiles = np.zeros((n_buckets, len(self.features)), dtype=np.float32)
 
-        all_features_t = torch.from_numpy(all_features).cuda()
+        all_features_t = torch.from_numpy(all_features)
 
         for feat_idx, feat in enumerate(self.features):
-            values = all_features_t[:, feat_idx].contiguous()
+            values, _ = all_features_t[:, feat_idx].contiguous().sort()
             n_vals = values.shape[0]
 
             def compute_quantiles_k(k: int) -> torch.Tensor:
-                """Compute k quantiles using torch.kthvalue on GPU."""
                 indices = torch.linspace(0, n_vals - 1, k, device=values.device).long()
-                sorted_vals, _ = values.sort()
-                return sorted_vals[indices]
+                return values[indices]
 
             # Binary search for k such that unique(quantiles(k)) == 256
-            lo, hi = n_buckets, min(n_vals, n_buckets * 2)
+            lo, hi = n_buckets, min(n_vals, n_buckets * 8)
 
             # First check if we can achieve 256 unique at hi
             q_hi = compute_quantiles_k(hi)
