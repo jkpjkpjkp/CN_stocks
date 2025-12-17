@@ -122,7 +122,7 @@ class PriceHistoryDataset(Dataset):
 class QuantizeEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
-        self.embedding = nn.Embedding(config.n_quantize,
+        self.embedding = nn.Embedding(config.n_buckets,
                                       config.q_dim)
         self.proj = nn.Linear(config.q_dim
                               * config.num_quantize_features,
@@ -141,7 +141,7 @@ class QuantizeEncoder(dummyLightning):
                             quantiles_tensor[:, i].contiguous(), right=True)
             for i in range(x.shape[1])
         ], dim=1)  # (batch, num_features)
-        tokens = tokens.clamp(0, self.n_quantize - 1)
+        tokens = tokens.clamp(0, self.n_buckets - 1)
 
         embedded = self.embedding(tokens)
         embedded = embedded.flatten(1)  # (batch, num_features * embed_dim) -> (batch, embed_dim)
@@ -240,16 +240,13 @@ class MultiReadout(dummyLightning):
         super().__init__(config)
 
         self.quantized_head = nn.Linear(config.hidden_dim,
-                                        config.n_quantize * self.num_horizons)
+                                        config.n_buckets * self.num_horizons)
         self.cent_head = nn.Linear(config.hidden_dim,
                                    config.num_cents * self.num_horizons)
-        self.mean_head = nn.Linear(config.hidden_dim, self.num_horizons)
         self.variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
         self.quantile_head = nn.Linear(config.hidden_dim,
                                        config.num_quantiles*self.num_horizons)
 
-        # Return prediction heads (future_close / current_close)
-        self.return_mean_head = nn.Linear(config.hidden_dim, self.num_horizons)
         self.return_variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
         self.return_quantile_head = nn.Linear(config.hidden_dim,
                                               config.num_quantiles*self.num_horizons)
@@ -270,22 +267,17 @@ class MultiReadout(dummyLightning):
         if target_type == 'quantized':
             out = self.quantized_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
-                            self.n_quantize)
+                            self.n_buckets)
         elif target_type == 'cent':
             out = self.cent_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
                             self.num_cents)
-        elif target_type == 'mean':
-            return self.mean_head(x)
         elif target_type == 'var':
             return F.softplus(self.variance_head(x))
         elif target_type == 'quantile':
             out = self.quantile_head(x)
             return out.view(batch_size, seq_len, self.num_horizons,
                             self.num_quantiles)
-        # Return predictions
-        elif target_type == 'return_mean':
-            return self.return_mean_head(x)
         elif target_type == 'return_var':
             return F.softplus(self.return_variance_head(x))
         elif target_type == 'return_quantile':
@@ -449,17 +441,6 @@ class FinalPipeline(dummyLightning):
             np.save(mmap_dir / f'{split}_stock_offsets.npy', stock_offsets)
             print(f"    Saved {split} arrays: {total_rows} rows")
 
-    def _load_quantiles(self, con: duckdb.DuckDBPyConnection) -> torch.Tensor:
-        """Load quantiles from DuckDB connection."""
-        result = con.execute("""
-            SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
-        """).fetchnumpy()
-        n_features = result['feature_idx'].max() + 1
-        n_quantiles = result['q_idx'].max() + 1
-        quantiles = np.zeros((n_quantiles, n_features), dtype=np.float32)
-        quantiles[result['q_idx'], result['feature_idx']] = result['value']
-        return torch.from_numpy(quantiles).float()
-
     def create_db(self, parquet_path: Path, db_path: Path):
         # Build directly into db_path (in /home/jkp/ssd) - persists across runs
         con = duckdb.connect(str(db_path))
@@ -566,13 +547,24 @@ class FinalPipeline(dummyLightning):
         build2('train')
         build2('val')
         return con
+    
+    def _load_quantiles(self, con: duckdb.DuckDBPyConnection) -> torch.Tensor:
+        """Load quantiles from DuckDB connection."""
+        result = con.execute("""
+            SELECT feature_idx, q_idx, value FROM quantiles ORDER BY feature_idx, q_idx
+        """).fetchnumpy()
+        n_features = result['feature_idx'].max() + 1
+        assert result['q_idx'].max() + 1 == self.n_quantized
+        quantiles = np.zeros((self.n_quantized, n_features), dtype=np.float32)
+        quantiles[result['q_idx'], result['feature_idx']] = result['value']
+        return torch.from_numpy(quantiles).float()
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection, sample_size: int):
-        quantiles_exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='quantiles'").fetchone()
-        if quantiles_exists:
+        if con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='quantiles'"
+        ).fetchone():
             return
-        n_quantize = self.n_quantize
-        q_positions = [i / n_quantize for i in range(n_quantize + 1)]
+        q_positions = [i / self.n_buckets for i in range(self.n_buckets + 1)]
         db_features_cols = ', '.join(self.db_features)
 
         sampled = con.execute(f"""
@@ -648,24 +640,31 @@ class FinalPipeline(dummyLightning):
         losses = {}
 
         features = self.forward(x)[:, self.seq_len//2:, :]
-        pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, n_quantize)
+        pred_quantized = self.readout(features, 'quantized')  # (batch, pred_len, num_horizons, n_buckets)
         y = y.to(pred_quantized.dtype)
         y_returns_typed = y_returns.to(pred_quantized.dtype)
 
         losses['quantized'] = 0.0
         quantiles_tensor = self.encoder_quantiles[:, 0].to(y_returns_typed.device, dtype=y_returns_typed.dtype)  # TODO: hard-code 0 is bad
         target_quantized = torch.bucketize(y_returns_typed, quantiles_tensor)
-        target_quantized = torch.clamp(target_quantized, 0, self.n_quantize - 1)
+        target_quantized = torch.clamp(target_quantized, 0, self.n_buckets - 1)
         for h_idx, h_name in enumerate(self.horizons):
             h_loss = F.cross_entropy(
-                pred_quantized[:, :, h_idx, :].reshape(-1, self.n_quantize),
+                pred_quantized[:, :, h_idx, :].reshape(-1, self.n_buckets),
                 target_quantized[:, :, h_idx].reshape(-1)
             )
             losses[f'quantized_{h_name}'] = h_loss
             losses['quantized'] += h_loss / len(self.horizons)
 
+        losses['quantile'] = 0.0
+        pred_quantiles = self.readout(features, 'quantile')
+        for h_idx, h_name in enumerate(self.horizons):
+            h_loss = self._sided_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
+            losses[f'quantile_{h_name}'] = h_loss
+            losses['quantile'] += h_loss / len(self.horizons)
+
         losses['nll'] = 0.0
-        pred_mean = self.readout(features, 'mean')  # (batch, pred_len, num_horizons)
+        pred_mean = pred_quantiles[:, :, :, self.num_quantiles//2]
         pred_var = self.readout(features, 'var')
         pred_var += 1e-8
         for h_idx, h_name in enumerate(self.horizons):
@@ -676,17 +675,16 @@ class FinalPipeline(dummyLightning):
             losses[f'nll_{h_name}'] = h_loss
             losses['nll'] += h_loss / len(self.horizons)
 
-        losses['quantile'] = 0.0
-        pred_quantiles = self.readout(features, 'quantile')
-        for h_idx, h_name in enumerate(self.horizons):
-            h_loss = self._quantile_loss(pred_quantiles[:, :, h_idx, :], y[:, :, h_idx])
-            losses[f'quantile_{h_name}'] = h_loss
-            losses['quantile'] += h_loss / len(self.horizons)
-
-        # ===== Return prediction losses =====
         y_returns = y_returns.to(pred_mean.dtype)
 
-        pred_return_mean = self.readout(features, 'return_mean')
+        losses['return_quantile'] = 0.0
+        pred_return_quantiles = self.readout(features, 'return_quantile')
+        for h_idx, h_name in enumerate(self.horizons):
+            h_loss = self._sided_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
+            losses[f'return_quantile_{h_name}'] = h_loss
+            losses['return_quantile'] += h_loss / len(self.horizons)
+        
+        pred_return_mean = pred_return_quantiles[:, :, :, self.num_quantiles//2]
         pred_return_var = self.readout(features, 'return_var')
         pred_return_var += 1e-8
 
@@ -699,14 +697,6 @@ class FinalPipeline(dummyLightning):
             losses[f'return_nll_{h_name}'] = h_loss
             losses['return_nll'] += h_loss / len(self.horizons)
 
-        losses['return_quantile'] = 0.0
-        pred_return_quantiles = self.readout(features, 'return_quantile')
-        for h_idx, h_name in enumerate(self.horizons):
-            h_loss = self._quantile_loss(pred_return_quantiles[:, :, h_idx, :], y_returns[:, :, h_idx])
-            losses[f'return_quantile_{h_name}'] = h_loss
-            losses['return_quantile'] += h_loss / len(self.horizons)
-
-        
         with torch.no_grad():  # Adaptive loss scaling with RMS estimates
             loss_values = {name: losses[name].detach() for name in self.loss_names}
 
@@ -776,7 +766,7 @@ class FinalPipeline(dummyLightning):
 
         return result
 
-    def _quantile_loss(self, pred, target):
+    def _sided_loss(self, pred, target):
         """ pred: (b, l, num_quantiles)
           target: (b, l)
         """
@@ -883,7 +873,7 @@ class FinalPipelineConfig(dummyConfig):
 
     # Data
     seq_len: int = 4096
-    n_quantize: int = 128
+    n_buckets: int = 128
     max_cent_abs: int = 64
     db_path: str = '/home/jkp/ssd/pipeline.duckdb'
     db_features: tuple = ('open', 'high', 'low', 'close',

@@ -1,0 +1,27 @@
+the val data is (~/ssd/a_1min.pq) whose timestamp is after training cutoff (~/ssd/pipeline_cutoff.txt)
+
+the prediction model is in final_pipeline.py, with checkpoint at ~/ssd/me
+
+as is the setting used in training, we will calculate the log(1+return) for each chunk of 2048.
+for each chunk (period), assume we start with cash 100M RMB. 
+the trading cost is 26/100000 for buyer and 76/100000 for seller
+each stock can only be sold on the next day of buying. 
+
+
+we will assume the nll estimate of return mean and variance is accurate, and decide upon a optimal holding strategy across the latter half (1024) of the period, where we get per-minute forecast of return of next (1, 30, 240, 480) minutes. 
+
+
+we act upon information as they emerge:
+
+at each instant, we decide wether to sell part of our sellable holding and purchase some other stock. 
+
+we sort all stocks by projected 480 minute return, and one-by-one consider buying the top 100
+for each stock, we alter our holding if the expected 240 minute return will go up by at least 0.05% after paying a 0.102% transaction fee, and replace all such holdings
+we, however, do not make such a transfer unless the projected 1min and 30min return is larger with the new stock than the old. 
+
+we calculate the change-hand decision every minute. note:
+1. we consider transaction fees together. that is, we sequentially considering the 100 potential buys, the `virtual bought` stocks are eligible to immediate sell (a 'change of mind' on our side) (we change our mind when the projected 240 min return goes up by at least 0.05% + drop in projected 480 min return, and we need not pay/consider transaction fee for this scenario)
+2. after all 100 stocks are considered, we make the actual trade, pay transaction fee, and put the newly bought into the 'just-bought' bucket
+(we need to store 2 buckets of stocks, the sellable and the just-bought, and merge the 2nd to the 1st at the start of a new day) 
+
+for this portfolio strategy, we will ignore the variance estimate and only consider the mean return estimate

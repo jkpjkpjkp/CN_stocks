@@ -6,12 +6,12 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv
 uv.lock
 best_model.pth
 
-/.checkpoint*
+/.*
+!/.gitignore
 /mlruns/
-/.log.txt
-/.tmp
+
+/*.png
+/~/
