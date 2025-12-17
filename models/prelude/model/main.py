@@ -285,4 +285,5 @@ class dummyLightning(Module):
 class dummyConfig:
     def __post_init__(self):
         # Dataloader
-        self.num_workers = self.num_workers or os.cpu_count()
+        if self.num_workers is None:
+            self.num_workers = os.cpu_count()

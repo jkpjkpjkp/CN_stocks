@@ -70,7 +70,7 @@ class PriceHistoryDataset(Dataset):
     def __getitem__(self, idx):
         stock_rank = np.searchsorted(self.cumsums, idx, side='right')
         prev_cumsum = int(self.cumsums[stock_rank - 1]) if stock_rank else 0
-        local_idx = idx - prev_cumsum
+        local_idx = idx - prev_cumsum + self.config.warmup_rows  # skip warmup rows
         stock_offset = int(self.stock_offsets[stock_rank])
 
         # slice
@@ -81,28 +81,27 @@ class PriceHistoryDataset(Dataset):
         global_start = stock_offset + local_idx
         global_end = stock_offset + end_idx
         raw_data = self.data[global_start:global_end]
+        prev_close = self.data[global_start-1, self.db_feat_idx['close']]
 
         def g(feat):
             return raw_data[:, self.db_feat_idx[feat]]
+        close = g('close')
         all_features = np.zeros((raw_data.shape[0], len(self.features)), dtype=np.float32)
         for feat_idx, feat in enumerate(self.features):
             if feat in self.db_feat_idx:
                 all_features[:, feat_idx] = raw_data[:, self.db_feat_idx[feat]]
             elif feat == 'close_norm':
-                close = g('close')
-                all_features[:, feat_idx] = close / close[0] - 1
+                all_features[:, feat_idx] = close / prev_close - 1
             elif feat == 'volume_norm':
                 volume = g('volume')
                 all_features[:, feat_idx] = ((volume - volume[:self.seq_len // 2].mean())
                                              / (volume[:self.seq_len // 2].std() + 1e-8))
             elif feat == 'delta_1min':
-                close = g('close')
                 all_features[:-1, feat_idx] = close[1:] - close[:-1]
             elif feat == 'ret_1min':
-                close = g('close')
                 all_features[:-1, feat_idx] = (close[1:] / (close[:-1] + 1e-8) - 1)
             elif feat == 'close_open':
-                all_features[:, feat_idx] = (g('close') / (g('open') + 1e-8) - 1)
+                all_features[:, feat_idx] = (close / (g('open') + 1e-8) - 1)
             elif feat == 'high_open':
                 all_features[:, feat_idx] = (g('high') / (g('open') + 1e-8) - 1)
             elif feat == 'low_open':
@@ -130,8 +129,11 @@ class PriceHistoryDataset(Dataset):
             # y_norm_factors has shape (seq_len//2,), need to broadcast to (seq_len//2, num_horizons)
             y = y / (self.y_norm_factors[:, None] + 1e-8)
 
+        delta = close[1:self.seq_len] - close[:self.seq_len-1]
+        delta = np.concatenate(([close[0]-prev_close], delta), axis=0)
         return (
             torch.from_numpy(all_features[:self.seq_len]).float(),
+            torch.from_numpy(delta).float(),
             torch.from_numpy(y).float(),
             torch.from_numpy(y_ret).float(),
         )
@@ -182,7 +184,7 @@ class CentsEncoder(dummyLightning):
         """Convert cent differences to tokens
 
         Args:
-            x: (batch, cent_feats) - delta price features (delta_1min)
+            x: (batch,) - delta price features (delta_1min)
 
         Returns:
             (batch, embed_dim) - projected embeddings
@@ -235,14 +237,14 @@ class MultiEncoder(dummyLightning):
 
         self.combiner = nn.Linear(3 * config.embed_dim, config.hidden_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, x_cents):
         """x: (batch, seq_len, features)"""
         batch_size, seq_len, feat_dim = x.shape
 
         x_flat = x.view(-1, feat_dim)
         embeddings = [
             self.quantize_encoder(x_flat),
-            self.cent_encoder(x_flat[:, self.cent_feat_idx]),
+            self.cent_encoder(x_cents),
             self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
@@ -428,10 +430,10 @@ class FinalPipeline(dummyLightning):
             cutoff = int(float(cutoff_cache_path.read_text().strip()))
         else:
             print("  Computing train/val cutoff (90th percentile of datetime)...")
-            cutoff = con.execute("""
+            cutoff = con.execute(f"""
                 SELECT QUANTILE_CONT(epoch_ns(datetime), 0.9) as cutoff
-                FROM (SELECT datetime FROM raw_data USING SAMPLE ?)
-            """, [self.samples]).fetchone()
+                FROM (SELECT datetime FROM raw_data USING SAMPLE {self.samples})
+            """).fetchone()
             cutoff_cache_path.write_text(str(cutoff))
         print(f"  Train/val cutoff timestamp: {cutoff}")
 
@@ -491,7 +493,7 @@ class FinalPipeline(dummyLightning):
                 valid_stocks AS (
                     SELECT
                         stock_id,
-                        stock_len - {seq_len} - {max_horizon} AS valid_samples
+                        stock_len - {seq_len} - {max_horizon} - {self.warmup_rows} AS valid_samples
                     FROM stock_lengths
                 )
                 SELECT
@@ -505,7 +507,6 @@ class FinalPipeline(dummyLightning):
         return con
 
     def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection):
-        """Compute 256 quantiles by iterating through Dataset, deduplicating high-frequency modes."""
         filename = self.mmap_dir + 'quantiles.npy'
         if Path(filename).exists():
             return
@@ -526,7 +527,7 @@ class FinalPipeline(dummyLightning):
         all_features = np.concatenate(all_features, axis=0)  # (samples * seq_len, num_features)
         print(f"    Collected {all_features.shape[0]} feature vectors")
 
-        print("     Computing quantiles with deduplication via binary search on k...")
+        print("     Computing quantiles via binary search on k...")
         n_breaks = self.n_buckets - 1
         quantiles = np.zeros((n_breaks, len(self.features)), dtype=np.float32)
 
@@ -618,16 +619,16 @@ class FinalPipeline(dummyLightning):
         print(f"    Saved y stats to {stats_file}")
 
 
-    def forward(self, x: torch.Tensor):
-        encoded = self.encoder(x)
+    def forward(self, x, x_cents):
+        encoded = self.encoder(x, x_cents)
         features = self.backbone(encoded)
         return features
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
-        x, y, y_returns = batch
+        x, x_cents, y, y_returns = batch
         losses = {}
 
-        features = self.forward(x)[:, self.seq_len//2:, :]
+        features = self.forward(x), x_cents[:, self.seq_len//2:, :]
 
         losses['quantile'] = 0.0
         pred_quantiles = self.readout(features, 'quantile')
@@ -819,6 +820,7 @@ class FinalPipelineConfig(dummyConfig):
     n_buckets: int = 256
     max_cent_abs: int = 64
     samples: int = 1000000
+    warmup_rows: int = 481  # first rows to skip per stock (ret_2day may be null)
     db_path: str = '/home/jkp/ssd/pipeline.duckdb'
     db_features: tuple = ('open', 'high', 'low', 'close',
                           'ret_30min', 'ret_1day', 'ret_2day',
@@ -827,7 +829,6 @@ class FinalPipelineConfig(dummyConfig):
                        'ret_1min', 'ret_30min', 'ret_1day', 'ret_2day',
                        'close_open', 'high_open', 'low_open', 'high_low',
                        'volume_norm')
-    cent_feats: tuple = ('delta_1min',)
     horizons: tuple = (1, 30, 240, 480)
     quantiles: tuple = (0.1, 0.25, 0.5, 0.75, 0.9)
     mmap_dir: str = '/home/jkp/ssd/pipeline_mmap/'
@@ -862,9 +863,6 @@ class FinalPipelineConfig(dummyConfig):
         self.q_dim = self.sin_dim = self.embed_dim // 2
         self.num_cents = self.max_cent_abs * 2 + 1
         self.num_features = len(self.features)
-        self.num_cent_feats = len(self.cent_feats)
-        self.cent_feat_idx = [i for i, f in enumerate(self.features) if f in self.cent_feats]
-
         # Prediction
         self.num_horizons = len(self.horizons)
         self.num_quantiles = len(self.quantiles)
