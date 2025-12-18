@@ -40,9 +40,14 @@ class PriceHistoryDataset(Dataset):
             config.horizons, config.seq_len, config.features, config.num_horizons
 
         self.stock_ids = np.load(config.mmap_dir + f'{split}_stock_ids.npy')
-        self.cumsums = np.load(config.mmap_dir + f'{split}_cumsums.npy')
+        self.valid_row_idxs = np.load(config.mmap_dir + f'{split}_valid_row_idxs.npy')
+        self.valid_stock_ids = np.load(config.mmap_dir + f'{split}_valid_stock_ids.npy')
         self.stock_offsets = np.load(config.mmap_dir + f'{split}_stock_offsets.npy')
-        self.total_samples = int(self.cumsums[-1]) if len(self.cumsums) else 0
+        self.total_samples = len(self.valid_row_idxs)
+
+        # Build mapping from stock_id to its rank in stock_ids array
+        self.stock_id_to_rank = {int(sid): i for i, sid in enumerate(self.stock_ids)}
+
         self.data = np.load(
             config.mmap_dir + f'{split}_data.npy',
             mmap_mode='r'
@@ -66,9 +71,10 @@ class PriceHistoryDataset(Dataset):
         return self.total_samples
 
     def __getitem__(self, idx):
-        stock_rank = np.searchsorted(self.cumsums, idx, side='right')
-        prev_cumsum = int(self.cumsums[stock_rank - 1]) if stock_rank else 0
-        local_idx = idx - prev_cumsum
+        # Get the stock_id and row_idx for this sample
+        stock_id = int(self.valid_stock_ids[idx])
+        local_idx = int(self.valid_row_idxs[idx])
+        stock_rank = self.stock_id_to_rank[stock_id]
         stock_offset = int(self.stock_offsets[stock_rank])
 
         # slice
@@ -294,8 +300,10 @@ class FinalPipeline(dummyLightning):
 
     def _check_mmap_ready(self, require_quantile=False, require_y_stats=False) -> bool:
         required_files = (
-            'train_data.npy', 'train_stock_ids.npy', 'train_cumsums.npy', 'train_stock_offsets.npy',
-            'val_data.npy', 'val_stock_ids.npy', 'val_cumsums.npy', 'val_stock_offsets.npy',
+            'train_data.npy', 'train_stock_ids.npy', 'train_valid_row_idxs.npy',
+            'train_valid_stock_ids.npy', 'train_stock_offsets.npy',
+            'val_data.npy', 'val_stock_ids.npy', 'val_valid_row_idxs.npy',
+            'val_valid_stock_ids.npy', 'val_stock_offsets.npy',
         )
         if require_quantile:
             required_files += ('quantiles.npy',)
@@ -331,18 +339,22 @@ class FinalPipeline(dummyLightning):
             split_files = [
                 f'{split}_data.npy',
                 f'{split}_stock_ids.npy',
-                f'{split}_cumsums.npy',
+                f'{split}_valid_row_idxs.npy',
                 f'{split}_stock_offsets.npy',
             ]
             if all(Path(self.mmap_dir + f).exists() for f in split_files):
                 print(f"    {split} arrays already exist, skipping...")
                 continue
 
-            index = con.execute(f"""
-                SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
+            # Get valid starting points (stock_id, row_idx) for 9:31 AM windows
+            valid_starts = con.execute(f"""
+                SELECT stock_id, row_idx FROM {split}_index ORDER BY stock_id, row_idx
             """).fetchall()
-            stock_ids = np.array([r[0] for r in index], dtype=np.int64)
-            cumsums = np.array([r[1] for r in index], dtype=np.int64)
+            valid_stock_ids = np.array([r[0] for r in valid_starts], dtype=np.int64)
+            valid_row_idxs = np.array([r[1] for r in valid_starts], dtype=np.int64)
+
+            # Get unique stocks that have valid samples
+            unique_stock_ids = np.unique(valid_stock_ids)
 
             stock_lengths = con.execute(f"""
                 SELECT stock_id, COUNT(*) as cnt
@@ -352,15 +364,18 @@ class FinalPipeline(dummyLightning):
             """).fetchall()
             stock_len_map = {r[0]: r[1] for r in stock_lengths}
 
-            stock_offsets = np.zeros(len(stock_ids), dtype=np.int64)
+            # Build stock_offsets for the data array
+            stock_offsets = np.zeros(len(unique_stock_ids), dtype=np.int64)
+            stock_id_to_rank = {}
             offset = 0
-            for i, sid in enumerate(stock_ids):
+            for i, sid in enumerate(unique_stock_ids):
+                stock_id_to_rank[int(sid)] = i
                 stock_offsets[i] = offset
                 offset += stock_len_map.get(int(sid), 0)
             total_rows = offset
 
             data = np.zeros((total_rows, len(self.db_features)), dtype=np.float32)
-            for i, stock_id in enumerate(stock_ids):
+            for i, stock_id in enumerate(unique_stock_ids):
                 stock_id = int(stock_id)
                 result = con.execute(f"""
                     SELECT {db_features_cols}
@@ -378,13 +393,14 @@ class FinalPipeline(dummyLightning):
                     data[start:start + n_rows, col_idx] = result[col]
 
                 if i % 500 == 0:
-                    print(f"      Processed {i}/{len(stock_ids)} stocks")
+                    print(f"      Processed {i}/{len(unique_stock_ids)} stocks")
 
             np.save(self.mmap_dir + f'{split}_data.npy', data)
-            np.save(self.mmap_dir + f'{split}_stock_ids.npy', stock_ids)
-            np.save(self.mmap_dir + f'{split}_cumsums.npy', cumsums)
+            np.save(self.mmap_dir + f'{split}_stock_ids.npy', unique_stock_ids)
+            np.save(self.mmap_dir + f'{split}_valid_row_idxs.npy', valid_row_idxs)
+            np.save(self.mmap_dir + f'{split}_valid_stock_ids.npy', valid_stock_ids)
             np.save(self.mmap_dir + f'{split}_stock_offsets.npy', stock_offsets)
-            print(f"    Saved {split} arrays: {total_rows} rows")
+            print(f"    Saved {split} arrays: {total_rows} rows, {len(valid_starts)} valid samples")
 
     def _create_db(self):
         con = duckdb.connect(self.db_path)
@@ -439,7 +455,7 @@ class FinalPipeline(dummyLightning):
                     SELECT
                         CAST(SUBSTR(d.id, 1, 6) AS INTEGER) AS stock_id,  -- this is correct: 'a start value of 1 refers to the first character of the string'
                         ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY d.datetime) - 1 AS row_idx,
-                        CAST(d.datetime AS DATE) AS date,
+                        d.datetime AS datetime,
                         {',\n  '.join(f'd.{f}' for f in self.db_features)}
                     FROM df_materialized d
                     WHERE epoch_ns(d.datetime) {'<=' if split == 'train' else '>'} {cutoff}
@@ -457,24 +473,21 @@ class FinalPipeline(dummyLightning):
 
         def build2(split='train'):
             print(f"  Building {split}_index...")
+            # Store valid starting row_idx values for 9:31 AM windows
             con.execute(f"""
                 CREATE TABLE IF NOT EXISTS {split}_index AS
                 WITH stock_lengths AS (
                     SELECT stock_id, MAX(row_idx) + 1 AS stock_len
                     FROM {split}_data
                     GROUP BY stock_id
-                ),
-                valid_stocks AS (
-                    SELECT
-                        stock_id,
-                        stock_len - {seq_len} - {max_horizon} AS valid_samples
-                    FROM stock_lengths
                 )
-                SELECT
-                    stock_id,
-                    SUM(valid_samples) OVER (ORDER BY stock_id) AS cumsum
-                FROM valid_stocks
-                WHERE valid_samples > 0
+                SELECT d.stock_id, d.row_idx
+                FROM {split}_data d
+                JOIN stock_lengths sl ON d.stock_id = sl.stock_id
+                WHERE EXTRACT(HOUR FROM d.datetime) = 9
+                  AND EXTRACT(MINUTE FROM d.datetime) = 31
+                  AND d.row_idx + {seq_len} + {max_horizon} <= sl.stock_len
+                ORDER BY d.stock_id, d.row_idx
             """)
         build2('train')
         build2('val')

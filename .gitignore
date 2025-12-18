@@ -11,3 +11,5 @@ wheels/
 /mlruns/
 
 /*.png
+
+/mlflow.db*
