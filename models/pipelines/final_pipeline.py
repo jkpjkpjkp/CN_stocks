@@ -1,7 +1,6 @@
 """
 1. Multiple encoding strategies:
    - Quantize: percentile
-   - Cent: delta in cents
    - Sinusoidal
 
 2. preprocessing:
@@ -127,11 +126,8 @@ class PriceHistoryDataset(Dataset):
             # y_norm_factors has shape (seq_len//2,), need to broadcast to (seq_len//2, num_horizons)
             y = y / (self.y_norm_factors[:, None] + 1e-8)
 
-        delta = close[1:self.seq_len] - close[:self.seq_len-1]
-        delta = np.concatenate(([close[0]-prev_close], delta), axis=0)
         return (
             torch.from_numpy(all_features[:self.seq_len]).float(),
-            torch.from_numpy(delta).float(),
             torch.from_numpy(y).float(),
             torch.from_numpy(y_ret).float(),
         )
@@ -171,31 +167,6 @@ class QuantizeEncoder(dummyLightning):
         return ret
 
 
-class CentsEncoder(dummyLightning):
-    def __init__(self, config):
-        super().__init__(config)
-        self.max_cent_abs = config.max_cent_abs
-        self.embedding = nn.Embedding(2 * config.max_cent_abs + 3,
-                                      config.embed_dim)
-
-    def forward(self, x):
-        """Convert cent differences to tokens
-
-        Args:
-            x: (batch,) - delta price features (delta_1min)
-
-        Returns:
-            (batch, embed_dim) - projected embeddings
-        """
-        x = x * 100
-        assert (x - x.long()).abs().max() < 1e-6, f"{x}"
-        x = x.long().clamp(-self.max_cent_abs-1, self.max_cent_abs+1)
-        x = x + self.max_cent_abs + 1
-
-        emb = self.embedding(x)
-        return emb.mean(dim=1)
-
-
 class SinEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
@@ -230,19 +201,17 @@ class MultiEncoder(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
         self.quantize_encoder = QuantizeEncoder(config)
-        self.cent_encoder = CentsEncoder(config)
         self.sin_encoder = SinEncoder(config)
 
-        self.combiner = nn.Linear(3 * config.embed_dim, config.hidden_dim)
+        self.combiner = nn.Linear(2 * config.embed_dim, config.hidden_dim)
 
-    def forward(self, x, x_cents):
+    def forward(self, x):
         """x: (batch, seq_len, features)"""
         batch_size, seq_len, feat_dim = x.shape
 
         x_flat = x.view(-1, feat_dim)
         embeddings = [
             self.quantize_encoder(x_flat),
-            self.cent_encoder(x_cents),
             self.sin_encoder(x_flat),
         ]
         output = self.combiner(torch.cat(embeddings, dim=-1))
@@ -254,8 +223,6 @@ class MultiReadout(dummyLightning):
     def __init__(self, config):
         super().__init__(config)
 
-        self.cent_head = nn.Linear(config.hidden_dim,
-                                   config.num_cents * self.num_horizons)
         self.variance_head = nn.Linear(config.hidden_dim, self.num_horizons)
         self.quantile_head = nn.Linear(config.hidden_dim,
                                        config.num_quantiles*self.num_horizons)
@@ -276,11 +243,7 @@ class MultiReadout(dummyLightning):
         batch_size, seq_len, _ = x.shape
         x = x.float()
 
-        if target_type == 'cent':
-            out = self.cent_head(x)
-            return out.view(batch_size, seq_len, self.num_horizons,
-                            self.num_cents)
-        elif target_type == 'var':
+        if target_type == 'var':
             return F.softplus(self.variance_head(x))
         elif target_type == 'quantile':
             out = self.quantile_head(x)
@@ -528,7 +491,7 @@ class FinalPipeline(dummyLightning):
         all_y = []
         all_y_ret = []
         for i, idx in enumerate(indices):
-            _, _, y, y_ret = dataset[idx]
+            _, y, y_ret = dataset[idx]
             all_y.append(y.numpy())
             all_y_ret.append(y_ret.numpy())
             if i % 10000 == 0:
@@ -637,16 +600,16 @@ class FinalPipeline(dummyLightning):
                 )
         np.save(filename, quantiles)
 
-    def forward(self, x, x_cents):
-        encoded = self.encoder(x, x_cents)
+    def forward(self, x):
+        encoded = self.encoder(x)
         features = self.backbone(encoded)
         return features
 
     def step(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
-        x, x_cents, y, y_returns = batch
+        x, y, y_returns = batch
         losses = {}
 
-        features = self.forward(x, x_cents)
+        features = self.forward(x)
 
         losses['quantile'] = 0.0
         pred_quantiles = self.readout(features, 'quantile')
@@ -836,7 +799,6 @@ class FinalPipelineConfig(dummyConfig):
     # Data
     seq_len: int = 4096
     n_buckets: int = 256
-    max_cent_abs: int = 64
     samples: int = 1000000
     warmup_rows: int = 481  # first rows to skip per stock (ret_2day may be null)
     db_path: str = '/home/jkp/ssd/pipeline.duckdb'
@@ -879,7 +841,6 @@ class FinalPipelineConfig(dummyConfig):
 
         # Embedding
         self.q_dim = self.sin_dim = self.embed_dim // 2
-        self.num_cents = self.max_cent_abs * 2 + 1
         self.num_features = len(self.features)
         # Prediction
         self.num_horizons = len(self.horizons)
