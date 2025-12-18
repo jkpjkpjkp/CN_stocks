@@ -6,9 +6,6 @@ dist/
 wheels/
 *.egg-info
 
-uv.lock
-best_model.pth
-
 /.*
 !/.gitignore
 /mlruns/
