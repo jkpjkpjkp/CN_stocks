@@ -609,7 +609,7 @@ class FinalPipeline(dummyLightning):
         x, y, y_returns = batch
         losses = {}
 
-        features = self.forward(x)
+        features = self.forward(x)[:, self.seq_len//2:, :]
 
         losses['quantile'] = 0.0
         pred_quantiles = self.readout(features, 'quantile')
