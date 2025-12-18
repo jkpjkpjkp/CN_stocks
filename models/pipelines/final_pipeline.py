@@ -5,7 +5,7 @@
 
 2. preprocessing:
    - Per-stock normalized
-   - Returns (1min, 30min, 1day, 2day)
+   - Returns (all in minutes: 1min, 30min, 240min, 480min, 1200min, 4800min, 19200min, 76800min)
    - close divided by open, etc. (intra-minute)
 
 3. predictions:
@@ -16,7 +16,7 @@
    - Quantile predictions (sided Huber loss)
 
 4. horizons:
-   - 1min, 30min, 1day, 2day
+   - 1min, 30min, 240min, 480min (prediction horizons)
 """
 import torch
 from torch import nn
@@ -68,7 +68,7 @@ class PriceHistoryDataset(Dataset):
     def __getitem__(self, idx):
         stock_rank = np.searchsorted(self.cumsums, idx, side='right')
         prev_cumsum = int(self.cumsums[stock_rank - 1]) if stock_rank else 0
-        local_idx = idx - prev_cumsum + self.config.warmup_rows  # skip warmup rows
+        local_idx = idx - prev_cumsum
         stock_offset = int(self.stock_offsets[stock_rank])
 
         # slice
@@ -410,9 +410,13 @@ class FinalPipeline(dummyLightning):
         con.execute("""
             CREATE VIEW IF NOT EXISTS df AS
             SELECT *,
-                LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_30min,
-                LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_1day,
-                LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1 AS ret_2day
+                COALESCE(LEAD(close, 30) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_30min,
+                COALESCE(LEAD(close, 240) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_240min,
+                COALESCE(LEAD(close, 480) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_480min,
+                COALESCE(LEAD(close, 1200) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_1200min,
+                COALESCE(LEAD(close, 4800) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_4800min,
+                COALESCE(LEAD(close, 19200) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_19200min,
+                COALESCE(LEAD(close, 76800) OVER (PARTITION BY id ORDER BY datetime) / close - 1, 0) AS ret_76800min
             FROM raw_data
         """)
 
@@ -463,7 +467,7 @@ class FinalPipeline(dummyLightning):
                 valid_stocks AS (
                     SELECT
                         stock_id,
-                        stock_len - {seq_len} - {max_horizon} - {self.warmup_rows} AS valid_samples
+                        stock_len - {seq_len} - {max_horizon} AS valid_samples
                     FROM stock_lengths
                 )
                 SELECT
@@ -800,13 +804,14 @@ class FinalPipelineConfig(dummyConfig):
     seq_len: int = 4096
     n_buckets: int = 256
     samples: int = 1000000
-    warmup_rows: int = 481  # first rows to skip per stock (ret_2day may be null)
     db_path: str = '/home/jkp/ssd/pipeline.duckdb'
     db_features: tuple = ('open', 'high', 'low', 'close',
-                          'ret_30min', 'ret_1day', 'ret_2day',
+                          'ret_30min', 'ret_240min', 'ret_480min',
+                          'ret_1200min', 'ret_4800min', 'ret_19200min', 'ret_76800min',
                           'volume')
     features: tuple = ('close_norm', 'delta_1min',
-                       'ret_1min', 'ret_30min', 'ret_1day', 'ret_2day',
+                       'ret_1min', 'ret_30min', 'ret_240min', 'ret_480min',
+                       'ret_1200min', 'ret_4800min', 'ret_19200min', 'ret_76800min',
                        'close_open', 'high_open', 'low_open', 'high_low',
                        'volume_norm')
     horizons: tuple = (1, 30, 240, 480)

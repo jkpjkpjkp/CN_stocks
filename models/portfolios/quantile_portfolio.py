@@ -185,7 +185,7 @@ class QuantilePortfolioSimulator:
                 ret_1min[:-1] = (close[1:] / (close[:-1] + 1e-8) - 1) * 100
                 features[aligned_idx, feat_idx['ret_1min']] = ret_1min
 
-            for f in ['delta_30min', 'ret_30min', 'ret_1day', 'ret_2day']:
+            for f in ['ret_30min', 'ret_240min', 'ret_480min', 'ret_1200min', 'ret_4800min', 'ret_19200min', 'ret_76800min']:
                 if f in feat_idx:
                     features[aligned_idx, feat_idx[f]] = 0
 

@@ -263,7 +263,7 @@ class PortfolioSimulator:
                 features[aligned_idx, feat_idx['ret_1min']] = ret_1min
 
             # These would need proper computation from wider window; use 0 for now
-            for f in ['delta_30min', 'ret_30min', 'ret_1day', 'ret_2day']:
+            for f in ['ret_30min', 'ret_240min', 'ret_480min', 'ret_1200min', 'ret_4800min', 'ret_19200min', 'ret_76800min']:
                 if f in feat_idx:
                     features[aligned_idx, feat_idx[f]] = 0
 

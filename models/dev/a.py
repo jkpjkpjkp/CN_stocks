@@ -1,1 +1,0 @@
-np.load('data.npy')

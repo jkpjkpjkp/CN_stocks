@@ -1,10 +1,8 @@
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torch.nn import Module, functional as F
-import mlflow
-import random
+from torch.utils.data import Dataset
+from torch.nn import functional as F
 from ..prelude.model import dummyLightning
 from ..prelude.data import halfdayData
 
