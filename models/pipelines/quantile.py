@@ -1,13 +1,12 @@
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torch.nn import Embedding, Module, Linear, CrossEntropyLoss
-import mlflow
-import random
+from torch.utils.data import Dataset
+from torch.nn import Embedding, Linear
 
 from ..prelude.model import dummyLightning
 from ..prelude.data import halfdayData
+
 
 class _quantile_30min(Dataset, halfdayData):
     def __init__(self, filename):
@@ -21,6 +20,7 @@ class _quantile_30min(Dataset, halfdayData):
         y = np.searchsorted(self.q30, y)
         x = np.searchsorted(self.q, x)
         return x, y
+
 
 class quantile_30min(dummyLightning):
     def __init__(self, config, trunk):

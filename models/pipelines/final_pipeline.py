@@ -34,8 +34,9 @@ from ..prelude.model import dummyLightning, dummyConfig, TM
 
 
 class PriceHistoryDataset(Dataset):
-    def __init__(self, config, split: str, load_y_stats: bool = True):
+    def __init__(self, config, split: str, normalize=True):
         self.config = config
+        self.normalize = normalize
         self.horizons, self.seq_len, self.features, self.num_horizons = \
             config.horizons, config.seq_len, config.features, config.num_horizons
 
@@ -50,10 +51,8 @@ class PriceHistoryDataset(Dataset):
 
         self.db_feat_idx = {f: i for i, f in enumerate(config.db_features)}
 
-        # Load y normalization stats if available
-        self.load_y_stats = load_y_stats
-        if load_y_stats:
-            stats_file = config.mmap_dir + 'y_stats.npz'
+        if normalize:
+            stats_file = config.mmap_dir + 'y_stats.npy'
             stats = np.load(stats_file)
             self.y_ret_mean = stats['y_ret_mean']  # (num_horizons,)
             self.y_ret_std = stats['y_ret_std']    # (num_horizons,)
@@ -120,8 +119,7 @@ class PriceHistoryDataset(Dataset):
         y = np.arcsinh(y)
         y_ret = np.arcsinh(y_ret)
 
-        # Normalize if stats are loaded
-        if self.load_y_stats:
+        if self.normalize:
             # y_ret: normalize to ~N(0,1) per horizon
             y_ret = (y_ret - self.y_ret_mean) / (self.y_ret_std + 1e-8)
 
@@ -338,8 +336,6 @@ class FinalPipeline(dummyLightning):
         )
         if require_quantile:
             required_files += ('quantiles.npy',)
-        if require_y_stats:
-            required_files += ('y_stats.npz',)
         return all(Path(self.mmap_dir + f).exists() for f in required_files)
 
     def prepare_data(self):
@@ -349,8 +345,8 @@ class FinalPipeline(dummyLightning):
                 print("  Creating memory-mapped arrays...")
                 self._create_mmap_arrays(con)
 
-            print("  Compute and store quantiles from train_data...")
-            self._compute_and_store_quantiles(con)
+            self._compute_ystats(con)
+            self._compute_quantiles(con)
 
             con.close()
         else:  # wait
@@ -368,6 +364,17 @@ class FinalPipeline(dummyLightning):
     def _create_mmap_arrays(self, con: duckdb.DuckDBPyConnection):
         db_features_cols = ', '.join(self.db_features)
         for split in ['train', 'val']:
+            # Check if all arrays for this split already exist
+            split_files = [
+                f'{split}_data.npy',
+                f'{split}_stock_ids.npy',
+                f'{split}_cumsums.npy',
+                f'{split}_stock_offsets.npy',
+            ]
+            if all(Path(self.mmap_dir + f).exists() for f in split_files):
+                print(f"    {split} arrays already exist, skipping...")
+                continue
+
             index = con.execute(f"""
                 SELECT stock_id, cumsum FROM {split}_index ORDER BY cumsum
             """).fetchall()
@@ -506,20 +513,74 @@ class FinalPipeline(dummyLightning):
         build2('val')
         return con
 
-    def _compute_and_store_quantiles(self, con: duckdb.DuckDBPyConnection):
+    def _compute_ystats(self, con):
+        stats_file = self.mmap_dir + 'y_stats.npy'
+        if Path(stats_file).exists():
+            return
+
+        print(f"    Constructing Dataset and sampling {self.samples} items (unnormalized)...")
+        dataset = PriceHistoryDataset(self.config, 'train', normalize=False)
+
+        n_total = len(dataset)
+        indices = np.random.choice(n_total, size=self.samples, replace=False)
+        
+        print(f"    Computing y stats ...")
+        all_y = []
+        all_y_ret = []
+        for i, idx in enumerate(indices):
+            _, _, y, y_ret = dataset[idx]
+            all_y.append(y.numpy())
+            all_y_ret.append(y_ret.numpy())
+            if i % 10000 == 0:
+                print(f"      Processed {i}/{len(indices)} samples")
+
+        all_y = np.stack(all_y)       # (samples, seq_len//2, num_horizons)
+        all_y_ret = np.stack(all_y_ret)  # (samples, seq_len//2, num_horizons)
+
+        # y_ret stats: mean and std per horizon
+        y_ret_mean = all_y_ret.mean(axis=(0, 1))  # (num_horizons,)
+        y_ret_std = all_y_ret.std(axis=(0, 1))    # (num_horizons,)
+
+        # y stats: estimate per-step std for brownian motion
+        # For brownian motion at position i, std = sigma * sqrt(i)
+        # We estimate sigma by: sigma = std(y[:, i, h]) / sqrt(i) for various i, then average
+        num_horizons = all_y.shape[2]
+        seq_half = all_y.shape[1]
+
+        # Use positions 1 to seq_half to estimate sigma (skip 0 to avoid division by 0)
+        sigma_estimates = []
+        for pos in range(1, seq_half):
+            for h_idx in range(num_horizons):
+                pos_std = all_y[:, pos, h_idx].std()
+                sigma_est = pos_std / np.sqrt(pos)
+                sigma_estimates.append(sigma_est)
+
+        y_per_step_std = np.mean(sigma_estimates)  # single scalar
+
+        print(f"    y_ret mean: {y_ret_mean}, std: {y_ret_std}")
+        print(f"    y per-step std (sigma): {y_per_step_std}")
+
+        np.save(stats_file,
+                y_ret_mean=y_ret_mean.astype(np.float32),
+                y_ret_std=y_ret_std.astype(np.float32),
+                y_per_step_std=np.float32(y_per_step_std))
+        print(f"    Saved y stats to {stats_file}")
+
+    def _compute_quantiles(self, con: duckdb.DuckDBPyConnection):
         filename = self.mmap_dir + 'quantiles.npy'
         if Path(filename).exists():
             return
 
         print(f"    Constructing Dataset and sampling {self.samples} items...")
-        dataset = PriceHistoryDataset(self.config, 'train', load_y_stats=False)
+        dataset = PriceHistoryDataset(self.config, 'train')
 
         n_total = len(dataset)
         indices = np.random.choice(n_total, size=self.samples, replace=False)
-
+        
+        print("     Compute and store quantiles from train_data...")
         all_features = []
         for i, idx in enumerate(indices):
-            x, _, _ = dataset[idx]  # x: (seq_len, num_features)
+            x = dataset[idx][0]  # x: (seq_len, num_features)
             all_features.append(x.numpy())
             if i % 10000 == 0:
                 print(f"      Processed {i}/{len(indices)} samples")
@@ -575,49 +636,6 @@ class FinalPipeline(dummyLightning):
                     [feat_idx, q_idx, float(quantiles[q_idx, feat_idx])]
                 )
         np.save(filename, quantiles)
-
-        print(f"    Computing y stats ...")
-        all_y = []
-        all_y_ret = []
-        for i, idx in enumerate(indices):
-            _, y, y_ret = dataset[idx]
-            all_y.append(y.numpy())
-            all_y_ret.append(y_ret.numpy())
-            if i % 10000 == 0:
-                print(f"      Processed {i}/{len(indices)} samples")
-
-        all_y = np.stack(all_y)       # (samples, seq_len//2, num_horizons)
-        all_y_ret = np.stack(all_y_ret)  # (samples, seq_len//2, num_horizons)
-
-        # y_ret stats: mean and std per horizon
-        y_ret_mean = all_y_ret.mean(axis=(0, 1))  # (num_horizons,)
-        y_ret_std = all_y_ret.std(axis=(0, 1))    # (num_horizons,)
-
-        # y stats: estimate per-step std for brownian motion
-        # For brownian motion at position i, std = sigma * sqrt(i)
-        # We estimate sigma by: sigma = std(y[:, i, h]) / sqrt(i) for various i, then average
-        num_horizons = all_y.shape[2]
-        seq_half = all_y.shape[1]
-
-        # Use positions 1 to seq_half to estimate sigma (skip 0 to avoid division by 0)
-        sigma_estimates = []
-        for pos in range(1, seq_half):
-            for h_idx in range(num_horizons):
-                pos_std = all_y[:, pos, h_idx].std()
-                sigma_est = pos_std / np.sqrt(pos)
-                sigma_estimates.append(sigma_est)
-
-        y_per_step_std = np.mean(sigma_estimates)  # single scalar
-
-        print(f"    y_ret mean: {y_ret_mean}, std: {y_ret_std}")
-        print(f"    y per-step std (sigma): {y_per_step_std}")
-
-        np.savez(stats_file,
-                 y_ret_mean=y_ret_mean.astype(np.float32),
-                 y_ret_std=y_ret_std.astype(np.float32),
-                 y_per_step_std=np.float32(y_per_step_std))
-        print(f"    Saved y stats to {stats_file}")
-
 
     def forward(self, x, x_cents):
         encoded = self.encoder(x, x_cents)
