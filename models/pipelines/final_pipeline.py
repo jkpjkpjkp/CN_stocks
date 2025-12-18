@@ -52,7 +52,7 @@ class PriceHistoryDataset(Dataset):
         self.db_feat_idx = {f: i for i, f in enumerate(config.db_features)}
 
         if normalize:
-            stats_file = config.mmap_dir + 'y_stats.npy'
+            stats_file = config.mmap_dir + 'y_stats.npz'
             stats = np.load(stats_file)
             self.y_ret_mean = stats['y_ret_mean']  # (num_horizons,)
             self.y_ret_std = stats['y_ret_std']    # (num_horizons,)
@@ -514,7 +514,7 @@ class FinalPipeline(dummyLightning):
         return con
 
     def _compute_ystats(self, con):
-        stats_file = self.mmap_dir + 'y_stats.npy'
+        stats_file = self.mmap_dir + 'y_stats.npz'
         if Path(stats_file).exists():
             return
 
@@ -560,10 +560,10 @@ class FinalPipeline(dummyLightning):
         print(f"    y_ret mean: {y_ret_mean}, std: {y_ret_std}")
         print(f"    y per-step std (sigma): {y_per_step_std}")
 
-        np.save(stats_file,
-                y_ret_mean=y_ret_mean.astype(np.float32),
-                y_ret_std=y_ret_std.astype(np.float32),
-                y_per_step_std=np.float32(y_per_step_std))
+        np.savez(stats_file,
+                 y_ret_mean=y_ret_mean.astype(np.float32),
+                 y_ret_std=y_ret_std.astype(np.float32),
+                 y_per_step_std=np.float32(y_per_step_std))
         print(f"    Saved y stats to {stats_file}")
 
     def _compute_quantiles(self, con: duckdb.DuckDBPyConnection):
@@ -646,7 +646,7 @@ class FinalPipeline(dummyLightning):
         x, x_cents, y, y_returns = batch
         losses = {}
 
-        features = self.forward(x), x_cents[:, self.seq_len//2:, :]
+        features = self.forward(x, x_cents)
 
         losses['quantile'] = 0.0
         pred_quantiles = self.readout(features, 'quantile')
